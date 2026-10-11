@@ -85,10 +85,17 @@ impl SlashCommand for ChangelogCommand {
         "/changelog"
     }
     fn description(&self) -> &'static str {
-        "Show recent release changes"
+        "Show latest release changes (/changelog all for history)"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        add_changelog_message(&ctx.chat);
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        match args.trim() {
+            "" => add_changelog_message(&ctx.chat),
+            "all" => add_changelog_message_with_scope(&ctx.chat, true),
+            _ => {
+                ctx.chat
+                    .add_child(Arc::new(Text::new("Usage: /changelog [all]", 1, 0)));
+            }
+        }
         ctx.tui.request_render(false);
     }
 }

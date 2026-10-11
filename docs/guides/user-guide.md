@@ -197,6 +197,16 @@ rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ```
 
+### 更新日志
+
+`/changelog` 显示当前二进制对应的最新发布说明；`/changelog all` 显示完整历史。
+更新后第一次启动新交互会话，会展示自上次阅读以来的新版本说明，后续启动不再重复。
+恢复已有会话时，提示会延后到下一次新会话。
+
+rpi 使用全局 `settings.json` 中的 `lastRpiChangelogVersion` 记录已读版本，避免导入的
+`lastChangelogVersion` 干扰。已有配置缺少 rpi 标记时，只补充展示当前版本一次；首次安装
+直接建立基线。设置 `collapseChangelog: true` 可显示简短更新提示。
+
 ### 跳到最新消息
 
 在 `--tui-mode fullscreen` 和 `--connect` 中，向上滚动回看历史时，消息区底部会显示

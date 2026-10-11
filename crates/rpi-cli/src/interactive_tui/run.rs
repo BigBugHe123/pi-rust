@@ -7,6 +7,7 @@ pub(super) async fn maybe_add_startup_changelog(
     chat: &Arc<Container>,
     settings: &crate::settings::Settings,
     collapse: bool,
+    existing_profile: bool,
 ) {
     let has_messages = harness
         .session()
@@ -20,12 +21,24 @@ pub(super) async fn maybe_add_startup_changelog(
         .await
         .map(|entry| entry.is_some())
         .unwrap_or(true);
-    let notice = crate::changelog::startup_changelog(
-        &crate::changelog::bundled_entries(),
+    let entries = crate::changelog::bundled_entries();
+    let baseline = crate::changelog::rpi_baseline(
+        &entries,
+        settings.last_rpi_changelog_version.as_deref(),
         settings.last_changelog_version.as_deref(),
+    );
+    let mut notice = crate::changelog::startup_changelog_for_profile(
+        &entries,
+        baseline,
         crate::VERSION,
         has_messages,
+        existing_profile,
     );
+    // Copy an identified rpi legacy baseline even when there is no new notice.
+    // On resume this copies only the old version, so unseen updates stay pending.
+    if notice.version_to_record.is_none() && settings.last_rpi_changelog_version.is_none() {
+        notice.version_to_record = baseline.map(str::to_owned);
+    }
     if let Some(markdown) = &notice.markdown {
         add_startup_changelog_message(chat, markdown, crate::VERSION, collapse);
     }
@@ -33,7 +46,17 @@ pub(super) async fn maybe_add_startup_changelog(
         let saved = crate::settings::load_settings()
             .map_err(|error| error.to_string())
             .and_then(|mut current| {
-                current.last_changelog_version = Some(version);
+                let candidate =
+                    semver::Version::parse(&version).map_err(|error| error.to_string())?;
+                if current
+                    .last_rpi_changelog_version
+                    .as_deref()
+                    .and_then(|seen| semver::Version::parse(seen).ok())
+                    .is_some_and(|seen| seen >= candidate)
+                {
+                    return Ok(());
+                }
+                current.last_rpi_changelog_version = Some(version);
                 crate::settings::save_settings(&current)
             });
         if let Err(error) = saved {
