@@ -28,6 +28,17 @@ use rpi_agent::types::AgentToolResult;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteEvent {
+    UiDialogRequest {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(rename = "toolCallId", default)]
+        tool_call_id: Option<String>,
+        ui: Value,
+    },
+    UiDialogClosed {
+        #[serde(rename = "requestId")]
+        request_id: String,
+    },
     AgentStart,
     AgentEnd {
         #[serde(rename = "messageCount")]
@@ -111,6 +122,8 @@ impl RemoteEvent {
     /// The wire `type` tag (kept in sync with the serde `rename_all`).
     pub fn type_tag(&self) -> &'static str {
         match self {
+            RemoteEvent::UiDialogRequest { .. } => "ui_dialog_request",
+            RemoteEvent::UiDialogClosed { .. } => "ui_dialog_closed",
             RemoteEvent::AgentStart => "agent_start",
             RemoteEvent::AgentEnd { .. } => "agent_end",
             RemoteEvent::RetryScheduled { .. } => "retry_scheduled",
@@ -265,6 +278,14 @@ pub fn tool_result_json(result: &AgentToolResult) -> Value {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RemoteCommand {
+    UiDialogResponse {
+        #[serde(rename = "requestId")]
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        answer: Option<Value>,
+        #[serde(default)]
+        cancelled: bool,
+    },
     /// Run a prompt on the remote `main` lane; events stream until `agent_end`.
     Prompt { content: String },
     /// Abort the in-flight run.
@@ -378,6 +399,39 @@ pub struct PromptOutcome {
 mod tests {
     use super::*;
     use rpi_agent::types::AgentToolResult;
+
+    #[test]
+    fn dialog_wire_shapes_round_trip_with_request_ids() {
+        let event: RemoteEvent = serde_json::from_value(serde_json::json!({
+            "type":"ui_dialog_request", "requestId":"q", "toolCallId":"c",
+            "ui":{"question":"Allow?", "options":["Yes","No"]},
+        }))
+        .unwrap();
+        assert_eq!(event.type_tag(), "ui_dialog_request");
+        assert_eq!(serde_json::to_value(&event).unwrap()["requestId"], "q");
+        let answer = RemoteCommand::UiDialogResponse {
+            request_id: "q".into(),
+            answer: Some(serde_json::json!({"values":["No"]})),
+            cancelled: false,
+        }
+        .with_id(7);
+        assert_eq!(answer["type"], "ui_dialog_response");
+        assert_eq!(answer["requestId"], "q");
+        assert_eq!(answer["answer"]["values"][0], "No");
+        let cancelled = RemoteCommand::UiDialogResponse {
+            request_id: "q".into(),
+            answer: None,
+            cancelled: true,
+        }
+        .with_id(8);
+        assert_eq!(cancelled["cancelled"], true);
+        assert!(cancelled.get("answer").is_none());
+        assert!(
+            matches!(serde_json::from_value::<RemoteEvent>(serde_json::json!({
+            "type":"ui_dialog_closed", "requestId":"q",
+        })).unwrap(), RemoteEvent::UiDialogClosed { request_id } if request_id == "q")
+        );
+    }
 
     #[test]
     fn event_projection_matches_wire_shape() {

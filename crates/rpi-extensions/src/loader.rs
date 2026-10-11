@@ -405,6 +405,19 @@ impl ExtensionSession {
         &self.loaded_paths
     }
 
+    /// Whether any loaded plugin claimed ownership of this host process's stdio
+    /// (`declare {"ownsStdio":true}`). When `true`, the host (pi-cli) must not
+    /// drain stdin before the plugin's `register` has run, and must run the
+    /// headless `Rpc` lifecycle (dispatch BeforeTuiStart + SessionStart, then
+    /// park) instead of Print/TUI so it never writes to the plugin's stdio.
+    /// `false` for `ExtensionSession::none()` and for every non-claiming plugin.
+    pub fn owns_stdio(&self) -> bool {
+        self.snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.owns_stdio())
+            .unwrap_or(false)
+    }
+
     /// Whether zero plugins loaded.
     pub fn is_empty(&self) -> bool {
         self.loaded_paths.is_empty()

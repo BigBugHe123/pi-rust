@@ -442,6 +442,146 @@ pub fn dispatch_empty_event(snapshot: &RegistrySnapshot, tag: EventTag) -> bool 
     true
 }
 
+/// Timeout budget for a `ToolCall` approval dispatch. Generous because the
+/// handler may wait on a human (e.g. an ACP `session/request_permission`).
+pub const TOOL_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Dispatch a tool approval against a live session. Only a successful continue
+/// permits execution; stale sessions, cancellation, timeout and handler errors
+/// block it. Blocking callbacks retain the plugin libraries until they return,
+/// even when the async caller has already stopped waiting.
+pub async fn dispatch_tool_call_event(
+    session: &crate::ExtensionSession,
+    tool_call_id: &str,
+    tool_name: &str,
+    params: &serde_json::Value,
+    signal: &tokio_util::sync::CancellationToken,
+    ui_dialog: &crate::UiDialogMailbox,
+) -> Option<String> {
+    dispatch_tool_call_event_with_timeout(
+        session,
+        tool_call_id,
+        tool_name,
+        params,
+        signal,
+        ui_dialog,
+        TOOL_CALL_TIMEOUT,
+    )
+    .await
+}
+
+async fn dispatch_tool_call_event_with_timeout(
+    session: &crate::ExtensionSession,
+    tool_call_id: &str,
+    tool_name: &str,
+    params: &serde_json::Value,
+    signal: &tokio_util::sync::CancellationToken,
+    ui_dialog: &crate::UiDialogMailbox,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    let snapshot = session.snapshot()?;
+    if !crate::registry::assert_active(snapshot.active_flag()) {
+        return Some(format!(
+            "tool `{tool_name}` approval session is stale; retry after reload"
+        ));
+    }
+    for h in snapshot.handlers_for(EventTag::ToolCall).iter().cloned() {
+        if !crate::registry::platform_allows(&h.platforms) {
+            continue;
+        }
+        if signal.is_cancelled() {
+            ui_dialog.cancel_tool_call(tool_call_id);
+            return Some(format!("tool `{tool_name}` approval cancelled"));
+        }
+        if !crate::registry::assert_active(snapshot.active_flag()) {
+            return Some(format!(
+                "tool `{tool_name}` approval session is stale; retry after reload"
+            ));
+        }
+        let plugin_name = h.plugin.clone();
+        let id = tool_call_id.to_string();
+        let name = tool_name.to_string();
+        let payload = params.to_string();
+        let keepalive = session.keepalive();
+        let started = std::time::Instant::now();
+        // Capture the whole RegisteredHandler rather than its raw user_data.
+        // The callback's own keepalive also survives timeout/cancellation.
+        let mut task = tokio::task::spawn_blocking(move || {
+            let _keepalive = keepalive;
+            call_tool_call_handler(h, id, name, payload)
+        });
+        let outcome = tokio::select! {
+            biased;
+            _ = signal.cancelled() => {
+                task.abort(); // Prevent a queued callback from starting.
+                ui_dialog.cancel_tool_call(tool_call_id);
+                crate::event_log::log_handler_invocation(
+                    EventTag::ToolCall, &plugin_name, "Cancelled",
+                    started.elapsed().as_millis() as u64, None,
+                );
+                return Some(format!("tool `{tool_name}` approval cancelled"));
+            }
+            outcome = tokio::time::timeout(timeout, &mut task) => outcome,
+        };
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (status, error) = match outcome {
+            Ok(Ok(Ok(rc))) if rc == rpi_plugin_sdk::EVENT_HANDLER_CONTINUE => ("Continue", None),
+            Ok(Ok(Ok(rc))) if rc == rpi_plugin_sdk::EVENT_HANDLER_ABORT => (
+                "Abort",
+                Some(format!(
+                    "extension `{plugin_name}` blocked tool `{tool_name}`"
+                )),
+            ),
+            Ok(Ok(Ok(rc))) => (
+                "Error",
+                Some(format!(
+                    "extension `{plugin_name}` tool `{tool_name}` approval failed: rc={rc}"
+                )),
+            ),
+            Ok(Ok(Err(_))) => (
+                "Panic",
+                Some(format!(
+                    "extension `{plugin_name}` tool `{tool_name}` approval panicked"
+                )),
+            ),
+            Ok(Err(error)) => (
+                "JoinFailed",
+                Some(format!(
+                    "extension `{plugin_name}` tool `{tool_name}` approval task failed: {error}"
+                )),
+            ),
+            Err(_) => {
+                task.abort();
+                (
+                    "Timeout",
+                    Some(format!(
+                        "extension `{plugin_name}` tool `{tool_name}` approval timed out"
+                    )),
+                )
+            }
+        };
+        crate::event_log::log_handler_invocation(
+            EventTag::ToolCall,
+            &plugin_name,
+            status,
+            duration_ms,
+            error.clone(),
+        );
+        if let Some(reason) = error {
+            ui_dialog.cancel_tool_call(tool_call_id);
+            return Some(reason);
+        }
+        // A reload can invalidate this session while the callback is running.
+        if !crate::registry::assert_active(snapshot.active_flag()) {
+            ui_dialog.cancel_tool_call(tool_call_id);
+            return Some(format!(
+                "tool `{tool_name}` approval session is stale; retry after reload"
+            ));
+        }
+    }
+    None
+}
+
 /// Like [`dispatch_data_event`], but reports whether a handler **claimed** the
 /// event by returning [`EVENT_HANDLER_CLAIMED`].
 ///
@@ -519,6 +659,30 @@ fn call_lifecycle_handler(
     // SAFETY: the plugin warrants `h.handler` + `h.user_data` are safe to call
     // from any thread; catch_unwind so a panic cannot cross FFI.
     catch_unwind(AssertUnwindSafe(|| (h.handler)(event, h.user_data)))
+}
+
+/// Invoke one `ToolCall` handler on a blocking thread. Takes the whole
+/// [`RegisteredHandler`](crate::registry::RegisteredHandler) **by value** for the
+/// same `Send` reason as [`call_lifecycle_handler`]: the closure must capture the
+/// `Send` struct whole, not its non-`Send` `user_data` field. Builds and frees
+/// the tool-call event on this thread (a `StablePluginEvent` holds raw pointers).
+fn call_tool_call_handler(
+    h: crate::registry::RegisteredHandler,
+    tool_call_id: String,
+    tool_name: String,
+    params: String,
+) -> std::thread::Result<i32> {
+    let event = StablePluginEvent::tool_call(
+        EventTag::ToolCall,
+        StbString::from_string(tool_call_id),
+        StbString::from_string(tool_name),
+        StbString::from_string(params),
+    );
+    // SAFETY: the plugin warrants `h.handler` + `h.user_data` are safe to call
+    // from any thread; catch_unwind so a panic cannot cross FFI.
+    let rc = catch_unwind(AssertUnwindSafe(|| (h.handler)(event, h.user_data)));
+    free_dispatched_event(&event);
+    rc
 }
 
 /// Veto-aware, timeout-bounded dispatch for a **no-payload lifecycle event**
@@ -1210,6 +1374,239 @@ mod tests {
         assert!(dispatch_lifecycle_event(&snap, EventTag::SessionStart)
             .await
             .is_none());
+    }
+
+    fn tool_call_session(reg: &crate::ExtensionRegistry) -> crate::ExtensionSession {
+        crate::ExtensionSession::from_parts(
+            Arc::new(reg.snapshot()),
+            crate::PluginKeepalive::empty(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_call_approval_error_and_stale_session_block_execution() {
+        let mut reg = crate::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "broken-gate".into(),
+            EventTag::ToolCall,
+            error_handler,
+            std::ptr::null_mut(),
+        );
+        let session = tool_call_session(&reg);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let ui = crate::UiDialogMailbox::new();
+        let reason =
+            dispatch_tool_call_event(&session, "c1", "bash", &serde_json::json!({}), &signal, &ui)
+                .await
+                .unwrap();
+        assert!(reason.contains("approval failed: rc="), "{reason}");
+        reg.invalidate();
+        let reason =
+            dispatch_tool_call_event(&session, "c2", "bash", &serde_json::json!({}), &signal, &ui)
+                .await
+                .unwrap();
+        assert!(reason.contains("stale"), "{reason}");
+    }
+
+    struct WaitingApproval {
+        ui: crate::UiDialogMailbox,
+        entered: tokio::sync::Notify,
+        finished: tokio::sync::Notify,
+        release: std::sync::atomic::AtomicBool,
+    }
+
+    extern "C" fn waiting_approval(event: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
+        // The test owns this context until the worker reports completion.
+        let state = unsafe { Arc::from_raw(data as *const WaitingApproval) };
+        let call_id = unsafe { event.payload.tool_call.tool_call_id.to_string_lossy() };
+        state
+            .ui
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "approval", "toolCallId": call_id,
+                "ui": {"question": "Allow?"},
+            }))
+            .unwrap();
+        state.entered.notify_one();
+        loop {
+            if state.release.load(Ordering::SeqCst) {
+                break;
+            }
+            if state.ui.poll("approval").unwrap()["status"] == "cancelled" {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Stay inside the callback so the test can check library retention
+        // after the async dispatch has already returned.
+        while !state.release.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        state.finished.notify_one();
+        rpi_plugin_sdk::EVENT_HANDLER_ABORT
+    }
+
+    async fn check_interrupted_approval(cancel: bool) {
+        let ui = crate::UiDialogMailbox::new();
+        ui.attach();
+        ui.handle(serde_json::json!({
+            "requestId": "other", "toolCallId": "other-call", "ui": {},
+        }))
+        .unwrap();
+        let state = Arc::new(WaitingApproval {
+            ui: ui.clone(),
+            entered: tokio::sync::Notify::new(),
+            finished: tokio::sync::Notify::new(),
+            release: std::sync::atomic::AtomicBool::new(false),
+        });
+        // Release on failed assertions too, so the blocking runtime can exit.
+        struct ReleaseWorker(Arc<WaitingApproval>);
+        impl Drop for ReleaseWorker {
+            fn drop(&mut self) {
+                self.0.release.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release = ReleaseWorker(state.clone());
+        let mut reg = crate::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "waiting-gate".into(),
+            EventTag::ToolCall,
+            waiting_approval,
+            Arc::into_raw(state.clone()) as *mut std::ffi::c_void,
+        );
+        let keepalive = crate::PluginKeepalive::empty();
+        let weak = Arc::downgrade(&keepalive);
+        let session = crate::ExtensionSession::from_parts(
+            Arc::new(reg.snapshot()),
+            keepalive,
+            Vec::new(),
+            None,
+        );
+        let signal = tokio_util::sync::CancellationToken::new();
+        let task_signal = signal.clone();
+        let task_ui = ui.clone();
+        let task = tokio::spawn(async move {
+            dispatch_tool_call_event_with_timeout(
+                &session,
+                "call",
+                "bash",
+                &serde_json::json!({}),
+                &task_signal,
+                &task_ui,
+                if cancel {
+                    TOOL_CALL_TIMEOUT
+                } else {
+                    std::time::Duration::from_millis(200)
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), state.entered.notified())
+            .await
+            .unwrap();
+        if cancel {
+            signal.cancel();
+        }
+        let reason = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            reason.contains(if cancel { "cancelled" } else { "timed out" }),
+            "{reason}"
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "running callback must keep its library mapped"
+        );
+        assert_eq!(ui.poll("other").unwrap()["status"], "pending");
+        state.release.store(true, Ordering::SeqCst);
+        tokio::time::timeout(std::time::Duration::from_secs(2), state.finished.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_call_approval_cancel_releases_waiter_and_retains_running_library() {
+        check_interrupted_approval(true).await;
+    }
+
+    #[tokio::test]
+    async fn tool_call_approval_timeout_blocks_and_retains_running_library() {
+        check_interrupted_approval(false).await;
+    }
+
+    // --- dispatch_tool_call_event: veto (B3b before_tool_call) ---
+
+    /// A `ToolCall` handler that vetoes blocks the tool and names the tool.
+    #[tokio::test]
+    async fn dispatch_tool_call_event_honors_veto() {
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "gate-ext".to_string(),
+            EventTag::ToolCall,
+            aborting_handler,
+            std::ptr::null_mut(),
+        );
+        let session = tool_call_session(&reg);
+        let veto = dispatch_tool_call_event(
+            &session,
+            "call_1",
+            "bash",
+            &serde_json::json!({"command": "rm -rf /"}),
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::UiDialogMailbox::new(),
+        )
+        .await;
+        assert_eq!(
+            veto.as_deref(),
+            Some("extension `gate-ext` blocked tool `bash`")
+        );
+    }
+
+    /// A continue code does not veto; no subscribers is also `None`.
+    #[tokio::test]
+    async fn dispatch_tool_call_event_continue_and_empty_do_not_veto() {
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "ok-ext".to_string(),
+            EventTag::ToolCall,
+            continue_handler,
+            std::ptr::null_mut(),
+        );
+        let session = tool_call_session(&reg);
+        assert!(dispatch_tool_call_event(
+            &session,
+            "call_1",
+            "read",
+            &serde_json::json!({"path": "x"}),
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::UiDialogMailbox::new(),
+        )
+        .await
+        .is_none());
+
+        let empty = crate::registry::ExtensionRegistry::new();
+        let empty_session = tool_call_session(&empty);
+        assert!(dispatch_tool_call_event(
+            &empty_session,
+            "call_2",
+            "read",
+            &serde_json::json!({}),
+            &tokio_util::sync::CancellationToken::new(),
+            &crate::UiDialogMailbox::new()
+        )
+        .await
+        .is_none());
     }
 
     /// No subscribers → no veto, no work.

@@ -66,6 +66,7 @@ struct UiDialogState {
     attached: bool,
     pending: VecDeque<String>,
     active: HashMap<String, UiDialogEntry>,
+    cancelled_tool_calls: std::collections::HashSet<String>,
 }
 
 /// Thread-safe mailbox connecting plugin runtime actions to an interactive
@@ -89,6 +90,7 @@ impl UiDialogMailbox {
                 attached: false,
                 pending: VecDeque::new(),
                 active: HashMap::new(),
+                cancelled_tool_calls: std::collections::HashSet::new(),
             })),
         }
     }
@@ -143,6 +145,16 @@ impl UiDialogMailbox {
             .len()
     }
 
+    /// Inspect lifecycle without consuming the answer reserved for a plugin.
+    pub fn is_pending(&self, request_id: &str) -> bool {
+        self.state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .active
+            .get(request_id)
+            .is_some_and(|entry| !entry.cancelled && entry.answer.is_none())
+    }
+
     /// Supply an answer for a request. Repeating the same operation is
     /// idempotent; answering a cancelled/unknown request is an explicit error.
     pub fn respond(&self, request_id: &str, answer: serde_json::Value) -> Result<(), String> {
@@ -188,6 +200,28 @@ impl UiDialogMailbox {
             entry.cancelled = true;
             entry.answer = None;
         }
+    }
+
+    /// Cancel approval requests belonging to one tool without disturbing
+    /// questions from concurrent tool calls.
+    pub fn cancel_tool_call(&self, tool_call_id: &str) {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        // A callback can reach `open` just after the host cancels its call.
+        // Remember the cancellation so it cannot enqueue an orphan question.
+        state.cancelled_tool_calls.insert(tool_call_id.to_string());
+        for entry in state.active.values_mut() {
+            if entry.request.tool_call_id.as_deref() == Some(tool_call_id) {
+                entry.cancelled = true;
+                entry.answer = None;
+            }
+        }
+        let cancelled: std::collections::HashSet<String> = state
+            .active
+            .iter()
+            .filter(|(_, entry)| entry.cancelled)
+            .map(|(id, _)| id.clone())
+            .collect();
+        state.pending.retain(|id| !cancelled.contains(id));
     }
 
     /// Poll a request and consume a terminal answer/cancellation. Pending
@@ -265,6 +299,14 @@ impl UiDialogMailbox {
                     .or_else(|| args.get("tool_call_id"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
+                if tool_call_id
+                    .as_ref()
+                    .is_some_and(|id| state.cancelled_tool_calls.contains(id))
+                {
+                    return Ok(serde_json::json!({
+                        "status": "cancelled", "requestId": id, "toolCallId": tool_call_id,
+                    }));
+                }
                 let ui = args.get("ui").cloned().unwrap_or_else(|| args.clone());
                 state.active.insert(
                     id.clone(),
@@ -1313,6 +1355,23 @@ mod tests {
         let cancelled = mailbox.poll("r1").unwrap();
         assert_eq!(cancelled["status"], "cancelled");
         assert!(mailbox.poll("r1").is_err());
+    }
+
+    #[test]
+    fn ui_dialog_tool_cancel_preserves_other_calls_and_rejects_late_questions() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        mailbox.handle(open_args("r2", "c2")).unwrap();
+        mailbox.cancel_tool_call("c1");
+        assert_eq!(mailbox.poll("r1").unwrap()["status"], "cancelled");
+        assert_eq!(mailbox.take_pending().unwrap().request_id, "r2");
+        assert_eq!(mailbox.poll("r2").unwrap()["status"], "pending");
+        assert_eq!(
+            mailbox.handle(open_args("late", "c1")).unwrap()["status"],
+            "cancelled"
+        );
+        assert!(mailbox.take_pending().is_none());
     }
 
     #[test]

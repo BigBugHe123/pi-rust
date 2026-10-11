@@ -645,6 +645,15 @@ pub async fn build(
         }
     }
 
+    // Share the live session cell with both /reload and the approval hook.
+    // Install the hook even when no plugins loaded yet: a later reload can
+    // discover the first permission gate.
+    let extension_session_cell = Arc::new(Mutex::new(extension_session.clone()));
+    let before_tool_call = Some(extension_tool_call_hook(
+        Arc::clone(&extension_session_cell),
+        ui_dialog_mailbox.clone(),
+    ));
+
     let options = AgentHarnessOptions {
         model: resolved.model.clone(),
         thinking_level: resolved.thinking_level,
@@ -698,12 +707,11 @@ pub async fn build(
         to_provider_messages: None,
         entry_projectors: Default::default(),
         agent_emitter: Some(emitter),
-        // B3b: the three exists-but-`None` loop hooks — populated when an
-        // extension session registers handlers for the matching pi `on()`
-        // tags (before_tool_call/after_tool_call/context). v1 leaves them `None`
-        // here; the rpi-extensions adapter that owns plugin handler dispatch is
-        // wired in the same build path once B3b's host-side adapter lands.
-        before_tool_call: None,
+        // B3b loop hooks. `before_tool_call` dispatches the pi `on("tool_call")`
+        // extension event and honors a veto (a permission gate can block a tool
+        // before it runs). `after_tool_call`/`transform_context` remain `None`
+        // (their host-side adapters are not wired yet).
+        before_tool_call,
         after_tool_call: None,
         transform_context: None,
         entry_transforms: Vec::new(),
@@ -779,7 +787,7 @@ pub async fn build(
     // site — passing it into `reload_extension_resources` keeps this structfree
     // of a harness back-reference so it can be `Clone` into the reload callback).
     let reload_context = ReloadContext {
-        extension_session: Arc::new(Mutex::new(extension_session)),
+        extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
         catalog,
@@ -798,6 +806,46 @@ pub async fn build(
     };
 
     Ok((harness, event_rx, reload_context))
+}
+
+/// Resolve the current plugin session for each call rather than keeping a
+/// startup snapshot. A clone retains its libraries while approval is pending.
+fn extension_tool_call_hook(
+    sessions: ExtensionSessionCell,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+) -> rpi_agent::BeforeToolCall {
+    Arc::new(move |ctx: rpi_agent::BeforeToolCallContext<'_>, signal| {
+        let session = sessions
+            .lock()
+            .map(|session| session.clone())
+            .map_err(|_| ());
+        let ui_dialog = ui_dialog.clone();
+        let tool_call_id = ctx.tool_call.id.clone();
+        let tool_name = ctx.tool_call.name.clone();
+        let params = ctx.args.clone();
+        Box::pin(async move {
+            let reason = match session {
+                Ok(session) => {
+                    rpi_extensions::dispatch_tool_call_event(
+                        &session,
+                        &tool_call_id,
+                        &tool_name,
+                        &params,
+                        &signal,
+                        &ui_dialog,
+                    )
+                    .await
+                }
+                Err(_) => Some("extension approval session is unavailable".to_string()),
+            };
+            reason.map(|reason| rpi_agent::BeforeToolCallResult {
+                block: true,
+                reason: Some(reason),
+                terminate: false,
+                args: None,
+            })
+        })
+    })
 }
 
 // ===========================================================================
@@ -841,9 +889,9 @@ pub async fn build(
 /// The cell that holds the live `ExtensionSession` across a `/reload`. Cloned
 /// into every site that needs the current session (the TUI, the reload
 /// callback). On reload the old session is `replace`d out (its `active` flag
-/// flipped + its keepalive dropped, unmapping the old cdylibs) and the fresh one
-/// `store`d. Carried as a plain `ExtensionSession` (not `Option`) — a `none()`
-/// placeholder fills the slot while the fresh one is being built.
+/// flipped) and the fresh one stored atomically. In-flight callbacks retain
+/// the old keepalive until they return; callers never observe an empty
+/// placeholder during the swap.
 pub type ExtensionSessionCell = Arc<Mutex<ExtensionSession>>;
 
 /// The cell that holds the live `ActionBridge` across a `/reload`. A plugin
@@ -1179,39 +1227,31 @@ where
     // The old registry's `active` flag flips false so any in-flight
     // `emit_resources_discover`/event dispatch on the old snapshot no-ops; the
     // old bridge's flag flips false so in-flight `runtime_action` calls parked
-    // on the old `user_data` hit the staleness guard. We do this BEFORE storing
-    // the fresh session so there is no window where both are "active".
+    // on the old `user_data` hit the staleness guard. Invalidate under the
+    // session lock before exposing the replacement to approval callbacks.
     //
-    // The session cell carries a plain `ExtensionSession` (not `Option`), so we
-    // `mem::replace` the live one out with a `none()` placeholder to extract it
-    // for invalidation (the snapshot's `active` flag is on a shared `Arc`, so a
-    // borrow of the extracted value is enough to flip it; the extraction itself
-    // also drops the old keepalive once we drop `old_session`, unmapping the old
-    // cdylibs). `mem::replace` (not `.take()`) because the cell is not `Option`.
+    // Swap directly to the fresh session under the same lock that approvals
+    // use. A temporary empty session would let a concurrent call bypass its gate.
+    // In-flight approvals retain their old session until their callback exits;
+    // its staleness flag prevents them from authorizing after this swap.
     {
         let mut session_guard = ctx.extension_session.lock().unwrap();
-        let old_session = std::mem::replace(
-            &mut *session_guard,
-            rpi_extensions::ExtensionSession::none(),
-        );
+        let old_session = std::mem::replace(&mut *session_guard, extension_session.clone());
         if let Some(old_snap) = old_session.snapshot_arc() {
             // `invalidate` is on the registry, but the snapshot shares the flag —
             // flipping the snapshot's flag invalidates the registry too (same Arc).
             // `RegistrySnapshot` exposes `active_flag()` for this.
             old_snap.active_flag().store(false, Ordering::SeqCst);
         }
-        // `old_session` drops here — its keepalive releases the old `Library`
-        // handles (unmapping the old cdylibs). The fresh session's keepalive
-        // (built below) holds the fresh mappings.
+        // `old_session` drops here; in-flight adapters/callbacks keep their
+        // own library references until they return.
     }
     if let Some(old_b) = old_bridge {
         old_b.invalidate();
     }
 
-    // The fresh bridge is now the live one. Store it + the fresh session so
-    // subsequent reloads (or plugin calls still resolving the cells) see them.
+    // The session was swapped atomically above; expose its matching bridge.
     *ctx.action_bridge.lock().unwrap() = Some(Arc::clone(&fresh_bridge));
-    *ctx.extension_session.lock().unwrap() = extension_session.clone();
 
     // ---- 3. resources_discover ("reload") over the fresh snapshot ----
     let discovered = extension_session
@@ -2575,6 +2615,72 @@ fn read_append_target(target: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::args::Args;
+
+    extern "C" fn deny_test_tool_call(
+        _event: rpi_plugin_sdk::StablePluginEvent,
+        _data: *mut std::ffi::c_void,
+    ) -> i32 {
+        rpi_plugin_sdk::EVENT_HANDLER_ABORT
+    }
+
+    async fn invoke_test_tool_hook(
+        hook: &rpi_agent::BeforeToolCall,
+    ) -> Option<rpi_agent::BeforeToolCallResult> {
+        let message = rpi_ai::providers::faux::faux_assistant_message(
+            "approval",
+            rpi_ai::types::StopReason::ToolUse,
+        );
+        let rpi_ai::types::Content::ToolCall(call) =
+            rpi_ai::types::Content::tool_call("call", "read", serde_json::json!({"path":"x"}))
+        else {
+            unreachable!()
+        };
+        hook(
+            rpi_agent::BeforeToolCallContext {
+                assistant_message: &message,
+                tool_call: &call,
+                args: &call.arguments,
+                context: &rpi_agent::AgentContext::default(),
+            },
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn tool_call_hook_uses_reloaded_session_and_newly_discovered_gate() {
+        let sessions = Arc::new(Mutex::new(ExtensionSession::none()));
+        let hook =
+            extension_tool_call_hook(sessions.clone(), rpi_extensions::UiDialogMailbox::new());
+        assert!(invoke_test_tool_hook(&hook).await.is_none());
+        for name in ["first-gate", "reloaded-gate"] {
+            let mut registry = rpi_extensions::ExtensionRegistry::new();
+            registry.register_event_handler(
+                name.into(),
+                rpi_plugin_sdk::EventTag::ToolCall,
+                deny_test_tool_call,
+                std::ptr::null_mut(),
+            );
+            let fresh = ExtensionSession::from_parts(
+                Arc::new(registry.snapshot()),
+                rpi_extensions::PluginKeepalive::empty(),
+                Vec::new(),
+                None,
+            );
+            {
+                let mut current = sessions.lock().unwrap();
+                if let Some(snapshot) = current.snapshot() {
+                    snapshot.active_flag().store(false, Ordering::SeqCst);
+                }
+                *current = fresh;
+            }
+            let result = invoke_test_tool_hook(&hook).await.unwrap();
+            assert!(result.block);
+            assert!(result.reason.unwrap().contains(name));
+        }
+        *sessions.lock().unwrap() = ExtensionSession::none();
+        assert!(invoke_test_tool_hook(&hook).await.is_none());
+    }
 
     /// A unique scratch file for one summary test.
     fn scratch(name: &str) -> PathBuf {

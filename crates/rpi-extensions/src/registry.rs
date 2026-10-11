@@ -331,6 +331,12 @@ pub struct ExtensionRegistry {
     priority: i32,
     /// P2: the registering plugin's declared platforms (empty = all).
     platforms: Vec<String>,
+    /// A plugin's `{"ownsStdio":true}` claim: this host process's stdin/stdout
+    /// belong to the plugin (an ACP/MCP-style stdio server), so the host must
+    /// defer `read_piped_stdin` until after extension load and run the headless
+    /// `Rpc` lifecycle instead of Print/TUI. Monotonic across `absorb` (any
+    /// claiming plugin wins). Default `false`.
+    owns_stdio: bool,
     /// Shared staleness flag. `true` while the session owning this registry is
     /// active; set `false` on swap/`/reload`. Tool/event dispatch checks it.
     active: Arc<AtomicBool>,
@@ -360,6 +366,7 @@ impl ExtensionRegistry {
             renderers: Vec::new(),
             priority: DEFAULT_PRIORITY,
             platforms: Vec::new(),
+            owns_stdio: false,
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -488,7 +495,8 @@ impl ExtensionRegistry {
     }
 
     /// Parse a v3 `declare` JSON payload and apply it (P2). Recognised keys:
-    /// `priority` (integer) and `platforms` (array of strings). Returns `true`
+    /// `priority` (integer), `platforms` (array of strings) and `ownsStdio`
+    /// (boolean; see [`ExtensionRegistry::declared_owns_stdio`]). Returns `true`
     /// if the payload parsed as JSON (even with no recognised keys), `false` on
     /// a parse error.
     pub fn apply_declaration_json(&mut self, json: &str) -> bool {
@@ -507,6 +515,11 @@ impl ExtensionRegistry {
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect::<Vec<String>>()
             });
+        if let Some(owns) = value.get("ownsStdio").and_then(|v| v.as_bool()) {
+            // A claim, not a toggle: once a plugin owns stdio it stays claimed
+            // (and `absorb` ORs it across plugins).
+            self.owns_stdio = self.owns_stdio || owns;
+        }
         self.apply_declaration(priority, platforms);
         true
     }
@@ -635,6 +648,7 @@ impl ExtensionRegistry {
             providers: self.providers.clone(),
             oauth_providers: self.oauth_providers.clone(),
             renderers: self.renderers.clone(),
+            owns_stdio: self.owns_stdio,
             active: Arc::clone(&self.active),
         }
     }
@@ -657,6 +671,12 @@ impl ExtensionRegistry {
     /// P2: the plugin's declared platforms (empty = all).
     pub fn declared_platforms(&self) -> &[String] {
         &self.platforms
+    }
+
+    /// Whether this plugin claimed ownership of the host process's stdio
+    /// (`declare {"ownsStdio":true}`). Default `false`.
+    pub fn declared_owns_stdio(&self) -> bool {
+        self.owns_stdio
     }
 
     /// Absorb another registry's registrations into this one, first-wins on
@@ -749,6 +769,10 @@ impl ExtensionRegistry {
             }
             self.renderers.push(r);
         }
+        // stdio ownership is a claim: any claiming plugin makes the merged
+        // session own stdio (first-wins on *which* plugin is not needed — the
+        // host only needs to know whether *some* plugin does).
+        self.owns_stdio |= other.owns_stdio;
     }
 }
 
@@ -774,6 +798,10 @@ pub struct RegistrySnapshot {
     providers: Vec<RegisteredProvider>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
     renderers: Vec<RegisteredRenderer>,
+    /// A plugin's `{"ownsStdio":true}` claim (merged OR across plugins). The
+    /// host reads this after `load_session` to defer `read_piped_stdin` and run
+    /// the headless `Rpc` lifecycle. See [`ExtensionRegistry::declared_owns_stdio`].
+    owns_stdio: bool,
     active: Arc<AtomicBool>,
 }
 
@@ -796,6 +824,13 @@ impl RegistrySnapshot {
     /// The registered CLI flags, insertion order.
     pub fn flags(&self) -> &[RegisteredFlag] {
         &self.flags
+    }
+
+    /// Whether any loaded plugin claimed ownership of the host process's stdio
+    /// (`declare {"ownsStdio":true}`). The host uses this to defer
+    /// `read_piped_stdin` and run the headless `Rpc` lifecycle.
+    pub fn owns_stdio(&self) -> bool {
+        self.owns_stdio
     }
 
     /// Keyboard shortcuts declared by extensions, insertion order.
@@ -1052,6 +1087,31 @@ mod tests {
         assert!(reg.apply_declaration_json("{}"));
         assert!(reg.apply_declaration_json(r#"{"priority":3}"#));
         assert_eq!(reg.apply_declaration(Some(3), None), 1);
+    }
+
+    /// `declare {"ownsStdio":true}` claims the host process's stdio; it is
+    /// monotonic (a later `false` does not un-claim) and merges by OR.
+    #[test]
+    fn declaration_owns_stdio_is_monotonic_and_merges() {
+        let mut reg = ExtensionRegistry::new();
+        assert!(!reg.declared_owns_stdio());
+        assert!(!reg.snapshot().owns_stdio());
+
+        assert!(reg.apply_declaration_json(r#"{"ownsStdio":true}"#));
+        assert!(reg.declared_owns_stdio());
+        assert!(reg.snapshot().owns_stdio());
+
+        // A later `false` must not release an established claim.
+        assert!(reg.apply_declaration_json(r#"{"ownsStdio":false}"#));
+        assert!(reg.declared_owns_stdio());
+
+        // `absorb` ORs ownership across plugins (any claiming plugin wins).
+        let mut plain = ExtensionRegistry::new();
+        let mut claiming = ExtensionRegistry::new();
+        assert!(claiming.apply_declaration_json(r#"{"ownsStdio":true}"#));
+        plain.absorb(claiming);
+        assert!(plain.declared_owns_stdio());
+        assert!(plain.snapshot().owns_stdio());
     }
 
     #[test]

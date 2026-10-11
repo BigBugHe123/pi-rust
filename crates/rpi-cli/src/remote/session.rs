@@ -240,6 +240,7 @@ impl RemoteSession {
     /// Fold one lifecycle event into the transcript.
     pub fn apply_event(&mut self, event: &RemoteEvent) {
         match event {
+            RemoteEvent::UiDialogRequest { .. } | RemoteEvent::UiDialogClosed { .. } => {}
             RemoteEvent::AgentStart => {
                 self.streaming = true;
                 self.retry_attempt = None;

@@ -30,6 +30,7 @@
 // Feature modules share the host state; their helpers stay private to this TUI.
 mod extensions;
 use extensions::*;
+pub(crate) use extensions::{ask_user_frame, parse_ask_user_prompt, AskUserPrompt};
 mod commands;
 use commands::*;
 mod settings;

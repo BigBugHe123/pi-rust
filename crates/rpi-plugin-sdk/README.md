@@ -46,6 +46,49 @@ The macro emits the `rpi_plugin_register` symbol. The version lives *inside* the
 `PluginApi` struct (`abi_version`, `struct_size`) rather than in the symbol name,
 so the entrypoint signature does not change when the struct grows.
 
+## Safe plugin helpers
+
+`handles::ToolHandles<T>` keeps tool state inside the plugin and returns opaque
+numeric `StepHandle` tokens. `get` retains an `Arc`, `lock` serializes state
+updates, and `cancel` sets a separate atomic flag without waiting for a poll.
+`remove` cancels and retires the token; repeated removal and unknown handles are
+no-ops. An in-flight callback keeps its state alive until it returns. Workers
+can share the flag through `insert_with_cancel`.
+
+`event_handler!` defines an event callback with a tag-checked `EventView` and
+panic containment. Its accessors return owned strings, so handlers never read
+the ABI union directly or retain host pointers. Event buffers are borrowed
+during fan-out and must not be freed by handlers.
+
+```rust
+rpi_plugin_sdk::event_handler! {
+    fn observe_message(event, _user_data) {
+        if let Some(message) = event.message_text() {
+            println!("{message}");
+        }
+        rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
+    }
+}
+```
+
+These helpers preserve the C ABI. They require an SDK release containing the
+helpers; packages using a local path dependency must publish that SDK before
+publishing dependent packages.
+
+`string_handler!` adapts command, prompt and runtime-action callbacks to `&str`
+inputs and a lifetime-bound `callbacks::Output`. `Output::write` handles null
+slots and reclaims earlier writes without freeing host-owned input. The SDK's
+`callbacks::free_string` is the producer-side ABI deallocator to register for
+SDK-allocated outputs. `execute_handler!` adapts borrowed tool call IDs, and
+`take_step_result!` copies and reclaims a plugin-owned result into the pointer-free
+`callbacks::Step` enum. These are ABI boundaries: the host must still honor
+buffer validity and producer allocation ownership.
+
+The optional `process` feature provides `process::ProcessTree` for terminating
+descendants and closing inherited pipes. Its Win32/libc calls and owned handles
+stay in the SDK; packages can enable `forbid(unsafe_code)` while using the
+platform-independent interface.
+
 ## Positioned plugin panels
 
 Hosts with declarative panel support accept a `panel` field on the existing

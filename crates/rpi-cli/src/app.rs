@@ -213,18 +213,21 @@ async fn run_inner() -> i32 {
 
     emit_startup_warnings(&parsed);
 
-    // ---- stdin (TS readPipedStdin: non-TTY stdin becomes initial prompt text) ----
+    // ---- stdin ownership ----
     // Do NOT drain stdin when the run is an RPC/server session: stdin is the
     // JSONL command channel there (a spawned `rpi --mode rpc` child reads its
     // commands from stdin), so consuming it up-front would leave the protocol
     // loop nothing to read. `--mode rpc` and `--server` both select RunMode::Rpc.
+    //
+    // NOTE: the actual `read_piped_stdin()` call is deferred until *after*
+    // extension load (below), because a plugin may `declare
+    // {"ownsStdio":true}` — an ACP/MCP-style stdio server that owns this
+    // process's stdin/stdout. Draining stdin before that plugin's `register`
+    // runs would deadlock it (and the host would swallow the client handshake).
+    // `--mode rpc`/`--server` are a static pre-computation (no plugin needed);
+    // the plugin claim is only known once `build()` has loaded extensions.
     let wants_rpc_channel =
         parsed.mode == crate::args::Mode::Rpc || parsed.unknown_flags.contains_key("server");
-    let stdin_text = if wants_rpc_channel {
-        None
-    } else {
-        read_piped_stdin()
-    };
 
     // ---- @file attachments → text (TS processFileArguments, text branch only) ----
     let (file_text, file_images) = match process_file_args(&parsed.file_args, &cwd) {
@@ -234,14 +237,6 @@ async fn run_inner() -> i32 {
             return EXIT_USAGE;
         }
     };
-
-    // ---- initial message + extra messages (TS buildInitialMessage) ----
-    let file_text_opt = if file_text.is_empty() {
-        None
-    } else {
-        Some(file_text.as_str())
-    };
-    let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
 
     // ---- provider + model resolution ----
     let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
@@ -308,6 +303,31 @@ async fn run_inner() -> i32 {
         };
     reload_context.dev_extension = dev_extension;
 
+    // ---- post-load stdin claim + initial message ----
+    // Extensions are loaded by `build()` (above). A plugin may have declared
+    // `{"ownsStdio":true}`: this process's stdio belongs to it (an ACP/MCP stdio
+    // server), so the host must neither drain stdin nor run a prompt/TUI mode
+    // that writes to stdout. Only now — after load — do we know. `--mode
+    // rpc`/`--server` already skipped the drain via `wants_rpc_channel`.
+    let stdio_claimed = reload_context
+        .extension_session
+        .lock()
+        .map(|session| session.owns_stdio())
+        .unwrap_or(false);
+    let stdin_text = if wants_rpc_channel || stdio_claimed {
+        None
+    } else {
+        read_piped_stdin()
+    };
+
+    // ---- initial message + extra messages (TS buildInitialMessage) ----
+    let file_text_opt = if file_text.is_empty() {
+        None
+    } else {
+        Some(file_text.as_str())
+    };
+    let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
+
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
     let stdout_is_tty = std::io::stdout().is_terminal();
@@ -330,6 +350,14 @@ async fn run_inner() -> i32 {
     } else {
         mode
     };
+
+    // A plugin that claimed stdio owns this process's stdin/stdout: force the
+    // headless Rpc lifecycle (dispatch BeforeTuiStart + SessionStart, then park)
+    // and let the plugin's own protocol server read/write stdio. This is
+    // authoritative — it must win over TTY detection and RPI_FORCE_TUI,
+    // otherwise the host would start a TUI/print run that writes to a stream the
+    // plugin owns.
+    let mode = if stdio_claimed { RunMode::Rpc } else { mode };
 
     let dev_cleanup = reload_context.dev_extension.clone();
     let dev_watcher = if matches!(mode, RunMode::Interactive) {
@@ -408,18 +436,29 @@ async fn run_inner() -> i32 {
                     );
                 }
 
-                let code = if parsed.unknown_flags.contains_key("server") {
-                    // Server mode: the rpi-server extension owns the TCP server;
-                    // the core just stays alive and tears the session down on
-                    // Ctrl+C (firing SessionShutdown so the extension stops it).
-                    eprintln!("[rpi] running in headless server mode (no TUI); Ctrl+C to stop");
+                let code = if parsed.unknown_flags.contains_key("server") || stdio_claimed {
+                    // Server mode OR a plugin-claimed stdio server: the extension
+                    // owns the process's I/O; the core just stays alive and
+                    // tears the session down on Ctrl+C (firing SessionShutdown
+                    // so the extension stops).
+                    eprintln!(
+                        "[rpi] running in headless mode (no TUI); extension owns stdio; Ctrl+C to stop"
+                    );
                     let _ = tokio::signal::ctrl_c().await;
                     0
                 } else {
                     // `--mode rpc`: JSONL command loop over stdio — the
                     // server-side agent that rpi-server spawns and that
-                    // `rpi --connect` talks to.
-                    crate::modes::rpc(&harness, Some(event_rx), model_catalog).await
+                    // `rpi --connect` talks to. The extension `UiDialog`
+                    // mailbox is bridged over the same channel so a permission
+                    // gate can ask the client mid-run.
+                    crate::modes::rpc(
+                        &harness,
+                        Some(event_rx),
+                        model_catalog,
+                        reload_context.ui_dialog.clone(),
+                    )
+                    .await
                 };
 
                 if let Some(reason) = crate::session::dispatch_session_event_async(

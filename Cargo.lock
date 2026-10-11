@@ -2347,7 +2347,9 @@ dependencies = [
 name = "rpi-plugin-sdk"
 version = "0.3.19"
 dependencies = [
+ "libc",
  "serde_json",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -182,6 +182,142 @@ async fn client_handshakes_and_folds_a_remote_run() {
     client.stop_session(&session_id).await;
 }
 
+#[tokio::test]
+async fn native_driver_receives_answers_and_cancels_remote_approvals() {
+    use rpi_cli::session_driver::{DriverCommand, DriverEvent, RemoteDriver, SessionDriver};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (answers_tx, mut answers_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut writer) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            let value: Value = serde_json::from_str(&line).unwrap();
+            let id = value["id"].clone();
+            match value["method"].as_str().unwrap() {
+                "start_session" => respond(&mut writer, id, json!({"sessionId":"s"})).await,
+                "subscribe" => {
+                    respond(&mut writer, id, json!({"subscriptionId":9})).await;
+                    notify(&mut writer, 9, json!({"type":"ready"})).await;
+                }
+                "send" => {
+                    respond(&mut writer, id, json!({"status":"sent"})).await;
+                    let command = &value["params"]["command"];
+                    match command["type"].as_str().unwrap() {
+                        "prompt" => {
+                            notify(&mut writer, 9, json!({"type":"agent_start"})).await;
+                            notify(&mut writer, 9, json!({"type":"ui_dialog_request", "requestId":"q1",
+                                "toolCallId":"c1", "ui":{"question":"Allow?", "options":["Yes","No"]}})).await;
+                        }
+                        "ui_dialog_response" => {
+                            answers_tx.send(command.clone()).unwrap();
+                            notify(&mut writer, 9, json!({"type":"ui_dialog_closed", "requestId":command["requestId"]})).await;
+                            if command["requestId"] == "q1" {
+                                notify(&mut writer, 9, json!({"type":"ui_dialog_request", "requestId":"q2",
+                                    "toolCallId":"c2", "ui":{"question":"Reason?", "kind":"input"}})).await;
+                            } else {
+                                notify(
+                                    &mut writer,
+                                    9,
+                                    json!({"type":"agent_end","messageCount":0,"messages":[]}),
+                                )
+                                .await;
+                            }
+                        }
+                        "get_state" => {}
+                        other => panic!("unexpected command {other}"),
+                    }
+                }
+                "stop_session" => {
+                    respond(&mut writer, id, json!({"status":"stopped"})).await;
+                    break;
+                }
+                other => panic!("unexpected method {other}"),
+            }
+        }
+    });
+    let driver = RemoteDriver::connect(&addr.to_string(), None)
+        .await
+        .unwrap();
+    let mut events = driver.events().unwrap();
+    driver
+        .send(DriverCommand::Prompt("test".into()))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let DriverEvent::UiDialog(request) = events.recv().await.unwrap() {
+                break request;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.request_id, "q1");
+    assert_eq!(first.tool_call_id.as_deref(), Some("c1"));
+    assert_eq!(first.ui["options"][1], "No");
+    driver
+        .send(DriverCommand::UiDialogResponse {
+            request_id: first.request_id,
+            answer: Some(json!({"values":["No"],"kind":"selector"})),
+        })
+        .await
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(3), answers_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer["requestId"], "q1");
+    assert_eq!(answer["answer"]["values"][0], "No");
+    assert_eq!(answer["cancelled"], false);
+    let second = tokio::time::timeout(Duration::from_secs(3), async {
+        let mut closed_first = false;
+        loop {
+            match events.recv().await.unwrap() {
+                DriverEvent::UiDialogClosed(id) if id == "q1" => closed_first = true,
+                DriverEvent::UiDialog(request) => {
+                    assert!(closed_first);
+                    break request;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(second.request_id, "q2");
+    driver
+        .send(DriverCommand::UiDialogResponse {
+            request_id: second.request_id,
+            answer: None,
+        })
+        .await
+        .unwrap();
+    let cancelled = tokio::time::timeout(Duration::from_secs(3), answers_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled["requestId"], "q2");
+    assert_eq!(cancelled["cancelled"], true);
+    assert!(cancelled.get("answer").is_none());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(events.recv().await.unwrap(), DriverEvent::UiDialogClosed(id) if id == "q2")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    driver.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(3), server)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// The pump must ignore non-event frames (responses) rather than confuse them
 /// with events.
 #[tokio::test]

@@ -276,41 +276,148 @@ fn emit_agent_event(event: &AgentEvent) {
 /// `set_thinking_level`, `set_active_tools`, `ping`, `stop`. `stop` (or stdin
 /// EOF) ends the loop. This is the process `rpi-server` spawns and that
 /// `rpi --connect` talks to. Mirrors TS `runRpcMode` / `modes/rpc`.
+///
+/// The extension `UiDialog` mailbox is bridged over the same channel: the host
+/// emits `{"type":"ui_dialog_request","requestId","toolCallId","ui"}`, and the
+/// client answers with `{"type":"ui_dialog_response","requestId","answer"}` (or
+/// `"cancelled":true`). A `prompt` runs in its own task so this loop keeps
+/// reading — that is what lets `abort` and dialog answers arrive mid-run.
 pub async fn rpc(
     harness: &AgentHarness,
     mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
     model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
 ) -> i32 {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-    use tokio::sync::Mutex as AsyncMutex;
+    rpc_with_io(
+        harness,
+        agent_events.take(),
+        model_catalog,
+        ui_dialog,
+        tokio::io::BufReader::new(tokio::io::stdin()),
+        std::io::stdout(),
+    )
+    .await
+}
+
+async fn rpc_with_io<R, W>(
+    harness: &AgentHarness,
+    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+    ui_dialog: rpi_extensions::UiDialogMailbox,
+    input: R,
+    output: W,
+) -> i32
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+    W: Write + Send + 'static,
+{
+    use tokio::io::AsyncBufReadExt;
 
     let lane: Arc<dyn AgentLane> = harness.lane("main");
-    let stdout = Arc::new(AsyncMutex::new(tokio::io::stdout()));
+    // One blocking writer owns stdout. Producers only enqueue bounded messages,
+    // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
+    let (stdout, writer_task, writer_failed) = start_rpc_writer(output);
+    let pump_stop = tokio_util::sync::CancellationToken::new();
 
+    // A completion response is queued only after its final events, so a
+    // subsequent prompt cannot overtake the previous run's agent_end.
+    let (event_flush_tx, mut event_flush_rx) =
+        tokio::sync::mpsc::unbounded_channel::<tokio::sync::oneshot::Sender<()>>();
     // Stream fine-grained AgentEvents as JSONL until the receiver closes.
-    if let Some(mut rx) = agent_events.take() {
-        let out = Arc::clone(&stdout);
+    let event_task = agent_events.take().map(|mut rx| {
+        let out = stdout.clone();
+        let stop = pump_stop.clone();
         tokio::spawn(async move {
             loop {
-                match rx.recv().await {
+                let received = tokio::select! {
+                    _ = stop.cancelled() => {
+                        drain_rpc_events(&out, &mut rx).await;
+                        break;
+                    }
+                    Some(done) = event_flush_rx.recv() => {
+                        drain_rpc_events(&out, &mut rx).await;
+                        let _ = done.send(());
+                        continue;
+                    }
+                    event = rx.recv() => event,
+                };
+                match received {
                     Ok(event) => write_line(&out, &agent_event_json(&event)).await,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
-        });
-    }
+        })
+    });
+
+    let event_flush = event_task.as_ref().map(|_| event_flush_tx);
+
+    // Bridge the extension `UiDialog` mailbox over the rpc channel so a
+    // permission-gate extension can ask the client a question mid-run: we emit
+    // `{"type":"ui_dialog_request",…}` and answer it from a
+    // `{"type":"ui_dialog_response",…}` on stdin. Without this a headless run
+    // leaves the mailbox detached and every `UiDialog` call fails.
+    ui_dialog.attach();
+    let dialog_task = {
+        let mailbox = ui_dialog.clone();
+        let out = stdout.clone();
+        let stop = pump_stop.clone();
+        tokio::spawn(async move {
+            let mut shown = std::collections::HashSet::new();
+            while !stop.is_cancelled() {
+                while let Some(request) = mailbox.take_pending() {
+                    let event = crate::remote::protocol::RemoteEvent::UiDialogRequest {
+                        request_id: request.request_id.clone(),
+                        tool_call_id: request.tool_call_id,
+                        ui: request.ui,
+                    };
+                    write_line(&out, &serde_json::to_value(event).unwrap()).await;
+                    shown.insert(request.request_id);
+                }
+                let closed: Vec<String> = shown
+                    .iter()
+                    .filter(|id| !mailbox.is_pending(id))
+                    .cloned()
+                    .collect();
+                for request_id in closed {
+                    shown.remove(&request_id);
+                    let event = crate::remote::protocol::RemoteEvent::UiDialogClosed { request_id };
+                    write_line(&out, &serde_json::to_value(event).unwrap()).await;
+                }
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(30)) => {}
+                }
+            }
+        })
+    };
+
+    // A `prompt` runs in a spawned task so this loop keeps reading stdin while
+    // the run is active — otherwise `abort` and `ui_dialog_response` could not
+    // be delivered mid-run. Only one prompt may be in flight at a time.
+    let run_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut run_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut run_cancel = tokio_util::sync::CancellationToken::new();
+    let mut cancel_on_exit = false;
 
     // Readiness marker: a host/client can wait for the first line.
     write_line(&stdout, &serde_json::json!({"type": "ready"})).await;
 
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut lines = input.lines();
     loop {
-        let line = match lines.next_line().await {
+        let incoming = tokio::select! {
+            _ = writer_failed.cancelled() => {
+                cancel_on_exit = true;
+                break;
+            }
+            line = lines.next_line() => line,
+        };
+        let line = match incoming {
             Ok(Some(line)) => line,
             Ok(None) => break, // EOF
             Err(error) => {
                 eprintln!("[rpi] rpc stdin error: {error}");
+                cancel_on_exit = true;
                 break;
             }
         };
@@ -340,17 +447,107 @@ pub async fn rpc(
             .unwrap_or("")
             .to_string();
 
-        if kind == "stop" {
-            write_line(
-                &stdout,
-                &RemoteResponse::ok(id.clone(), serde_json::json!({"stopped": true})).to_json(),
-            )
-            .await;
-            break;
+        match kind.as_str() {
+            "ui_dialog_response" => {
+                let request_id = msg
+                    .get("requestId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let result = if msg
+                    .get("cancelled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    ui_dialog.cancel(&request_id)
+                } else {
+                    let answer = msg
+                        .get("answer")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    ui_dialog.respond(&request_id, answer)
+                };
+                if msg.get("id").is_some() {
+                    let response = match result {
+                        Ok(()) => RemoteResponse::ok(
+                            id,
+                            serde_json::json!({"accepted":true,"requestId":request_id}),
+                        ),
+                        Err(error) => RemoteResponse::error(id, error),
+                    };
+                    write_line(&stdout, &response.to_json()).await;
+                } else if let Err(error) = result {
+                    eprintln!("[rpi] ui_dialog_response: {error}");
+                }
+                continue;
+            }
+            "stop" => {
+                cancel_on_exit = true;
+                write_line(
+                    &stdout,
+                    &RemoteResponse::ok(id.clone(), serde_json::json!({"stopped": true})).to_json(),
+                )
+                .await;
+                break;
+            }
+            "prompt" => {
+                if run_active.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    write_line(
+                        &stdout,
+                        &RemoteResponse::error(id.clone(), "a run is already active").to_json(),
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(task) = run_task.take() {
+                    let _ = task.await;
+                }
+                run_cancel = tokio_util::sync::CancellationToken::new();
+                let cancel_task = run_cancel.clone();
+                let content = msg
+                    .get("content")
+                    .or_else(|| msg.get("prompt"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned);
+                let lane_task = Arc::clone(&lane);
+                let out_task = stdout.clone();
+                let active_task = Arc::clone(&run_active);
+                let mailbox_task = ui_dialog.clone();
+                let id_task = id.clone();
+                let flush_events = event_flush.clone();
+                run_task = Some(tokio::spawn(async move {
+                    let result = match content {
+                        Some(content) => {
+                            rpc_prompt_cancellable(&lane_task, &content, cancel_task).await
+                        }
+                        None => Err("prompt requires a string `content`".to_string()),
+                    };
+                    let response = match result {
+                        Ok(value) => RemoteResponse::ok(id_task, value),
+                        Err(error) => RemoteResponse::error(id_task, error),
+                    };
+                    if let Some(flush) = flush_events {
+                        let (done, drained) = tokio::sync::oneshot::channel();
+                        if flush.send(done).is_ok() {
+                            let _ = drained.await;
+                        }
+                    }
+                    write_line(&out_task, &response.to_json()).await;
+                    // A finished/aborted run leaves no dialog outstanding.
+                    mailbox_task.cancel_all();
+                    active_task.store(false, std::sync::atomic::Ordering::Release);
+                }));
+                continue;
+            }
+            _ => {}
         }
 
         let result = match kind.as_str() {
-            "prompt" => rpc_prompt(&lane, &msg).await,
+            "abort" if run_active.load(std::sync::atomic::Ordering::Acquire) => {
+                // This also covers abort arriving before the task enters the lane.
+                run_cancel.cancel();
+                Ok(serde_json::json!({"aborted": true}))
+            }
             "abort" => lane
                 .abort()
                 .await
@@ -371,16 +568,104 @@ pub async fn rpc(
         write_line(&stdout, &response.to_json()).await;
     }
 
-    let _ = stdout.lock().await.flush().await;
-    0
+    // EOF closes the input half of the protocol, not an accepted prompt.
+    // There can be no more dialog answers, so release approvals, then await the
+    // run before SessionShutdown can unload plugins or the runtime exits.
+    ui_dialog.detach();
+    if cancel_on_exit {
+        run_cancel.cancel();
+    }
+    let mut exit_code = 0;
+    if let Some(task) = run_task {
+        if let Err(error) = task.await {
+            eprintln!("[rpi] rpc prompt task failed: {error}");
+            exit_code = 1;
+        }
+    }
+    pump_stop.cancel();
+    let _ = dialog_task.await;
+    if let Some(task) = event_task {
+        let _ = task.await;
+    }
+    // All producers have joined; close the queue and flush every queued line.
+    drop(stdout);
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        error => {
+            eprintln!("[rpi] rpc output failed: {error:?}");
+            exit_code = 1;
+        }
+    }
+    exit_code
 }
 
-async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, value: &serde_json::Value) {
-    use tokio::io::AsyncWriteExt;
-    let mut guard = out.lock().await;
-    let _ = guard.write_all(value.to_string().as_bytes()).await;
-    let _ = guard.write_all(b"\n").await;
-    let _ = guard.flush().await;
+#[derive(Clone)]
+struct RpcWriter(tokio::sync::mpsc::Sender<Vec<u8>>);
+
+fn start_rpc_writer<W: Write + Send + 'static>(
+    mut output: W,
+) -> (
+    RpcWriter,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+    tokio_util::sync::CancellationToken,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let failed = tokio_util::sync::CancellationToken::new();
+    let failure_signal = failed.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let result = (|| {
+            while let Some(line) = rx.blocking_recv() {
+                output.write_all(&line)?;
+                output.flush()?;
+            }
+            output.flush()
+        })();
+        if result.is_err() {
+            failure_signal.cancel();
+        }
+        result
+    });
+    (RpcWriter(tx), task, failed)
+}
+
+async fn write_line(out: &RpcWriter, value: &serde_json::Value) {
+    let mut line = value.to_string().into_bytes();
+    line.push(b'\n');
+    let _ = out.0.send(line).await;
+}
+
+async fn drain_rpc_events(
+    out: &RpcWriter,
+    events: &mut tokio::sync::broadcast::Receiver<AgentEvent>,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(event) => write_line(out, &agent_event_json(&event)).await,
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+/// Cancellation is delivered even if abort/stop arrives before prompt_text has
+/// registered a run. Once active, await its normal aborted outcome and cleanup.
+async fn rpc_prompt_cancellable(
+    lane: &Arc<dyn AgentLane>,
+    content: &str,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<serde_json::Value, String> {
+    let prompt = rpc_prompt_text(lane, content);
+    tokio::pin!(prompt);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => {
+            match lane.abort().await {
+                Ok(_) => prompt.await,
+                Err(_) => Err("Operation aborted".to_string()),
+            }
+        }
+        result = &mut prompt => result,
+    }
 }
 
 fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>) {
@@ -398,18 +683,12 @@ fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>
     }
 }
 
-async fn rpc_prompt(
+async fn rpc_prompt_text(
     lane: &Arc<dyn AgentLane>,
-    msg: &serde_json::Value,
+    content: &str,
 ) -> Result<serde_json::Value, String> {
-    let content = msg
-        .get("content")
-        .or_else(|| msg.get("prompt"))
-        .and_then(|v| v.as_str())
-        .ok_or("prompt requires a string `content`")?
-        .to_string();
     let result = lane
-        .prompt_text(&content, Vec::new())
+        .prompt_text(content, Vec::new())
         .await
         .map_err(|e| e.to_string())?;
     let (outcome, final_text) = rpc_outcome_str(&result.outcome);
@@ -729,6 +1008,475 @@ mod tests {
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    #[derive(Clone, Default)]
+    struct RpcOutput(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RpcOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RpcOutput {
+        fn messages(&self) -> Vec<serde_json::Value> {
+            String::from_utf8(self.0.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+
+        async fn wait_for(
+            &self,
+            predicate: impl Fn(&serde_json::Value) -> bool,
+        ) -> serde_json::Value {
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                loop {
+                    if let Some(message) = self.messages().into_iter().find(&predicate) {
+                        return message;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("RPC message not received")
+        }
+    }
+
+    async fn rpc_test_harness(
+        text: &str,
+        tokens_per_second: f64,
+    ) -> (AgentHarness, Arc<rpi_ai::providers::faux::FauxProvider>) {
+        let provider = rpi_ai::providers::faux::FauxProvider::new(
+            rpi_ai::providers::faux::FauxScript::new()
+                .with_text(text)
+                .with_tokens_per_second(tokens_per_second),
+        );
+        let options = rpi_harness::types::AgentHarnessOptions {
+            model: provider.default_model().clone(),
+            models: vec![provider.clone()],
+            ..Default::default()
+        };
+        (AgentHarness::create(options).await.unwrap(), provider)
+    }
+
+    fn start_test_rpc(
+        harness: AgentHarness,
+        ui: rpi_extensions::UiDialogMailbox,
+    ) -> (
+        tokio::io::DuplexStream,
+        RpcOutput,
+        tokio::task::JoinHandle<i32>,
+    ) {
+        let (client, input) = tokio::io::duplex(4096);
+        let output = RpcOutput::default();
+        let captured = output.clone();
+        let task = tokio::spawn(async move {
+            rpc_with_io(
+                &harness,
+                None,
+                vec![],
+                ui,
+                tokio::io::BufReader::new(input),
+                captured,
+            )
+            .await
+        });
+        (client, output, task)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_eof_waits_for_accepted_prompt() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) = rpc_test_harness("completed", 100.0).await;
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        client
+            .write_all(b"{\"type\":\"prompt\",\"id\":1,\"content\":\"test\"}\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let response = output
+            .messages()
+            .into_iter()
+            .find(|m| m["id"] == 1)
+            .unwrap();
+        assert_eq!(response["result"]["outcome"], "completed");
+        assert_eq!(response["result"]["finalText"], "completed");
+        assert!(!ui.is_attached());
+    }
+
+    #[tokio::test]
+    async fn rpc_eof_drains_queued_final_events() {
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel(256);
+        for _ in 0..100 {
+            tx.send(AgentEvent::AgentStart).unwrap();
+        }
+        tx.send(AgentEvent::AgentEnd { messages: vec![] }).unwrap();
+        let output = RpcOutput::default();
+        let code = rpc_with_io(
+            &harness,
+            Some(rx),
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            tokio::io::BufReader::new(&b""[..]),
+            output.clone(),
+        )
+        .await;
+        assert_eq!(code, 0);
+        let messages = output.messages();
+        assert_eq!(
+            messages.len(),
+            102,
+            "ready plus every queued event must be flushed"
+        );
+        assert_eq!(messages.last().unwrap()["type"], "agent_end");
+    }
+
+    struct BackpressuredOutput {
+        entered: Arc<std::sync::atomic::AtomicBool>,
+        release: Arc<std::sync::atomic::AtomicBool>,
+        output: RpcOutput,
+    }
+
+    impl Write for BackpressuredOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            while !self.release.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            self.output.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_output_backpressure_is_bounded_and_keeps_workers_responsive() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let release = Arc::new(AtomicBool::new(false));
+        struct ReleaseOnDrop(Arc<AtomicBool>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _release = ReleaseOnDrop(release.clone());
+        let entered = Arc::new(AtomicBool::new(false));
+        let output = RpcOutput::default();
+        let (writer, task, _) = start_rpc_writer(BackpressuredOutput {
+            entered: entered.clone(),
+            release: release.clone(),
+            output: output.clone(),
+        });
+        write_line(&writer, &serde_json::json!({"id": 0})).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !entered.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let producer_writer = writer.clone();
+        let producer = tokio::spawn(async move {
+            for id in 1..=100 {
+                write_line(&producer_writer, &serde_json::json!({"id": id})).await;
+            }
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            tokio::time::sleep(std::time::Duration::from_millis(20)),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !producer.is_finished(),
+            "the bounded queue must apply backpressure"
+        );
+        release.store(true, Ordering::SeqCst);
+        producer.await.unwrap();
+        drop(writer);
+        task.await.unwrap().unwrap();
+        let messages = output.messages();
+        assert_eq!(messages.len(), 101);
+        for (index, message) in messages.iter().enumerate() {
+            assert_eq!(message["id"], index);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_completion_response_follows_final_event_under_backpressure() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (harness, _) = rpc_test_harness("completed", 0.0).await;
+        let (emitter, events) = rpi_agent::events::BroadcastEmitter::new(256);
+        harness
+            .set_agent_emitter(Some(Arc::new(emitter)))
+            .await
+            .unwrap();
+        let output = RpcOutput::default();
+        let release = Arc::new(AtomicBool::new(false));
+        let release_writer = release.clone();
+        let release_thread = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            release_writer.store(true, Ordering::SeqCst);
+        });
+        let code = rpc_with_io(
+            &harness,
+            Some(events),
+            vec![],
+            rpi_extensions::UiDialogMailbox::new(),
+            tokio::io::BufReader::new(
+                &b"{\"type\":\"prompt\",\"id\":1,\"content\":\"test\"}\n"[..],
+            ),
+            BackpressuredOutput {
+                entered: Arc::new(AtomicBool::new(false)),
+                release,
+                output: output.clone(),
+            },
+        )
+        .await;
+        release_thread.join().unwrap();
+        assert_eq!(code, 0);
+        let messages = output.messages();
+        let end = messages
+            .iter()
+            .position(|m| m["type"] == "agent_end")
+            .unwrap();
+        let response = messages.iter().position(|m| m["id"] == 1).unwrap();
+        assert!(
+            end < response,
+            "a new prompt must not overtake the previous agent_end"
+        );
+        assert_eq!(messages[response]["result"]["outcome"], "completed");
+    }
+
+    #[tokio::test]
+    async fn rpc_output_failure_closes_without_waiting_for_more_input() {
+        struct BrokenOutput;
+        impl Write for BrokenOutput {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "closed client output",
+                ))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let (_client, input) = tokio::io::duplex(4096);
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let code = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            rpc_with_io(
+                &harness,
+                None,
+                vec![],
+                ui.clone(),
+                tokio::io::BufReader::new(input),
+                BrokenOutput,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(code, 1);
+        assert!(!ui.is_attached());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_stop_aborts_and_joins_active_prompt() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, provider) = rpc_test_harness("still streaming the response", 20.0).await;
+        let lane = harness.lane("main");
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client
+            .write_all(b"{\"type\":\"prompt\",\"id\":1,\"content\":\"test\"}\n")
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while provider
+                .state()
+                .call_count
+                .load(std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client
+            .write_all(b"{\"type\":\"stop\",\"id\":2}\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let messages = output.messages();
+        assert_eq!(
+            messages.iter().find(|m| m["id"] == 1).unwrap()["result"]["outcome"],
+            "aborted"
+        );
+        assert_eq!(
+            messages.iter().find(|m| m["id"] == 2).unwrap()["result"]["stopped"],
+            true
+        );
+        assert!(
+            lane.abort().await.is_err(),
+            "RPC returned with an active lane"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_immediate_stop_cancels_prompt_before_or_after_lane_start() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) = rpc_test_harness("not completed", 20.0).await;
+        let lane = harness.lane("main");
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client.write_all(b"{\"type\":\"prompt\",\"id\":1,\"content\":\"test\"}\n{\"type\":\"stop\",\"id\":2}\n").await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let response = output
+            .messages()
+            .into_iter()
+            .find(|m| m["id"] == 1)
+            .unwrap();
+        assert!(
+            response["result"]["outcome"] == "aborted" || response["error"] == "Operation aborted",
+            "{response}"
+        );
+        assert!(lane.abort().await.is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_dialog_answers_and_ping_are_read_while_prompt_runs() {
+        use tokio::io::AsyncWriteExt;
+        let (harness, _) =
+            rpc_test_harness("the streamed response finishes after the dialog", 30.0).await;
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        output.wait_for(|m| m["type"] == "ready").await;
+        client
+            .write_all(b"{\"type\":\"prompt\",\"id\":1,\"content\":\"test\"}\n")
+            .await
+            .unwrap();
+        ui.handle(serde_json::json!({"requestId":"approval", "toolCallId":"call", "ui":{}}))
+            .unwrap();
+        output.wait_for(|m| m["type"] == "ui_dialog_request").await;
+        client.write_all(b"{\"type\":\"ui_dialog_response\",\"requestId\":\"approval\",\"answer\":true}\n{\"type\":\"ping\",\"id\":2}\n").await.unwrap();
+        output.wait_for(|m| m["id"] == 2).await;
+        assert_eq!(ui.poll("approval").unwrap()["answer"], true);
+        output
+            .wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == "approval")
+            .await;
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            output
+                .messages()
+                .into_iter()
+                .find(|m| m["id"] == 1)
+                .unwrap()["result"]["outcome"],
+            "completed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_notifies_client_when_an_approval_is_cancelled() {
+        use tokio::io::AsyncWriteExt;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        output.wait_for(|m| m["type"] == "ready").await;
+        ui.handle(serde_json::json!({"requestId":"cancelled", "toolCallId":"c", "ui":{}}))
+            .unwrap();
+        output.wait_for(|m| m["type"] == "ui_dialog_request").await;
+        ui.cancel_tool_call("c");
+        output
+            .wait_for(|m| m["type"] == "ui_dialog_closed" && m["requestId"] == "cancelled")
+            .await;
+        // The notification must not consume the cancellation meant for the plugin.
+        assert_eq!(ui.poll("cancelled").unwrap()["status"], "cancelled");
+        client.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn rpc_accepts_native_dialog_responses_without_consuming_plugin_answers() {
+        use crate::remote::protocol::RemoteCommand;
+        use tokio::io::AsyncWriteExt;
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let ui = rpi_extensions::UiDialogMailbox::new();
+        let (mut client, output, task) = start_test_rpc(harness, ui.clone());
+        output.wait_for(|m| m["type"] == "ready").await;
+        for (request_id, answer, response_id) in [
+            (
+                "answered",
+                Some(serde_json::json!({"values":["No"],"kind":"selector"})),
+                5,
+            ),
+            ("cancelled", None, 6),
+        ] {
+            ui.handle(serde_json::json!({"requestId":request_id,"toolCallId":request_id,"ui":{}}))
+                .unwrap();
+            output
+                .wait_for(|m| m["type"] == "ui_dialog_request" && m["requestId"] == request_id)
+                .await;
+            let command = RemoteCommand::UiDialogResponse {
+                request_id: request_id.into(),
+                cancelled: answer.is_none(),
+                answer,
+            }
+            .with_id(response_id);
+            client
+                .write_all(format!("{command}\n").as_bytes())
+                .await
+                .unwrap();
+            let ack = output.wait_for(|m| m["id"] == response_id).await;
+            assert_eq!(ack["result"]["accepted"], true);
+            let result = ui.poll(request_id).unwrap();
+            if request_id == "answered" {
+                assert_eq!(result["answer"]["values"][0], "No");
+            } else {
+                assert_eq!(result["status"], "cancelled");
+            }
+        }
+        client.shutdown().await.unwrap();
+        assert_eq!(task.await.unwrap(), 0);
+    }
 
     fn assistant(text: &str, stop: StopReason) -> AssistantMessage {
         AssistantMessage {

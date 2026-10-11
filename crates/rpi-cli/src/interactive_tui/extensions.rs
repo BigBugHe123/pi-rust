@@ -575,16 +575,16 @@ impl AskUserBridge {
 /// flat native question contract and the earlier `questions[0]` alias, plus a
 /// `confirm` summary.
 #[derive(Clone)]
-pub(super) struct AskUserPrompt {
-    pub(super) question_id: String,
-    pub(super) question: String,
-    pub(super) header: Option<String>,
-    pub(super) context: Option<String>,
-    pub(super) options: Vec<(String, Option<String>)>,
-    pub(super) allow_multiple: bool,
-    pub(super) allow_freeform: bool,
-    pub(super) suggest: Option<String>,
-    pub(super) kind: String,
+pub(crate) struct AskUserPrompt {
+    pub(crate) question_id: String,
+    pub(crate) question: String,
+    pub(crate) header: Option<String>,
+    pub(crate) context: Option<String>,
+    pub(crate) options: Vec<(String, Option<String>)>,
+    pub(crate) allow_multiple: bool,
+    pub(crate) allow_freeform: bool,
+    pub(crate) suggest: Option<String>,
+    pub(crate) kind: String,
 }
 
 pub(super) fn ask_user_str(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -636,7 +636,7 @@ pub(super) fn ask_user_options(value: &serde_json::Value) -> Vec<(String, Option
     options
 }
 
-pub(super) fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -> AskUserPrompt {
+pub(crate) fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -> AskUserPrompt {
     let ui = &request.ui;
     let kind = ui
         .get("kind")
@@ -695,7 +695,7 @@ pub(super) fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -
 
 /// Build the shared header frame for an ask-user prompt.
 /// Uses markdown-aware rendering for question and context content.
-pub(super) fn ask_user_frame(
+pub(crate) fn ask_user_frame(
     prompt: &AskUserPrompt,
     body: Arc<dyn Component>,
     hint: &str,

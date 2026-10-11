@@ -35,6 +35,11 @@ use crate::transcript_view::{UiEvent, UiToolCall};
 /// A command the TUI sends to its backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DriverCommand {
+    /// Answer or cancel a remote question by request id.
+    UiDialogResponse {
+        request_id: String,
+        answer: Option<Value>,
+    },
     /// Run a prompt on the backend's main lane.
     Prompt(String),
     /// Interrupt the in-flight run.
@@ -64,6 +69,8 @@ pub struct DriverStatus {
 /// An item pushed from a driver to the TUI.
 #[derive(Debug, Clone)]
 pub enum DriverEvent {
+    UiDialog(rpi_extensions::UiDialogRequest),
+    UiDialogClosed(String),
     /// A transcript event.
     Ui(UiEvent),
     /// A fresh session-state snapshot.
@@ -248,8 +255,8 @@ impl RemoteDriver {
                     }
                 }
                 if let Ok(event) = serde_json::from_value::<RemoteEvent>(line) {
-                    if let Some(ui) = map_remote_event(&event) {
-                        let _ = tx.send(DriverEvent::Ui(ui));
+                    if let Some(event) = map_remote_driver_event(&event) {
+                        let _ = tx.send(event);
                     }
                 }
             }
@@ -282,6 +289,13 @@ impl SessionDriver for RemoteDriver {
 
     async fn send(&self, command: DriverCommand) -> Result<(), String> {
         let remote = match command {
+            DriverCommand::UiDialogResponse { request_id, answer } => {
+                RemoteCommand::UiDialogResponse {
+                    request_id,
+                    cancelled: answer.is_none(),
+                    answer,
+                }
+            }
             DriverCommand::Prompt(content) => RemoteCommand::Prompt { content },
             DriverCommand::Abort => RemoteCommand::Abort,
             DriverCommand::RefreshState => RemoteCommand::GetState,
@@ -316,12 +330,34 @@ fn status_of(session: &RemoteSession) -> DriverStatus {
     }
 }
 
+/// Preserve dialog messages alongside transcript events; they are not part
+/// of the transcript and must reach the shell's modal input slot.
+fn map_remote_driver_event(event: &RemoteEvent) -> Option<DriverEvent> {
+    match event {
+        RemoteEvent::UiDialogRequest {
+            request_id,
+            tool_call_id,
+            ui,
+        } => Some(DriverEvent::UiDialog(rpi_extensions::UiDialogRequest {
+            request_id: request_id.clone(),
+            tool_call_id: tool_call_id.clone(),
+            ui: ui.clone(),
+            raw: serde_json::to_value(event).unwrap_or(Value::Null),
+        })),
+        RemoteEvent::UiDialogClosed { request_id } => {
+            Some(DriverEvent::UiDialogClosed(request_id.clone()))
+        }
+        _ => map_remote_event(event).map(DriverEvent::Ui),
+    }
+}
+
 /// Project a wire [`RemoteEvent`] into the shared [`UiEvent`].
 pub fn map_remote_event(event: &RemoteEvent) -> Option<UiEvent> {
     use crate::remote::session::message_role;
     use crate::transcript_view::{assistant_blocks_from_value, tool_calls_from_value};
 
     match event {
+        RemoteEvent::UiDialogRequest { .. } | RemoteEvent::UiDialogClosed { .. } => None,
         RemoteEvent::AgentStart => Some(UiEvent::AgentStart),
         RemoteEvent::AgentEnd { .. } => Some(UiEvent::AgentEnd),
         RemoteEvent::RetryScheduled {
@@ -446,6 +482,9 @@ impl SessionDriver for LocalDriver {
 
     async fn send(&self, command: DriverCommand) -> Result<(), String> {
         match command {
+            DriverCommand::UiDialogResponse { .. } => {
+                Err("local driver has no dialog mailbox".to_string())
+            }
             DriverCommand::Prompt(text) => {
                 // Drive the run on a background task: `prompt_text` only returns
                 // once the run completes, but a driver `send` must not block the
@@ -580,6 +619,23 @@ fn parse_thinking_level_name(name: &str) -> Option<ThinkingLevel> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn remote_dialogs_are_forwarded_as_modal_events() {
+        let request: RemoteEvent = serde_json::from_value(json!({
+            "type":"ui_dialog_request", "requestId":"q1", "toolCallId":"c1", "ui":{"question":"Allow?"},
+        })).unwrap();
+        let Some(DriverEvent::UiDialog(request)) = map_remote_driver_event(&request) else {
+            panic!("dialog was dropped")
+        };
+        assert_eq!(request.request_id, "q1");
+        assert_eq!(request.tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(request.ui["question"], "Allow?");
+        assert!(
+            matches!(map_remote_driver_event(&RemoteEvent::UiDialogClosed { request_id: "q1".into() }),
+            Some(DriverEvent::UiDialogClosed(id)) if id == "q1")
+        );
+    }
 
     #[test]
     fn map_remote_event_ignores_non_assistant_messages() {

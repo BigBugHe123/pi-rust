@@ -7,7 +7,7 @@
 //! the same shell serves the remote client today and the in-process host once
 //! its runner adopts the driver seam.
 //!
-//! Local-only capabilities (session tree, extensions, selectors) are not part of
+//! Local-only capabilities (session tree and extension management) are not part of
 //! this shell: it is the transport-agnostic floor both frontends share.
 //!
 //! [`UiEvent`]: crate::transcript_view::UiEvent
@@ -24,6 +24,9 @@ use rpi_tui::{
 
 use crate::session_driver::{DriverCommand, DriverEvent, DriverStatus, SessionDriver};
 use crate::transcript_view::TranscriptView;
+
+mod dialogs;
+use dialogs::ShellDialogs;
 
 /// Drive the generic shell against `driver` until the user exits (or the
 /// driver's event stream ends). `addr` is a display label for the banner.
@@ -45,6 +48,8 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
     let view = TranscriptView::new(transcript_container.clone());
 
     let editor = Arc::new(Editor::simple());
+    let editor_slot = Arc::new(Container::new());
+    editor_slot.add_child(editor.clone());
 
     // Layout mirrors the local TUI's bottom dock: transcript (grow) over
     // status slot + editor + footer.
@@ -57,7 +62,7 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
                 .min_size(1),
         ),
         StackChild::Entry(StackEntry::new(chrome.status.clone())),
-        StackChild::Entry(StackEntry::new(editor.clone()).shrink(0).min_size(3)),
+        StackChild::Entry(StackEntry::new(editor_slot.clone()).shrink(0).min_size(3)),
         StackChild::Entry(StackEntry::new(chrome.footer.clone())),
     ]);
     let root: Arc<dyn Component> = Arc::new(root);
@@ -81,20 +86,24 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
     }));
 
     let input_tui = tui.clone();
-    let _reader = tokio::task::spawn_blocking(move || loop {
-        match crossterm::event::poll(Duration::from_millis(50)) {
-            Ok(true) => {}
-            Ok(false) => continue,
-            Err(_) => break,
-        }
-        match crossterm::event::read() {
-            Ok(event) => {
-                let _ = input_tui.refresh_size();
-                if input_tx.send(event).is_err() {
-                    break;
-                }
+    let reader_stop = tokio_util::sync::CancellationToken::new();
+    let stop_reader = reader_stop.clone();
+    let reader = tokio::task::spawn_blocking(move || {
+        while !stop_reader.is_cancelled() {
+            match crossterm::event::poll(Duration::from_millis(50)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
             }
-            Err(_) => break,
+            match crossterm::event::read() {
+                Ok(event) => {
+                    let _ = input_tui.refresh_size();
+                    if input_tx.send(event).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
         }
     });
 
@@ -111,12 +120,15 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
         &mut submit_rx,
         &tui,
         &editor,
+        &editor_slot,
         &chrome,
         &view,
         addr,
     )
     .await;
 
+    reader_stop.cancel();
+    let _ = reader.await;
     tui.stop(Default::default());
     outcome
 }
@@ -130,6 +142,7 @@ async fn run_loop<D: SessionDriver>(
     submit_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     tui: &Arc<TuiAltScreen>,
     editor: &Arc<Editor>,
+    editor_slot: &Arc<Container>,
     chrome: &ChatChrome,
     view: &TranscriptView,
     addr: &str,
@@ -139,12 +152,20 @@ async fn run_loop<D: SessionDriver>(
     // tick). Idle screens never request a frame.
     let mut ticker = tokio::time::interval(Duration::from_millis(120));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (dialog_tx, mut dialog_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut dialogs = ShellDialogs::new(dialog_tx);
     loop {
+        dialogs.sync_view(editor_slot, editor, tui);
         tokio::select! {
             maybe_event = events.recv() => {
                 let Some(event) = maybe_event else { break };
                 match event {
-                    DriverEvent::Ui(ui) => view.apply(&ui, tui.width()),
+                    DriverEvent::UiDialog(request) => dialogs.push(request),
+                    DriverEvent::UiDialogClosed(id) => dialogs.close(&id),
+                    DriverEvent::Ui(ui) => {
+                        if matches!(ui, crate::transcript_view::UiEvent::AgentEnd) { let _ = dialogs.clear(); }
+                        view.apply(&ui, tui.width());
+                    }
                     DriverEvent::Status(next) => {
                         *status = next;
                         sync_working(editor, status.streaming);
@@ -170,15 +191,23 @@ async fn run_loop<D: SessionDriver>(
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         crate::key_trace::key(&key, "driver-tui");
                         if is_ctrl(&key, 'c') {
+                            let had_dialog = dialogs.has_active();
+                            for cancel in dialogs.clear() {
+                                let _ = driver.send(cancel).await;
+                            }
                             if status.streaming {
                                 view.add_notice("aborting…");
                                 let _ = driver.send(DriverCommand::Abort).await;
-                            } else {
+                            } else if !had_dialog {
                                 break;
                             }
-                        } else {
+                        } else if !dialogs.handle_key(key) {
                             editor.handle_key(key);
                         }
+                        tui.request_render(false);
+                    }
+                    Event::Paste(text) => {
+                        if !dialogs.handle_paste(&text) { editor.insert(&text); }
                         tui.request_render(false);
                     }
                     other => {
@@ -188,6 +217,9 @@ async fn run_loop<D: SessionDriver>(
             }
             maybe_text = submit_rx.recv() => {
                 let Some(text) = maybe_text else { break };
+                // A normal editor submission queued before a question arrived
+                // must not bypass the active approval UI.
+                if dialogs.has_active() { continue; }
                 match handle_submit(driver, status, view, &text).await {
                     Ok(SubmitAction::Continue) => {}
                     Ok(SubmitAction::Quit) => break,
@@ -195,6 +227,14 @@ async fn run_loop<D: SessionDriver>(
                 }
                 editor.clear();
                 tui.request_render(false);
+            }
+            Some(action) = dialog_rx.recv() => {
+                if let Some((id, command)) = dialogs.action(action) {
+                    match driver.send(command).await {
+                        Ok(()) => dialogs.close(&id),
+                        Err(error) => view.add_notice(&format!("error: {error}")),
+                    }
+                }
             }
             _ = ticker.tick() => {
                 let retrying = chrome.tick_retry();
@@ -204,6 +244,9 @@ async fn run_loop<D: SessionDriver>(
             }
             else => break,
         }
+    }
+    for cancel in dialogs.clear() {
+        let _ = driver.send(cancel).await;
     }
     Ok(())
 }

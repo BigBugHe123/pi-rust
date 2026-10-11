@@ -60,6 +60,14 @@ use core::ffi::c_char;
 use core::ffi::c_void;
 use core::ptr;
 
+#[cfg(feature = "json")]
+pub mod callbacks;
+#[cfg(feature = "json")]
+pub mod events;
+pub mod handles;
+#[cfg(feature = "process")]
+pub mod process;
+
 // ---------------------------------------------------------------------------
 // StbString — owned UTF-8 crossing as ptr+len with an explicit free
 // ---------------------------------------------------------------------------
@@ -248,7 +256,7 @@ impl StbString {
 
 /// Helpers to cross structured data as JSON-in-`StbString`. See the module docs
 /// for the precision/order limit.
-#[cfg(any(feature = "json", doc))]
+#[cfg(feature = "json")]
 pub mod json {
     use super::StbString;
     use serde_json::Value;
@@ -752,9 +760,9 @@ pub union EventPayload {
 
 /// One event dispatched to a plugin handler. The host translates its native
 /// `AgentEvent` / `HarnessEvent` into this and calls every registered handler
-/// for the `tag` (dispatch wrapped in `catch_unwind`). Ownership of the
-/// [`StbString`]s passes to the handler; the handler frees them via the host's
-/// `free_string`.
+/// for the `tag`. Event buffers are borrowed during fan-out: handlers must not
+/// free them or retain their pointers. The host frees them after all handlers
+/// return. Use `events::EventView` to retain owned payload copies.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct StablePluginEvent {
@@ -1430,6 +1438,7 @@ mod tests {
         assert_eq!(freed_count(), 0);
     }
 
+    #[cfg(feature = "json")]
     #[test]
     fn json_round_trip_preserves_structure() {
         let val = serde_json::json!({ "name": "echo", "args": [1, 2, 3], "ok": true });
