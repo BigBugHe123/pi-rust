@@ -254,10 +254,10 @@ struct CommandContext {
     lane: Arc<dyn AgentLane>,
     model_catalog: Arc<Vec<rpi_ai::Model>>,
     cwd: std::path::PathBuf,
-    /// Harness resources snapshot (skills + prompt templates) for `/context`.
-    /// Captured once at TUI startup because the blocking submit thread can't
-    /// `.await get_resources()`.
-    resources: Arc<rpi_harness::types::AgentHarnessResources>,
+    /// Loaded resources for /context; refreshed after successful /reload.
+    resources: Arc<Mutex<rpi_harness::types::AgentHarnessResources>>,
+    /// Context file section retained in the startup header, if visible.
+    startup_context: Option<Arc<Container>>,
     /// B5d: the reload context `/reload` drives. `Arc<ReloadContext>` so the
     /// blocking submit thread can cheaply clone it into the `ReloadCommand`
     /// without an `.await` (the command can't drive reload directly — it signals
@@ -960,9 +960,16 @@ pub async fn interactive_tui(
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
     let chat_container = Arc::new(Container::new());
-    if should_show_startup_listing(args.verbose, quiet_startup) {
-        add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
-    }
+    let startup_context = if should_show_startup_listing(args.verbose, quiet_startup) {
+        Some(add_welcome_message_with_capabilities(
+            &chat_container,
+            &active_tool_names,
+            &skill_names,
+            &resources_snapshot.context_files,
+        ))
+    } else {
+        None
+    };
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner once, then write the sentinel. The banner covers the theme hint;
@@ -1102,11 +1109,9 @@ pub async fn interactive_tui(
     // the template's frontmatter description (or a fallback) so the autocomplete
     // popover shows what each template does.
     //
-    // We snapshot the full resources once (skills + prompt-templates): the
-    // autocomplete builder consumes the templates, and the `/context` command
-    // (fired from the blocking submit handler, which can't `.await`) reads the
-    // snapshot to render the discovered-resources panel without touching the
-    // harness async accessor.
+    // Build autocomplete from the initial templates. /context shares a resource
+    // snapshot that the async reload handler refreshes, so its blocking command
+    // can list the current files without awaiting the harness accessor.
     let template_slash_commands: Vec<SlashCommandEntry> = resources_snapshot
         .prompt_templates
         .clone()
@@ -1120,8 +1125,7 @@ pub async fn interactive_tui(
                 .unwrap_or_else(|| "Expand prompt template".to_string()),
         })
         .collect();
-    let resources_arc: Arc<rpi_harness::types::AgentHarnessResources> =
-        Arc::new(resources_snapshot);
+    let resources_arc = Arc::new(Mutex::new(resources_snapshot));
     // Build the built-in command registry once — the single source of truth for
     // both dispatch and the built-in autocomplete entries. The discovered
     // prompt-template commands are merged into the autocomplete list separately
@@ -1342,6 +1346,7 @@ pub async fn interactive_tui(
         model_catalog: model_catalog_arc.clone(),
         cwd: cwd.clone(),
         resources: resources_arc.clone(),
+        startup_context,
         reload_context: Arc::new(reload_context.clone()),
         session: agent_session.clone(),
     };
@@ -2979,6 +2984,15 @@ pub async fn interactive_tui(
                 tui.request_render(false);
                 let outcome =
                     crate::session::reload_extension_resources(&harness, &reload_ctx).await;
+                if !outcome.had_errors {
+                    if let Ok(resources) = harness.get_resources().await {
+                        update_resource_listing(
+                            &ctx.resources,
+                            ctx.startup_context.as_ref(),
+                            resources,
+                        );
+                    }
+                }
                 // B5e: the reload swapped a fresh `ExtensionSession` into the
                 // context's cell. Rebuild the markdown transformer from that
                 // fresh snapshot and install it on the in-flight streaming

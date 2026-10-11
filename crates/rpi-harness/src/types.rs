@@ -55,10 +55,16 @@ pub struct PromptTemplate {
 }
 
 /// Resources made available to explicit invocation methods and system-prompt
-/// callbacks. Mirrors TS `AgentHarnessResources`. Both fields clone-on-get per
+/// callbacks. Mirrors TS `AgentHarnessResources`. Fields clone-on-get per
 /// the defensive-copy contract.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentHarnessResources {
+    /// Paths of files successfully used to compose the system prompt, in load
+    /// order: base prompt, append prompts, then project instruction files.
+    /// This is provenance for resource listings; contents are already composed
+    /// into the system prompt and must not be injected again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_files: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_templates: Option<Vec<PromptTemplate>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

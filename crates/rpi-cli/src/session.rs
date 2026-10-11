@@ -359,11 +359,12 @@ pub async fn build(
     // Whether this model sees its own prior reasoning again decides how the
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
+    let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
+            Some(path) => read_prompt_source(&path, &mut context_paths)
+                .unwrap_or_else(|| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
             None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
         },
         None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
@@ -377,7 +378,7 @@ pub async fn build(
     // string OR a readable file path (mirrors TS `resolvePromptInput`).
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &args.append_system_prompt {
-        let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
+        let text = read_append_target(extra, &mut context_paths).unwrap_or_else(|| extra.clone());
         append_texts.push(text);
     }
     if args.append_system_prompt.is_empty() {
@@ -385,7 +386,7 @@ pub async fn build(
             .then(|| discover_append_system_prompt_file(cwd))
             .flatten()
         {
-            if let Ok(text) = std::fs::read_to_string(&path) {
+            if let Some(text) = read_prompt_source(&path, &mut context_paths) {
                 append_texts.push(text);
             }
         }
@@ -475,6 +476,11 @@ pub async fn build(
         // (the global step returns None anyway).
         let agent_dir_path = agent_dir.clone().unwrap_or_else(|| cwd.to_path_buf());
         let files = load_project_context_files(&env_dyn, cwd, &agent_dir_path).await;
+        context_paths.extend(
+            files
+                .iter()
+                .map(|file| file.path.to_string_lossy().into_owned()),
+        );
         format_project_context(&files)
     };
 
@@ -661,6 +667,7 @@ pub async fn build(
         tools,
         system_prompt: Some(system_prompt),
         resources: AgentHarnessResources {
+            context_files: context_paths,
             skills: if skills.is_empty() {
                 None
             } else {
@@ -1303,14 +1310,14 @@ where
         resource_diags.extend(result.resource_diagnostics);
     }
 
-    let context_block = if effective_args.no_context_files {
-        String::new()
+    let context_files = if effective_args.no_context_files || !project_trusted {
+        Vec::new()
     } else {
         let agent_dir = crate::config::agent_dir().ok();
         let agent_dir_path = agent_dir.unwrap_or_else(|| ctx.cwd.clone());
-        let files = load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await;
-        format_project_context(&files)
+        load_project_context_files(&env_dyn, &ctx.cwd, &agent_dir_path).await
     };
+    let context_block = format_project_context(&context_files);
 
     let mut details: Vec<String> = Vec::new();
     if !skill_diags.is_empty() || !prompt_diags.is_empty() || !resource_diags.is_empty() {
@@ -1354,26 +1361,36 @@ where
     // re-composes the prompt on the next reload, which is the same staleness the
     // rest of this path already has (provider resolution is a startup concern).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
+    let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => std::fs::read_to_string(&path)
-                .unwrap_or_else(|_| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
+        None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
+            Some(path) => read_prompt_source(&path, &mut context_paths)
+                .unwrap_or_else(|| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
             None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
         },
+        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
-        let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
+        let text = read_append_target(extra, &mut context_paths).unwrap_or_else(|| extra.clone());
         append_texts.push(text);
     }
     if effective_args.append_system_prompt.is_empty() {
-        if let Some(path) = discover_append_system_prompt_file(&ctx.cwd) {
-            if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(path) = project_trusted
+            .then(|| discover_append_system_prompt_file(&ctx.cwd))
+            .flatten()
+        {
+            if let Some(text) = read_prompt_source(&path, &mut context_paths) {
                 append_texts.push(text);
             }
         }
     }
+    context_paths.extend(
+        context_files
+            .iter()
+            .map(|file| file.path.to_string_lossy().into_owned()),
+    );
     let append_join = if append_texts.is_empty() {
         None
     } else {
@@ -1401,6 +1418,7 @@ where
 
     // ---- 5. Push the rebuilt state into the live harness via the B5d setters ----
     let resources = AgentHarnessResources {
+        context_files: context_paths,
         skills: if skills.is_empty() {
             None
         } else {
@@ -2602,19 +2620,208 @@ pub(crate) async fn create_jsonl_session_with_id(
 
 /// Read an `--append-system-prompt` target: if it's a readable file path, return
 /// its contents; otherwise return `None` and let the caller use the literal.
-fn read_append_target(target: &str) -> Option<String> {
+fn read_append_target(target: &str, sources: &mut Vec<String>) -> Option<String> {
     let path = Path::new(target);
     if path.is_file() {
-        std::fs::read_to_string(path).ok()
+        read_prompt_source(path, sources)
     } else {
         None
     }
+}
+
+/// Record provenance at the successful read, rather than rediscovering files
+/// during rendering (which could report a shadowed or unreadable file).
+fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let source = absolute.to_string_lossy().into_owned();
+    if !sources.contains(&source) {
+        sources.push(source);
+    }
+    Some(text)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::args::Args;
+
+    #[test]
+    fn loaded_context_paths_track_precedence_and_reload() {
+        const CHILD: &str = "RPI_CONTEXT_PATHS_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "session::tests::loaded_context_paths_track_precedence_and_reload",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(crate::config::CONFIG_DIR_ENV, dir.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let agent = crate::config::agent_dir().unwrap();
+                let cwd = agent.join("project");
+                let project_config = cwd.join(".rpi");
+                std::fs::create_dir_all(&project_config).unwrap();
+                for (path, content) in [
+                    (agent.join("SYSTEM.md"), "GLOBAL_BASE"),
+                    (agent.join("APPEND_SYSTEM.md"), "GLOBAL_APPEND"),
+                    (agent.join("AGENTS.md"), "GLOBAL_INSTRUCTIONS"),
+                    (project_config.join("SYSTEM.md"), "PROJECT_BASE"),
+                    (project_config.join("APPEND_SYSTEM.md"), "PROJECT_APPEND"),
+                    (cwd.join("AGENTS.md"), "PROJECT_INSTRUCTIONS"),
+                    (cwd.join("CLAUDE.md"), "SHADOWED_CLAUDE"),
+                ] {
+                    std::fs::write(path, content).unwrap();
+                }
+                let resolved = crate::provider::resolve(
+                    Some("anthropic"),
+                    Some(crate::provider::DEFAULT_MODEL_ID),
+                    None,
+                    Some("test-key"),
+                    None,
+                )
+                .unwrap();
+                let args = Args {
+                    no_session: true,
+                    no_extensions: true,
+                    no_skills: true,
+                    no_prompt_templates: true,
+                    trust_override: Some(true),
+                    ..Default::default()
+                };
+                let (harness, _events, mut context) =
+                    build(&resolved, &args, &cwd, true).await.unwrap();
+                let resources = harness.get_resources().await.unwrap();
+                let path = |p: PathBuf| p.to_string_lossy().into_owned();
+                assert_eq!(
+                    &resources.context_files[..2],
+                    &[
+                        path(project_config.join("SYSTEM.md")),
+                        path(project_config.join("APPEND_SYSTEM.md")),
+                    ]
+                );
+                assert!(resources
+                    .context_files
+                    .contains(&path(agent.join("AGENTS.md"))));
+                assert!(resources
+                    .context_files
+                    .contains(&path(cwd.join("AGENTS.md"))));
+                assert!(!resources
+                    .context_files
+                    .contains(&path(cwd.join("CLAUDE.md"))));
+                assert!(!resources
+                    .context_files
+                    .contains(&path(agent.join("SYSTEM.md"))));
+                let prompt = harness.get_system_prompt().await.unwrap().unwrap();
+                assert!(prompt.contains("PROJECT_BASE") && prompt.contains("PROJECT_APPEND"));
+                assert!(!prompt.contains("GLOBAL_BASE") && !prompt.contains("SHADOWED_CLAUDE"));
+
+                // Removing the selected project files makes reload fall back to
+                // globals; removed instruction paths must disappear as well.
+                std::fs::remove_file(project_config.join("SYSTEM.md")).unwrap();
+                std::fs::remove_file(project_config.join("APPEND_SYSTEM.md")).unwrap();
+                std::fs::remove_file(cwd.join("AGENTS.md")).unwrap();
+                assert!(
+                    !reload_extension_resources(&harness, &context)
+                        .await
+                        .had_errors
+                );
+                let resources = harness.get_resources().await.unwrap();
+                assert_eq!(
+                    &resources.context_files[..2],
+                    &[
+                        path(agent.join("SYSTEM.md")),
+                        path(agent.join("APPEND_SYSTEM.md")),
+                    ]
+                );
+                assert!(resources
+                    .context_files
+                    .contains(&path(cwd.join("CLAUDE.md"))));
+                assert!(!resources
+                    .context_files
+                    .contains(&path(project_config.join("SYSTEM.md"))));
+
+                // Explicit append files are listed; literal text and overridden
+                // discovered base/append files are not invented as file sources.
+                let explicit = agent.join("custom-append.md");
+                std::fs::write(&explicit, "EXPLICIT_APPEND").unwrap();
+                context.args.system_prompt = Some("EXPLICIT_BASE".into());
+                context.args.append_system_prompt =
+                    vec![path(explicit.clone()), "literal append".into()];
+                context.args.no_context_files = true;
+                assert!(
+                    !reload_extension_resources(&harness, &context)
+                        .await
+                        .had_errors
+                );
+                assert_eq!(
+                    harness.get_resources().await.unwrap().context_files,
+                    vec![path(explicit)]
+                );
+
+                // The reload must honor the startup opt-out from project context.
+                context.args.system_prompt = None;
+                context.args.append_system_prompt.clear();
+                context.args.no_context_files = false;
+                context.args.trust_override = Some(false);
+                assert!(
+                    !reload_extension_resources(&harness, &context)
+                        .await
+                        .had_errors
+                );
+                assert!(harness
+                    .get_resources()
+                    .await
+                    .unwrap()
+                    .context_files
+                    .is_empty());
+                let prompt = harness.get_system_prompt().await.unwrap().unwrap();
+                assert!(
+                    !prompt.contains("SHADOWED_CLAUDE") && !prompt.contains("GLOBAL_INSTRUCTIONS")
+                );
+            });
+    }
+
+    #[test]
+    fn prompt_source_read_failures_and_literals_do_not_create_file_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("SYSTEM.md");
+        let mut sources = Vec::new();
+        assert!(read_prompt_source(&file, &mut sources).is_none());
+        std::fs::write(&file, [0xff, 0xfe]).unwrap();
+        assert!(read_prompt_source(&file, &mut sources).is_none());
+        assert!(read_append_target("literal instructions", &mut sources).is_none());
+        assert!(sources.is_empty());
+        std::fs::write(&file, "loaded instructions").unwrap();
+        assert_eq!(
+            read_prompt_source(&file, &mut sources).as_deref(),
+            Some("loaded instructions")
+        );
+        assert!(read_prompt_source(&file, &mut sources).is_some());
+        assert_eq!(sources, vec![file.to_string_lossy().into_owned()]);
+    }
 
     extern "C" fn deny_test_tool_call(
         _event: rpi_plugin_sdk::StablePluginEvent,

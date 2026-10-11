@@ -659,7 +659,8 @@ impl SlashCommand for ContextCommand {
         false
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
-        show_context_panel(&ctx.chat, &ctx.resources);
+        let resources = ctx.resources.lock().unwrap().clone();
+        show_context_panel(&ctx.chat, &resources);
         // Live session stats are async, so ask the main loop to append them.
         let _ = ctx.tx.send(TuiMessage::ShowUsage);
         ctx.tui.request_render(false);
