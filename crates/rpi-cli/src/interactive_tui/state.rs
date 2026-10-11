@@ -568,6 +568,20 @@ impl WindowsPasteRun {
         self.last_at = Some(now);
     }
 
+    #[cfg(windows)]
+    pub(super) fn read_queued_text(&mut self) {
+        // A few queued characters could be ordinary typing. Only take the
+        // native fast path once the existing heuristic confirms a longer run.
+        if self.burst && self.text.len() >= 64 {
+            if let Ok(text) = rpi_tui::windows_paste::read_text_batch() {
+                if !text.is_empty() {
+                    self.text.push_str(&text);
+                    self.last_at = Some(std::time::Instant::now());
+                }
+            }
+        }
+    }
+
     pub(super) fn flush(&mut self, editor: &Editor) {
         if !self.text.is_empty() {
             editor.handle_paste(&self.text);

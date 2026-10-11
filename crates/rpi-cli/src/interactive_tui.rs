@@ -2565,6 +2565,18 @@ pub async fn interactive_tui(
                         // Treat these the same as KeyCode::Enter below.
                     } else {
                         windows_paste_run.feed(ch, std::time::Instant::now());
+                        #[cfg(windows)]
+                        if windows_paste_run.burst
+                            && windows_paste_run.text.len() >= 64
+                            && pending_event.is_none()
+                            && state_for_key
+                                .extension_claimed_keys
+                                .lock()
+                                .unwrap()
+                                .is_empty()
+                        {
+                            windows_paste_run.read_queued_text();
+                        }
                         continue;
                     }
                 }

@@ -65,6 +65,8 @@ pub mod user_message;
 pub mod utils;
 pub mod visual_truncate;
 pub mod vstack;
+#[cfg(windows)]
+pub mod windows_paste;
 pub mod word_navigation;
 
 // Re-export main types
