@@ -197,6 +197,15 @@ rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ```
 
+### 启动资源清单
+
+启动 TUI 时，`Context` 会列出实际加载成功的系统提示词和项目指令文件路径，
+包括 `SYSTEM.md`、`APPEND_SYSTEM.md` 以及 `AGENTS.md` / `CLAUDE.md`。
+项目 `SYSTEM.md` 和 `APPEND_SYSTEM.md` 优先于全局同名文件；清单只显示生效的来源。
+没有加载文件时，启动页会省略 `Context`。`/context` 可查看当前完整资源清单，
+成功执行 `/reload` 后，启动页的 `Context` 和 `/context` 都会更新。
+设置 `quietStartup: true` 可隐藏启动资源清单。
+
 ### 更新日志
 
 `/changelog` 显示当前二进制对应的最新发布说明；`/changelog all` 显示完整历史。

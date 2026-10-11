@@ -1111,6 +1111,10 @@ fn test_chat_container_has_welcome_content() {
         &chat,
         &["read".into(), "bash".into(), "web_fetch".into()],
         &["rust-review".into(), "release".into()],
+        &[
+            "/project/.rpi/SYSTEM.md".into(),
+            "/project/AGENTS.md".into(),
+        ],
     );
 
     let lines = chat.render(80);
@@ -1129,10 +1133,46 @@ fn test_chat_container_has_welcome_content() {
         "Tool names missing: {plain}"
     );
     assert!(plain.contains("Skills (2)"), "Skill count missing: {plain}");
+    assert!(plain.contains("Context (2)"));
+    assert!(plain.contains("/project/.rpi/SYSTEM.md"));
+    assert!(plain.contains("/project/AGENTS.md"));
     assert!(
         plain.contains("rust-review · release"),
         "Skill names missing: {plain}"
     );
+}
+
+#[test]
+fn reload_updates_context_header_and_context_panel_without_stale_paths() {
+    use rpi_harness::types::AgentHarnessResources;
+    let chat = Arc::new(Container::new());
+    let old = AgentHarnessResources {
+        context_files: vec!["/old/SYSTEM.md".into()],
+        ..Default::default()
+    };
+    let listing = add_welcome_message_with_capabilities(&chat, &[], &[], &old.context_files);
+    let shared = Arc::new(Mutex::new(old));
+    let fresh = AgentHarnessResources {
+        context_files: vec!["/new/APPEND_SYSTEM.md".into(), "/new/CLAUDE.md".into()],
+        ..Default::default()
+    };
+    update_resource_listing(&shared, Some(&listing), fresh.clone());
+    let header = strip_ansi(&chat.render(120).join("\n"));
+    assert!(header.contains("Context (2)"));
+    assert!(header.contains("/new/APPEND_SYSTEM.md"));
+    assert!(!header.contains("/old/SYSTEM.md"));
+    assert_eq!(*shared.lock().unwrap(), fresh);
+    let panel = Arc::new(Container::new());
+    show_context_panel(&panel, &shared.lock().unwrap());
+    let output = strip_ansi(&panel.render(120).join("\n"));
+    assert!(output.contains("/new/CLAUDE.md"));
+    assert!(!output.contains("/old/SYSTEM.md"));
+
+    update_resource_listing(&shared, Some(&listing), Default::default());
+    assert!(!strip_ansi(&chat.render(120).join("\n")).contains("Context"));
+    let panel = Arc::new(Container::new());
+    show_context_panel(&panel, &shared.lock().unwrap());
+    assert!(strip_ansi(&panel.render(120).join("\n")).contains("no context files loaded"));
 }
 
 #[test]

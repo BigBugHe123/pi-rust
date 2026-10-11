@@ -8,17 +8,18 @@ use super::*;
 
 /// Add the welcome header to the chat container.
 pub(super) fn add_welcome_message(container: &Arc<Container>) {
-    add_welcome_message_with_capabilities(container, &[], &[]);
+    add_welcome_message_with_capabilities(container, &[], &[], &[]);
 }
 
 /// Add the startup welcome header and a compact snapshot of active tools and
-/// discovered skills. The snapshot reflects the harness configuration used by
-/// the first turn, including tools contributed by extensions.
+/// discovered skills and context files. The snapshot reflects the first turn's
+/// configuration, including tools contributed by extensions.
 pub(super) fn add_welcome_message_with_capabilities(
     container: &Arc<Container>,
     active_tools: &[String],
     skills: &[String],
-) {
+    context_files: &[String],
+) -> Arc<Container> {
     let c = current_theme().colors;
     // The mark, wordmark and language mark live in `crate::brand`. See that
     // module for why the layout is built from single-width characters only.
@@ -39,6 +40,9 @@ pub(super) fn add_welcome_message_with_capabilities(
         .fg("Enter send · Shift+Enter newline · Ctrl+C clear · Esc abort · /help");
     container.add_child(Arc::new(Text::new(hint, 1, 0)));
     container.add_child(Arc::new(Spacer::new(1)));
+    let context_listing = Arc::new(Container::new());
+    render_context_files(&context_listing, context_files);
+    container.add_child(context_listing.clone());
     container.add_child(Arc::new(Text::new(
         welcome_capability_line("Tools", active_tools),
         1,
@@ -50,6 +54,39 @@ pub(super) fn add_welcome_message_with_capabilities(
         0,
     )));
     container.add_child(Arc::new(DynamicBorder::new()));
+    context_listing
+}
+
+/// Retain this section in the welcome header so /reload can replace it.
+pub(super) fn render_context_files(container: &Arc<Container>, files: &[String]) {
+    container.clear();
+    if files.is_empty() {
+        return;
+    }
+    let colors = current_theme().colors;
+    container.add_child(Arc::new(Text::new(
+        colors.accent.fg(&format!("Context ({})", files.len())),
+        1,
+        0,
+    )));
+    for path in files {
+        container.add_child(Arc::new(Text::new(
+            colors.dim.fg(&format!("  {path}")),
+            1,
+            0,
+        )));
+    }
+}
+
+pub(super) fn update_resource_listing(
+    shared: &Arc<Mutex<rpi_harness::types::AgentHarnessResources>>,
+    startup_context: Option<&Arc<Container>>,
+    resources: rpi_harness::types::AgentHarnessResources,
+) {
+    if let Some(listing) = startup_context {
+        render_context_files(listing, &resources.context_files);
+    }
+    *shared.lock().unwrap() = resources;
 }
 
 /// Append update notices inside the live transcript. Fullscreen mode clears
@@ -431,20 +468,31 @@ pub(super) fn add_note_message(container: &Arc<Container>, text: &str) {
 
 /// Render the `/context` panel: a transcript message listing the discovered
 /// context files, skills, and prompt templates loaded for this session
-/// (Part A resource discovery). Reads the harness resources snapshot captured
-/// at TUI startup (the blocking submit handler can't `await get_resources()`.
+/// (Part A resource discovery). Reads the shared resources snapshot, initialized
+/// at startup and refreshed on reload, without awaiting the harness accessor.
 ///
 /// Mirrors pi's context-panel intent (pi surfaces loaded resources on startup +
 /// via `/reload`); here it's a transcript note rather than an overlay since the
-/// resource set is session-static between `/reload`s (deferred).
+/// resource set is refreshed after successful `/reload`s.
 pub(super) fn show_context_panel(
     chat: &Arc<Container>,
-    resources: &Arc<rpi_harness::types::AgentHarnessResources>,
+    resources: &rpi_harness::types::AgentHarnessResources,
 ) {
     let skills = resources.skills.as_deref().unwrap_or(&[]);
     let templates = resources.prompt_templates.as_deref().unwrap_or(&[]);
     let mut lines: Vec<String> = Vec::new();
     lines.push("📂 Discovered resources for this session:".into());
+    if resources.context_files.is_empty() {
+        lines.push("  Context: (no context files loaded)".into());
+    } else {
+        lines.push(format!("  Context ({}):", resources.context_files.len()));
+        lines.extend(
+            resources
+                .context_files
+                .iter()
+                .map(|path| format!("    • {path}")),
+        );
+    }
 
     if skills.is_empty() {
         lines.push(
@@ -480,8 +528,6 @@ pub(super) fn show_context_panel(
             lines.push(format!("    • /{} — {desc}", t.name));
         }
     }
-    lines.push("  Context files (AGENTS.md/CLAUDE.md) are injected from the ancestor walk;".into());
-    lines.push("  SYSTEM.md / APPEND_SYSTEM.md feed the base + append prompt sections.".into());
     lines.push(
         "  Use --no-skills/-ns, --no-prompt-templates/-np, --no-context-files/-nc to suppress."
             .into(),

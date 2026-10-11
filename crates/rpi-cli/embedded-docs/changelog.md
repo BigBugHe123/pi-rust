@@ -11,6 +11,26 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-10-11
+
+### Added
+
+- Show successfully loaded system prompt and project instruction files in the
+  TUI startup Context section. `/context` and the startup listing refresh after
+  a successful `/reload`, including project/global precedence and removed files.
+
+### Fixed
+
+- Batch confirmed Windows console text pastes instead of dispatching each
+  character separately, substantially reducing the delay before large pasted
+  text folds. Preserve Unicode, tabs, line endings, shortcuts and trailing Enter.
+- Track rpi release notes independently from imported Pi settings so updates
+  appear once on the next new interactive session. `/changelog` defaults to the
+  latest release; `/changelog all` shows the complete history.
+- Read scroll position and follow-output state from the primary scroll view,
+  and ignore the jump-to-latest click while another UI owns terminal rendering.
+- Keep context-file opt-outs consistent between startup and reload.
+
 ## [0.3.20] - 2026-10-11
 
 - Add plugin-owned text components: register layout once, update content separately,
