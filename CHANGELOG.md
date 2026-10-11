@@ -11,6 +11,15 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-10-11
+
+- Add plugin-owned text components: register layout once, update content separately,
+  configure positions, show/hide, and automatically clean up on unload or reload.
+- Keep legacy footer status text and remove the experimental panel payload.
+- Improve footer/sidebar rendering, scroll navigation, Unicode line updates,
+  and terminal stdio lifecycle support for plugins.
+
+
 ## [0.3.19] - 2026-10-10
 
 ### Fixed

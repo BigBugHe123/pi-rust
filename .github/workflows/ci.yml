@@ -23,8 +23,14 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Test PowerShell installer offline
-        shell: ${{ matrix.shell }}
+      - name: Test PowerShell installer offline (Windows PowerShell)
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./scripts/tests/install.Tests.ps1
+
+      - name: Test PowerShell installer offline (PowerShell Core)
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         run: ./scripts/tests/install.Tests.ps1
 
   test:
