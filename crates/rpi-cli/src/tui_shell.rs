@@ -195,7 +195,6 @@ async fn run_loop<D: SessionDriver>(
                             MouseEventKind::ScrollDown => tui.scroll_by(3),
                             _ => {}
                         }
-                        tui.request_render(false);
                     }
                     Event::Key(key) if key.kind != KeyEventKind::Release => {
                         crate::key_trace::key(&key, "driver-tui");
@@ -210,8 +209,8 @@ async fn run_loop<D: SessionDriver>(
                             } else if !had_dialog {
                                 break;
                             }
-                        } else if !dialogs.handle_key(key)
-                            && !crate::transcript_navigation::handle_key(tui, keybindings, &key) {
+                        } else if !dialogs.handle_key(key) {
+                            if crate::transcript_navigation::handle_key(tui, keybindings, &key) { continue; }
                             editor.handle_key(key);
                         }
                         tui.request_render(false);
