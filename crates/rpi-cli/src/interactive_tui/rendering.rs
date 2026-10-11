@@ -198,14 +198,28 @@ pub(super) fn add_version_message(container: &Arc<Container>) {
 
 /// Show the real bundled changelog, including in installed/offline builds.
 pub(super) fn add_changelog_message(container: &Arc<Container>) {
+    add_changelog_message_with_scope(container, false);
+}
+
+pub(super) fn add_changelog_message_with_scope(container: &Arc<Container>, all: bool) {
     let c = current_theme().colors;
     container.add_child(Arc::new(Text::new(
-        c.md_heading.fg(&tui_bold("Recent Changes")),
+        c.md_heading.fg(&tui_bold(if all {
+            "Full Changelog"
+        } else {
+            "Recent Changes"
+        })),
         1,
         0,
     )));
     container.add_child(Arc::new(Spacer::new(1)));
-    let markdown = crate::changelog::format_entries(&crate::changelog::bundled_entries());
+    let entries = crate::changelog::bundled_entries();
+    let entries = if all {
+        entries
+    } else {
+        crate::changelog::latest_release(&entries, crate::VERSION)
+    };
+    let markdown = crate::changelog::format_entries(&entries);
     let markdown = if markdown.is_empty() {
         "No changelog entries found.".into()
     } else {
@@ -224,7 +238,7 @@ pub(super) fn add_startup_changelog_message(
     container.add_child(Arc::new(DynamicBorder::new()));
     if collapse {
         container.add_child(Arc::new(Text::new(
-            format!("Updated to v{version}. Use /changelog to view full changelog."),
+            format!("Updated to v{version}. Use /changelog to view release notes."),
             1,
             0,
         )));

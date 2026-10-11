@@ -105,6 +105,41 @@ pub fn format_entries(entries: &[ChangelogEntry]) -> String {
         .join("\n\n")
 }
 
+/// Default command view: the latest shipped release at or below this binary's version.
+pub fn latest_release(entries: &[ChangelogEntry], current_version: &str) -> Vec<ChangelogEntry> {
+    let Ok(current) = semver::Version::parse(current_version) else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .filter(|entry| {
+            (entry.major, entry.minor, entry.patch) <= (current.major, current.minor, current.patch)
+        })
+        .max_by_key(|entry| (entry.major, entry.minor, entry.patch))
+        .cloned()
+        .into_iter()
+        .collect()
+}
+
+/// Migrate only legacy markers that name a release in rpi's bundled history.
+/// A foreign version (for example Pi 0.85.1) must not suppress rpi updates.
+pub fn rpi_baseline<'a>(
+    entries: &[ChangelogEntry],
+    dedicated: Option<&'a str>,
+    legacy: Option<&'a str>,
+) -> Option<&'a str> {
+    dedicated.or_else(|| {
+        legacy.filter(|version| {
+            semver::Version::parse(version).is_ok_and(|version| {
+                entries.iter().any(|entry| {
+                    (entry.major, entry.minor, entry.patch)
+                        == (version.major, version.minor, version.patch)
+                })
+            })
+        })
+    })
+}
+
 #[derive(Debug, Default)]
 pub struct StartupChangelog {
     pub markdown: Option<String>,
@@ -119,6 +154,18 @@ pub fn startup_changelog(
     current_version: &str,
     has_messages: bool,
 ) -> StartupChangelog {
+    startup_changelog_for_profile(entries, last_version, current_version, has_messages, false)
+}
+
+/// Existing profiles without an rpi baseline see the current release once;
+/// genuinely fresh installs record a baseline without replaying old history.
+pub fn startup_changelog_for_profile(
+    entries: &[ChangelogEntry],
+    last_version: Option<&str>,
+    current_version: &str,
+    has_messages: bool,
+    existing_profile: bool,
+) -> StartupChangelog {
     if has_messages {
         return StartupChangelog::default();
     }
@@ -127,7 +174,19 @@ pub fn startup_changelog(
     };
     let Some(last) = last_version.and_then(|version| semver::Version::parse(version).ok()) else {
         return StartupChangelog {
-            markdown: None,
+            markdown: existing_profile
+                .then(|| {
+                    let current_notes: Vec<_> = entries
+                        .iter()
+                        .filter(|entry| {
+                            (entry.major, entry.minor, entry.patch)
+                                == (current.major, current.minor, current.patch)
+                        })
+                        .cloned()
+                        .collect();
+                    format_entries(&current_notes)
+                })
+                .filter(|markdown| !markdown.is_empty()),
             version_to_record: Some(current_version.into()),
         };
     };
@@ -145,11 +204,8 @@ pub fn startup_changelog(
         .cloned()
         .collect();
     unseen.sort_by_key(|entry| std::cmp::Reverse((entry.major, entry.minor, entry.patch)));
-    if unseen.is_empty() {
-        return StartupChangelog::default();
-    }
     StartupChangelog {
-        markdown: Some(format_entries(&unseen)),
+        markdown: (!unseen.is_empty()).then(|| format_entries(&unseen)),
         version_to_record: Some(current_version.into()),
     }
 }
@@ -271,6 +327,71 @@ mod tests {
         let downgraded = startup_changelog(&entries, Some("0.3.18"), "0.3.17", false);
         assert!(downgraded.markdown.is_none());
         assert!(downgraded.version_to_record.is_none());
+    }
+
+    #[test]
+    fn foreign_baseline_does_not_hide_rpi_notes_and_the_new_marker_is_independent() {
+        let entries = parse_changelog("## [0.3.19]\n- current\n## [0.3.18]\n- previous");
+        assert_eq!(rpi_baseline(&entries, None, Some("0.85.1")), None);
+        let notice = startup_changelog_for_profile(
+            &entries,
+            rpi_baseline(&entries, None, Some("0.85.1")),
+            "0.3.19",
+            false,
+            true,
+        );
+        assert_eq!(notice.version_to_record.as_deref(), Some("0.3.19"));
+        let markdown = notice.markdown.unwrap();
+        assert!(markdown.contains("current"));
+        assert!(!markdown.contains("previous"));
+        let baseline = rpi_baseline(&entries, Some("0.3.19"), Some("0.86.0"));
+        let again = startup_changelog_for_profile(&entries, baseline, "0.3.19", false, true);
+        assert!(again.markdown.is_none());
+        assert!(again.version_to_record.is_none());
+        assert_eq!(rpi_baseline(&entries, None, Some("0.3.18")), Some("0.3.18"));
+        assert_eq!(
+            rpi_baseline(&entries, Some("0.3.20"), Some("0.85.1")),
+            Some("0.3.20")
+        );
+        assert!(
+            startup_changelog_for_profile(&entries, Some("0.3.20"), "0.3.19", false, true)
+                .version_to_record
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn existing_profile_without_marker_defers_on_resume_and_shows_only_current_notes_once() {
+        let entries = parse_changelog("## [0.3.19]\n- current\n## [0.3.18]\n- previous");
+        let resumed = startup_changelog_for_profile(&entries, None, "0.3.19", true, true);
+        assert!(resumed.markdown.is_none());
+        assert!(resumed.version_to_record.is_none());
+        let notice = startup_changelog_for_profile(&entries, None, "0.3.19", false, true);
+        assert!(notice.markdown.unwrap().contains("current"));
+        let baseline = notice.version_to_record;
+        assert!(startup_changelog_for_profile(
+            &entries,
+            baseline.as_deref(),
+            "0.3.19",
+            false,
+            true
+        )
+        .markdown
+        .is_none());
+        let fresh = startup_changelog_for_profile(&entries, None, "0.3.19", false, false);
+        assert!(fresh.markdown.is_none());
+        assert_eq!(fresh.version_to_record.as_deref(), Some("0.3.19"));
+    }
+
+    #[test]
+    fn command_selects_one_latest_release_and_never_future_notes() {
+        let entries = parse_changelog(
+            "## [0.3.20]\n- future\n## [0.3.19]\n- current\n## [0.3.18]\n- previous",
+        );
+        let latest = latest_release(&entries, "0.3.19");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].content, "- current");
+        assert_eq!(latest_release(&entries, "0.3.21")[0].content, "- future");
     }
 
     #[test]

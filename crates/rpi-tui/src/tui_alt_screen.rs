@@ -394,11 +394,17 @@ impl TuiAltScreen {
 
     /// Get the current scroll position.
     pub fn viewport_top(&self) -> usize {
+        if let Some(scroll) = self.get_primary_scroll_view() {
+            return scroll.scroll_top();
+        }
         self.scroll_top.lock().map(|s| *s).unwrap_or(0)
     }
 
     /// Check if following output.
     pub fn is_following_output(&self) -> bool {
+        if let Some(scroll) = self.get_primary_scroll_view() {
+            return scroll.is_following_end();
+        }
         self.stick_to_bottom.lock().map(|s| *s).unwrap_or(true)
     }
 
@@ -419,7 +425,11 @@ impl TuiAltScreen {
         &self,
         event: &crossterm::event::MouseEvent,
     ) -> bool {
-        if self.uses_main_screen() || self.has_overlay() || !self.jump_to_end.hit(event) {
+        if self.uses_main_screen()
+            || self.is_render_suspended()
+            || self.has_overlay()
+            || !self.jump_to_end.hit(event)
+        {
             return false;
         }
         let Some(scroll) = self.get_primary_scroll_view() else {

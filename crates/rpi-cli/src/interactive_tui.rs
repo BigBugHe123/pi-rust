@@ -967,6 +967,10 @@ pub async fn interactive_tui(
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner once, then write the sentinel. The banner covers the theme hint;
     // the theme stays pickable via `/theme`. See `extras.rs`.
+    // Capture this before first-time setup writes its sentinel.
+    let existing_profile = crate::extras::setup_done()
+        || saved_settings.last_changelog_version.is_some()
+        || saved_settings.last_rpi_changelog_version.is_some();
     crate::extras::maybe_first_time_setup(&chat_container);
     let collapse_changelog =
         preferred_project_setting(&project_settings, |settings| settings.collapse_changelog)
@@ -977,6 +981,7 @@ pub async fn interactive_tui(
         &chat_container,
         &saved_settings,
         collapse_changelog,
+        existing_profile,
     )
     .await;
 

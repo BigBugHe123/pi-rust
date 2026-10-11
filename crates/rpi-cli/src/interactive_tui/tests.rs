@@ -2,13 +2,107 @@ use super::*;
 use rpi_tui::Component;
 
 #[test]
-fn changelog_command_renders_real_bundled_release_notes() {
+fn changelog_command_shows_current_release_and_all_is_explicit() {
+    let entries = crate::changelog::bundled_entries();
+    let latest = crate::changelog::latest_release(&entries, crate::VERSION);
+    let heading = |entry: &crate::changelog::ChangelogEntry| {
+        format!("{}.{}.{}", entry.major, entry.minor, entry.patch)
+    };
+    let latest_heading = heading(&latest[0]);
+    let historical_heading = heading(entries.last().unwrap());
     let chat = Arc::new(Container::new());
     add_changelog_message(&chat);
     let output = strip_ansi(&chat.render(120).join("\n"));
-    assert!(output.contains("0.3.17"));
-    assert!(output.contains("whitespace-only streaming"));
+    assert!(output.lines().any(|line| line.trim() == latest_heading));
+    assert!(!output.lines().any(|line| line.trim() == historical_heading));
     assert!(!output.contains("Native parity phase 1"));
+    let chat = Arc::new(Container::new());
+    add_changelog_message_with_scope(&chat, true);
+    let output = strip_ansi(&chat.render(120).join("\n"));
+    assert!(output.lines().any(|line| line.trim() == historical_heading));
+    assert!(output.lines().any(|line| line.trim() == latest_heading));
+}
+
+#[test]
+fn startup_changelog_foreign_profile_is_shown_once_and_persisted() {
+    const CHILD: &str = "RPI_CHANGELOG_REGRESSION_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{"lastChangelogVersion":"0.85.1","custom":{"retained":true}}"#,
+        )
+        .unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "interactive_tui::tests::startup_changelog_foreign_profile_is_shown_once_and_persisted", "--nocapture"])
+            .env(CHILD, "1").env(crate::config::CONFIG_DIR_ENV, dir.path()).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let harness = AgentHarness::create(Default::default()).await.unwrap();
+            let settings = crate::settings::load_settings().unwrap();
+            let chat = Arc::new(Container::new());
+            maybe_add_startup_changelog(&harness, &chat, &settings, false, true).await;
+            let output = strip_ansi(&chat.render(120).join("\n"));
+            assert!(output.contains("What's New"));
+            assert!(output.lines().any(|line| line.trim() == crate::VERSION));
+            let old = crate::changelog::bundled_entries().pop().unwrap();
+            let old_version = format!("{}.{}.{}", old.major, old.minor, old.patch);
+            assert!(!output.lines().any(|line| line.trim() == old_version));
+            let settings = crate::settings::load_settings().unwrap();
+            assert_eq!(
+                settings.last_rpi_changelog_version.as_deref(),
+                Some(crate::VERSION)
+            );
+            assert_eq!(settings.last_changelog_version.as_deref(), Some("0.85.1"));
+            let chat = Arc::new(Container::new());
+            maybe_add_startup_changelog(&harness, &chat, &settings, false, true).await;
+            assert_eq!(chat.child_count(), 0);
+            let value: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(crate::config::settings_path().unwrap()).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(value["custom"]["retained"], true);
+            // A newer process may save a marker after this startup read its settings.
+            let mut stale = settings.clone();
+            let current_version = semver::Version::parse(crate::VERSION).unwrap();
+            let old = crate::changelog::bundled_entries()
+                .into_iter()
+                .find(|entry| {
+                    (entry.major, entry.minor, entry.patch)
+                        < (
+                            current_version.major,
+                            current_version.minor,
+                            current_version.patch,
+                        )
+                })
+                .unwrap();
+            stale.last_rpi_changelog_version =
+                Some(format!("{}.{}.{}", old.major, old.minor, old.patch));
+            let mut newer = settings;
+            let mut next_version = current_version;
+            next_version.patch += 1;
+            newer.last_rpi_changelog_version = Some(next_version.to_string());
+            crate::settings::save_settings(&newer).unwrap();
+            maybe_add_startup_changelog(&harness, &Arc::new(Container::new()), &stale, false, true)
+                .await;
+            assert_eq!(
+                crate::settings::load_settings()
+                    .unwrap()
+                    .last_rpi_changelog_version,
+                Some(next_version.to_string())
+            );
+        });
 }
 
 #[test]

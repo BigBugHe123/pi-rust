@@ -188,9 +188,13 @@ pub struct Settings {
     /// Update checks remain enabled, matching upstream.
     #[serde(default)]
     pub quiet_startup: Option<bool>,
-    /// Most recent release notes seen in a fresh interactive session (global).
+    /// Legacy/imported marker retained for settings compatibility. Only known
+    /// rpi release versions are migrated into the dedicated rpi marker.
     #[serde(default)]
     pub last_changelog_version: Option<String>,
+    /// rpi's own release-note baseline, independent of imported Pi settings.
+    #[serde(default)]
+    pub last_rpi_changelog_version: Option<String>,
     /// Show a compact upgrade notice instead of full notes. Pi defaults false.
     #[serde(default)]
     pub collapse_changelog: Option<bool>,
@@ -541,6 +545,10 @@ fn save_settings_to_path(
         (
             "lastChangelogVersion",
             settings.last_changelog_version.as_ref(),
+        ),
+        (
+            "lastRpiChangelogVersion",
+            settings.last_rpi_changelog_version.as_ref(),
         ),
     ] {
         match val {
@@ -1034,6 +1042,29 @@ mod scoped_tests {
         assert_eq!(loaded.collapse_changelog, Some(true));
         let value: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(value["custom"]["retained"], true);
+    }
+
+    #[test]
+    fn rpi_changelog_marker_preserves_foreign_baselines_and_existing_settings() {
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        std::fs::write(
+            &path,
+            r#"{"lastChangelogVersion":"0.85.1","theme":"dark","custom":{"retained":true}}"#,
+        )
+        .unwrap();
+        let mut settings = load_settings().unwrap();
+        settings.last_rpi_changelog_version = Some("0.3.19".into());
+        save_settings(&settings).unwrap();
+        let loaded = load_settings().unwrap();
+        assert_eq!(loaded.last_rpi_changelog_version.as_deref(), Some("0.3.19"));
+        assert_eq!(loaded.last_changelog_version.as_deref(), Some("0.85.1"));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["lastRpiChangelogVersion"], "0.3.19");
+        assert_eq!(value["lastChangelogVersion"], "0.85.1");
+        assert_eq!(value["theme"], "dark");
         assert_eq!(value["custom"]["retained"], true);
     }
 
