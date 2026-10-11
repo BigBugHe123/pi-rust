@@ -336,10 +336,6 @@ pub(super) const HISTORY_LIMIT: usize = 100;
 /// know the footer is showing *our* text before blanking it.
 pub(super) const AUTO_SEND_PREFIX: &str = "Auto-send in ";
 
-/// Keep a few rows of overlap so page scrolling preserves visual context,
-/// matching the upstream fullscreen viewport behavior.
-pub(super) const PAGE_SCROLL_OVERLAP: usize = 4;
-
 /// upstream scrolls a small chunk for each wheel notch rather than moving the
 /// transcript one physical row at a time. Three lines stays precise while
 /// avoiding the sluggish feel of the previous implementation.
@@ -402,7 +398,7 @@ pub(super) fn parse_configured_key(value: &str) -> Option<rpi_tui::KeyCombo> {
     Some(rpi_tui::KeyCombo::new(code, modifiers))
 }
 
-pub(super) fn configured_keybindings() -> Arc<rpi_tui::Keybindings> {
+pub(crate) fn configured_keybindings() -> Arc<rpi_tui::Keybindings> {
     let mut bindings = rpi_tui::Keybindings::new();
     let settings = crate::settings::load_settings().unwrap_or_default();
     let Some(overrides) = settings.keybindings else {
@@ -436,6 +432,13 @@ pub(super) fn configured_keybindings() -> Arc<rpi_tui::Keybindings> {
             rpi_tui::keybindings::keys::PASTE_IMAGE,
         ),
         ("app.message.dequeue", rpi_tui::keybindings::keys::DEQUEUE),
+        ("tui.altScreen.bottom", rpi_tui::keybindings::keys::BOTTOM),
+        ("tui.altScreen.top", rpi_tui::keybindings::keys::TOP),
+        ("tui.altScreen.pageUp", rpi_tui::keybindings::keys::PAGE_UP),
+        (
+            "tui.altScreen.pageDown",
+            rpi_tui::keybindings::keys::PAGE_DOWN,
+        ),
     ];
     for (name, id) in known {
         let Some(value) = overrides.get(*name) else {
@@ -656,12 +659,8 @@ pub(super) fn probe_paste_input(
     (more_queued, pending)
 }
 
-pub(super) fn transcript_page_size(viewport_height: usize) -> i32 {
-    viewport_height
-        .saturating_sub(PAGE_SCROLL_OVERLAP)
-        .max(1)
-        .min(i32::MAX as usize) as i32
-}
+#[cfg(test)]
+pub(super) use crate::transcript_navigation::transcript_page_size;
 
 pub(super) fn should_dispatch_key(kind: KeyEventKind) -> bool {
     kind != KeyEventKind::Release

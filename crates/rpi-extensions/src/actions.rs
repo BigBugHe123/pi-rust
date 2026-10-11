@@ -308,6 +308,7 @@ impl UiDialogMailbox {
                     }));
                 }
                 let ui = args.get("ui").cloned().unwrap_or_else(|| args.clone());
+                rpi_plugin_sdk::dialogs::validate(&ui, tool_call_id.as_deref())?;
                 state.active.insert(
                     id.clone(),
                     UiDialogEntry {
@@ -455,6 +456,9 @@ pub trait RuntimeActionHost: Send + Sync {
 /// — when it drops after `take_registry`, the master `Arc` in `rpi-cli` keeps
 /// the allocation alive.)
 pub struct ActionBridge {
+    stdio: crate::StdioLifecycle,
+    plugin_identity: Option<(u64, String)>,
+    component_owners: Arc<std::sync::Mutex<Vec<u64>>>,
     /// Captured at build time from a thread running the target runtime.
     pub(crate) runtime: Handle,
     /// The host impl (`HarnessActionHost` in rpi-cli).
@@ -483,6 +487,9 @@ impl ActionBridge {
     /// target runtime (pi-cli builds the bridge on the async main thread).
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
         Arc::new(Self {
+            stdio: crate::StdioLifecycle::default(),
+            plugin_identity: None,
+            component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
             runtime,
             host,
             reload: None,
@@ -517,6 +524,9 @@ impl ActionBridge {
         ui_dialog: UiDialogMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
+            stdio: crate::StdioLifecycle::default(),
+            plugin_identity: None,
+            component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
             runtime,
             host,
             reload: None,
@@ -537,6 +547,9 @@ impl ActionBridge {
         editor_text: crate::editor_text::EditorTextMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
+            stdio: crate::StdioLifecycle::default(),
+            plugin_identity: None,
+            component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
             runtime,
             host,
             reload: Some(reload),
@@ -545,6 +558,46 @@ impl ActionBridge {
             editor_text,
             active: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    pub(crate) fn for_plugin(&self, name: &str) -> Arc<Self> {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let owner = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        self.component_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(owner);
+        Arc::new(Self {
+            component_owners: self.component_owners.clone(),
+            stdio: self.stdio.clone(),
+            plugin_identity: Some((owner, name.to_owned())),
+            runtime: self.runtime.clone(),
+            host: self.host.clone(),
+            reload: self.reload.clone(),
+            ui_dialog: self.ui_dialog.clone(),
+            ext_status: self.ext_status.clone(),
+            editor_text: self.editor_text.clone(),
+            active: self.active.clone(),
+        })
+    }
+
+    pub fn stdio_lifecycle(&self) -> crate::StdioLifecycle {
+        self.stdio.clone()
+    }
+
+    pub(crate) fn claim_stdio(&self) -> Result<(), String> {
+        let (id, name) = self
+            .plugin_identity
+            .as_ref()
+            .ok_or("missing plugin identity")?;
+        self.stdio.claim(*id, name)
+    }
+
+    pub(crate) fn release_stdio_claim(&self) {
+        if let Some((id, _)) = &self.plugin_identity {
+            self.stdio.release_failed_registration(*id);
+            self.ext_status.remove_owner(*id);
+        }
     }
 
     /// Clone the session mailbox for TUI attachment or a reload-created bridge.
@@ -567,7 +620,14 @@ impl ActionBridge {
     /// the old `user_data` pointer fail fast with a staleness error instead of
     /// driving the swapped-out session. Idempotent.
     pub fn invalidate(&self) {
+        let owners = self
+            .component_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         self.active.store(false, Ordering::SeqCst);
+        for owner in owners.iter() {
+            self.ext_status.remove_owner(*owner);
+        }
     }
 
     /// Whether this bridge is still the live session's bridge.
@@ -702,10 +762,14 @@ async fn dispatch(
         // UI-only action: handled by the bridge (no harness call), exactly like
         // `UiDialog`. Written straight into the shared registry the TUI polls.
         RuntimeActionId::SetStatus => ext_status.handle(args),
+        RuntimeActionId::UiComponent => Err("UiComponent requires a plugin bridge".into()),
         // Editor-only action: served by the bridge (no harness call), exactly
         // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
+        RuntimeActionId::StdioLifecycle => {
+            Err("stdio lifecycle requires a plugin context".to_owned())
+        }
     }
 }
 
@@ -741,7 +805,7 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::SetEditorText),
+            u32::from(RuntimeActionId::UiComponent),
             args_json,
             out,
             user_data,
@@ -849,7 +913,25 @@ fn run_action(
     let ext_status = bridge.ext_status.clone();
     let editor_text = bridge.editor_text.clone();
     let reload_cb = bridge.reload.clone();
-    if action == RuntimeActionId::SetStatus {
+    if action == RuntimeActionId::StdioLifecycle {
+        let result = bridge.stdio.handle(
+            bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id),
+            args,
+        );
+        let _ = tx.send(result);
+    } else if action == RuntimeActionId::UiComponent {
+        let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
+        let _owners = bridge
+            .component_owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = if bridge.is_active() {
+            ext_status.component(owner, args)
+        } else {
+            Err("stale plugin bridge".into())
+        };
+        let _ = tx.send(result);
+    } else if action == RuntimeActionId::SetStatus {
         // Same reasoning as `UiDialog`: this action never touches the harness,
         // so it must not need a Tokio worker. A plugin calling it from inside a
         // single-threaded runtime (a tool poll callback, say) would otherwise
@@ -944,6 +1026,75 @@ fn run_action(
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stdio_claim_is_exclusive_and_only_its_scoped_context_can_finish() {
+        let master = ActionBridge::new(
+            Handle::current(),
+            Arc::new(MockHost {
+                prompt: String::new(),
+                saw: Mutex::new(Vec::new()),
+            }),
+        );
+        let diag: Arc<dyn crate::PluginDiagnostics> = Arc::new(crate::NullDiagnostics);
+        let owner = crate::HostApi::with_action_bridge(
+            "owner",
+            crate::ExtensionRegistry::new(),
+            diag.clone(),
+            master.clone(),
+        );
+        let other = crate::HostApi::with_action_bridge(
+            "other",
+            crate::ExtensionRegistry::new(),
+            diag,
+            master.clone(),
+        );
+        let vtable = owner.build_vtable();
+        let claim = r#"{"ownsStdio":true}"#;
+        unsafe {
+            crate::set_current_api(&owner);
+        }
+        assert_eq!(vtable.declare.unwrap()(StbStringRef::from_str(claim)), 0);
+        crate::clear_current_api();
+        let other_vtable = other.build_vtable();
+        let finish = StbStringRef::from_str(r#"{"op":"finish","exitCode":7}"#);
+        let mut out = StbString::empty();
+        // Direct, on a single-thread executor: this action must not park on Tokio.
+        assert_eq!(
+            (other_vtable.runtime_action)(
+                RuntimeActionId::StdioLifecycle as u32,
+                finish,
+                &mut out,
+                other_vtable.user_data
+            ),
+            1
+        );
+        (other_vtable.free_string)(out);
+        assert_eq!(
+            (vtable.runtime_action)(
+                RuntimeActionId::StdioLifecycle as u32,
+                finish,
+                &mut out,
+                vtable.user_data
+            ),
+            0
+        );
+        (vtable.free_string)(out);
+        assert_eq!(master.stdio_lifecycle().wait().await, 7);
+        unsafe {
+            crate::set_current_api(&other);
+        }
+        assert_ne!(
+            other_vtable.declare.unwrap()(StbStringRef::from_str(claim)),
+            0
+        );
+        crate::clear_current_api();
+        assert!(master
+            .stdio_lifecycle()
+            .validate()
+            .unwrap_err()
+            .contains("owner"));
+    }
 
     /// A minimal `RuntimeActionHost` that answers `get_system_prompt` with a
     /// canned string and `reload` with Ok(null); every other action returns an
@@ -1457,13 +1608,45 @@ mod tests {
         crate::host_free_string(out);
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 20 is one past the highest defined action (`SetEditorText` = 19).
+        // 23 is one past the highest defined action.
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(20, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(23, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         crate::host_free_string(out);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn component_bridge_isolates_plugins_and_cleans_up_reload_and_drop() {
+        let host = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let root = ActionBridge::new(tokio::runtime::Handle::current(), host);
+        let a = root.for_plugin("a");
+        let b = root.for_plugin("b");
+        let mailbox = root.extension_status_mailbox();
+        for plugin in [&a, &b] {
+            let mut out = StbString::empty();
+            assert_eq!(
+                trampoline_runtime_action(
+                    22,
+                    StbStringRef::from_str(
+                        r#"{"op":"register","id":"same","slot":"footer.after"}"#
+                    ),
+                    &mut out,
+                    Arc::as_ptr(plugin) as *mut c_void
+                ),
+                0
+            );
+            crate::host_free_string(out);
+        }
+        assert_eq!(mailbox.panels().len(), 2);
+        drop(a);
+        assert_eq!(mailbox.panels().len(), 1);
+        root.invalidate();
+        assert!(mailbox.panels().is_empty());
     }
 
     /// Action 18 (`SetStatus`) is bridge-local, like `UiDialog`: it writes the
@@ -1517,5 +1700,13 @@ mod tests {
             1
         );
         crate::host_free_string(out);
+    }
+}
+
+impl Drop for ActionBridge {
+    fn drop(&mut self) {
+        if let Some((owner, _)) = &self.plugin_identity {
+            self.ext_status.remove_owner(*owner);
+        }
     }
 }

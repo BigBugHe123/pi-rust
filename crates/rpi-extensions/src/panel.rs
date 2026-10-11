@@ -1,4 +1,4 @@
-//! Declarative, passive UI panels transported by the existing SetStatus action.
+//! Internal text component layout used by the TUI renderer.
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -22,12 +22,15 @@ pub enum PanelLayout {
     #[default]
     Overlay,
     Sidebar,
+    Footer,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionPanel {
     pub version: u32,
+    #[serde(default)]
+    pub order: i32,
     #[serde(default)]
     pub layout: PanelLayout,
     #[serde(default)]

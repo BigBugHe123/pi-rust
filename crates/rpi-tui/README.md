@@ -84,3 +84,11 @@ navigation — the source is at
 
 MIT. See [LICENSE](https://github.com/bigfish1913/pi-rust/blob/main/LICENSE)
 and [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE).
+
+`TuiAltScreen::set_scroll_to_end_indicator` accepts an optional label callback.
+It displays the label on the last visible row of a follow-end primary
+`ScrollView` while the user is reading earlier content. Hosts should call
+`handle_scroll_to_end_indicator_mouse_event` before text-selection handling.
+A primary-button press jumps to the end and resumes following output.
+The indicator stays inside the transcript clip, preserves the scrollbar,
+and does not appear in main-screen mode or over modal overlays.

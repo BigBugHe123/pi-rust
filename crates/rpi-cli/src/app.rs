@@ -314,6 +314,18 @@ async fn run_inner() -> i32 {
         .lock()
         .map(|session| session.owns_stdio())
         .unwrap_or(false);
+    let stdio_lifecycle = reload_context
+        .extension_session
+        .lock()
+        .ok()
+        .and_then(|session| session.action_bridge())
+        .map(|bridge| bridge.stdio_lifecycle());
+    if let Some(lifecycle) = &stdio_lifecycle {
+        if let Err(error) = lifecycle.validate() {
+            eprintln!("error: {error}");
+            return EXIT_RUNTIME;
+        }
+    }
     let stdin_text = if wants_rpc_channel || stdio_claimed {
         None
     } else {
@@ -352,7 +364,7 @@ async fn run_inner() -> i32 {
     };
 
     // A plugin that claimed stdio owns this process's stdin/stdout: force the
-    // headless Rpc lifecycle (dispatch BeforeTuiStart + SessionStart, then park)
+    // headless Rpc lifecycle (dispatch startup events, then wait for completion)
     // and let the plugin's own protocol server read/write stdio. This is
     // authoritative — it must win over TTY detection and RPI_FORCE_TUI,
     // otherwise the host would start a TUI/print run that writes to a stream the
@@ -438,14 +450,23 @@ async fn run_inner() -> i32 {
 
                 let code = if parsed.unknown_flags.contains_key("server") || stdio_claimed {
                     // Server mode OR a plugin-claimed stdio server: the extension
-                    // owns the process's I/O; the core just stays alive and
-                    // tears the session down on Ctrl+C (firing SessionShutdown
-                    // so the extension stops).
+                    // owns the process's I/O. Wait for its completion or Ctrl+C,
+                    // then dispatch SessionShutdown before unloading plugins.
                     eprintln!(
                         "[rpi] running in headless mode (no TUI); extension owns stdio; Ctrl+C to stop"
                     );
-                    let _ = tokio::signal::ctrl_c().await;
-                    0
+                    if stdio_claimed {
+                        let lifecycle = stdio_lifecycle
+                            .as_ref()
+                            .expect("stdio owner requires an action bridge");
+                        tokio::select! {
+                            code = lifecycle.wait() => code,
+                            _ = tokio::signal::ctrl_c() => 0,
+                        }
+                    } else {
+                        let _ = tokio::signal::ctrl_c().await;
+                        0
+                    }
                 } else {
                     // `--mode rpc`: JSONL command loop over stdio — the
                     // server-side agent that rpi-server spawns and that

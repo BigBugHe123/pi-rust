@@ -47,7 +47,12 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
     // updated in place from the driver's normalized event stream.
     let view = TranscriptView::new(transcript_container.clone());
 
-    let editor = Arc::new(Editor::simple());
+    let keybindings = crate::interactive_tui::configured_keybindings();
+    let editor = Arc::new(Editor::new(
+        rpi_tui::EditorOptions::default(),
+        rpi_tui::EditorStyle::default(),
+        keybindings.clone(),
+    ));
     let editor_slot = Arc::new(Container::new());
     editor_slot.add_child(editor.clone());
 
@@ -72,6 +77,7 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
         false,
         None,
     ));
+    crate::transcript_navigation::install(&tui, keybindings.clone());
     tui.set_layout_root(Some(root));
     tui.set_focus(Some(editor.clone()));
     editor.set_focused(true);
@@ -123,6 +129,7 @@ pub async fn run_driver_tui<D: SessionDriver>(driver: &D, addr: &str) -> Result<
         &editor_slot,
         &chrome,
         &view,
+        &keybindings,
         addr,
     )
     .await;
@@ -145,6 +152,7 @@ async fn run_loop<D: SessionDriver>(
     editor_slot: &Arc<Container>,
     chrome: &ChatChrome,
     view: &TranscriptView,
+    keybindings: &rpi_tui::Keybindings,
     addr: &str,
 ) -> Result<(), String> {
     // Repaint cadence while a run is in flight so the in-editor spinner and the
@@ -181,6 +189,7 @@ async fn run_loop<D: SessionDriver>(
                 match event {
                     Event::Resize(_, _) => tui.refresh_size(),
                     Event::Mouse(mouse) => {
+                        if tui.handle_scroll_to_end_indicator_mouse_event(&mouse) { continue; }
                         match mouse.kind {
                             MouseEventKind::ScrollUp => tui.scroll_by(-3),
                             MouseEventKind::ScrollDown => tui.scroll_by(3),
@@ -201,7 +210,8 @@ async fn run_loop<D: SessionDriver>(
                             } else if !had_dialog {
                                 break;
                             }
-                        } else if !dialogs.handle_key(key) {
+                        } else if !dialogs.handle_key(key)
+                            && !crate::transcript_navigation::handle_key(tui, keybindings, &key) {
                             editor.handle_key(key);
                         }
                         tui.request_render(false);

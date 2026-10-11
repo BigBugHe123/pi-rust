@@ -89,67 +89,43 @@ descendants and closing inherited pipes. Its Win32/libc calls and owned handles
 stay in the SDK; packages can enable `forbid(unsafe_code)` while using the
 platform-independent interface.
 
-## Positioned plugin panels
+## Registered TUI text components
 
-Hosts with declarative panel support accept a `panel` field on the existing
-`RuntimeActionId::SetStatus` (18). The ABI and legacy
-`{"key":"my-plugin","value":"footer text"}` behavior are unchanged.
-No host changes are needed for each new plugin, its text or its position.
+Use `RuntimeActionId::UiComponent` (22). Each plugin owns its own component IDs.
+Register once, then send content updates without repeating the layout:
 
 ```json
-{
-  "key": "my-plugin.monitor",
-  "panel": {
-    "version": 1,
-    "anchor": "top-right",
-    "offsetX": -2,
-    "offsetY": 1,
-    "width": 44,
-    "maxHeight": 9,
-    "minScreenWidth": 50,
-    "border": true,
-    "title": "My monitor",
-    "lines": ["1 round · 87 steps · 252 tok/s", "First token: 0.42s"]
-  }
-}
+{"op":"register","id":"monitor","type":"text","slot":"footer.after","order":10,"width":240,"maxHeight":1,"border":false,"visible":false}
+{"op":"update","id":"monitor","text":"TPS 252 · TTFT 0.42s"}
+{"op":"show","id":"monitor"}
+{"op":"configure","id":"monitor","slot":"sidebar.right","width":40,"maxHeight":8}
+{"op":"hide","id":"monitor"}
+{"op":"remove","id":"monitor"}
 ```
 
-Pass this JSON using `api.runtime_action` and free its output with
-`api.free_string`, as for other runtime actions. Update the same key to replace
-its panel, or send `{"key":"my-plugin.monitor","panel":null}` to remove it.
-Clear panels during `SessionShutdown` as well. Footer statuses and panels have
-independent registries; clearing one does not clear the other. Headless runs
-store panels without rendering them. Older hosts do not render the new field.
+Registration is idempotent and preserves existing content, visibility and layout.
+`update` accepts `text` and optional `title`; layout fields are rejected. `configure`
+changes layout while preserving text and visibility. Hidden components retain state.
+Updating an unregistered ID returns an error. Plugin unload removes its components.
+Use `RuntimeActionId::SetStatus` with `key` and `value` for legacy footer statuses;
+the old `panel` payload has been removed.
 
-Supported anchors: `top-left`, `top-center`, `top-right`, `left-center`, `center`,
-`right-center`, `bottom-left`, `bottom-center`, `bottom-right`. Signed offsets
-are terminal columns/rows relative to the anchor; negative offsets move left/up.
-In the interactive TUI, positions are relative to the visible transcript area,
-so panels stay fixed while chat scrolls and never cover the editor or footer.
-Panels are passive text overlays and do not change keyboard focus. Content is
-rendered at the allocated width and offsets are clamped inside the available area.
-When passive panels overlap, the host moves later panels to the nearest free
-vertical position, leaving a one-row gap. A panel that cannot fit is temporarily
-hidden and returns when space becomes available. Use `sidebar` to reserve space
-beside chat rather than cover transcript content.
+Slots: `footer.after`, `sidebar.left`, `sidebar.right`, `overlay`.
+Components sort by `order` (default 0), then plugin identity and ID.
+Layout fields: `anchor`, `offsetX`, `offsetY`, `width`, `maxHeight`,
+`minScreenWidth`, `border`. Anchors use the nine conventional positions from
+`top-left` to `bottom-right`, with `left-center` and `right-center`.
+Width is 4–240 columns, maxHeight is 1–80 rows. Content is limited to 64 lines,
+2048 UTF-8 bytes per line and 256 bytes per title. Controls are stripped by the
+renderer and Unicode display widths are respected. Each plugin may register 32
+components. Invalid changes preserve the previous state.
 
-Set `"layout":"sidebar"` to reserve a column beside the transcript instead of
-covering chat. The default `"layout":"overlay"` preserves existing panels.
-Left anchors use the left sidebar; other anchors use the right sidebar. A single
-panel follows its vertical anchor and `offsetY`; multiple panels on one side
-stack in key order. `offsetX` applies only to overlays. A sidebar adds a two-column
-separator to the requested width. It hides when `minScreenWidth` is not met or
-less than 48 columns would remain for chat. The editor and footer stay full width.
-Removing sidebar panels restores the transcript width. Sidebar mode leaves
-keyboard focus and transcript scrolling with the original components.
-
-`version` and `lines` are required. Defaults: anchor `top-right`, width 44,
-maxHeight 16, offsets 0, minScreenWidth 0, border true, title empty. Width is
-4–240 columns; maxHeight is 1–80 rows including title and borders. Content is
-clipped to width and height, with Unicode display widths respected. Terminal
-control sequences in content are stripped. At most 32 panels, 64 lines per
-panel, 2048 UTF-8 bytes per line and 256 bytes per title are accepted. Invalid
-updates return an error and preserve the previous panel.
+Footer rows render below usage in both terminal modes. Sidebars reserve space in
+fullscreen mode; native scrollback shows their content above the editor. Overlays
+use the visible transcript viewport. Passive components do not change input focus.
+Headless hosts store components without rendering them. Older hosts reject action 22;
+plugins should handle that error. This API supports text components; interactive
+questions continue to use `UiDialog`.
 
 ## Why a hand-written C ABI
 
@@ -212,3 +188,55 @@ Rebuild extensions when the SDK contract they require changes.
 
 MIT. See [LICENSE](https://github.com/bigfish1913/pi-rust/blob/main/LICENSE)
 and [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE).
+
+## Exclusive stdio servers
+
+During registration, `declare {"ownsStdio":true}` requests exclusive ownership
+of the process's stdin/stdout. Each plugin has its own runtime context; two
+owners cause a startup error, including when their file stems are identical.
+Failed registration releases its claim. The host leaves stdio untouched and
+runs the normal session lifecycle without rendering a TUI.
+
+Use `RuntimeActionId::StdioLifecycle` (21) with `{"op":"status"}` to check
+support and with `{"op":"finish","exitCode":0}` to signal EOF or server
+completion. Only the owner can finish, and early completion is retained. The
+host dispatches `SessionShutdown` and returns the code. Stop and join plugin
+workers in that handler; do not terminate the process from a plugin.
+
+The optional `stdio` feature provides `stdio::StdinLines::poll_line`. It polls
+pipe/file input without a background stdin task that can block shutdown.
+Wait between `InputLine::Pending` results using the server's own cancellation
+mechanism. The caller must exclusively own stdin. Windows console input is
+unsupported by this pipe/file server helper.
+
+## Dialog purpose
+
+`UiDialog` (17) keeps its open/poll/cancel protocol. A presentation `kind` such
+as `selector` does not imply permission. Omitted `ui.purpose` means `question`;
+`purpose: "permission"` requires a nonempty `toolCallId`, a flat single-choice
+`confirm`/`selector` and explicit decision metadata on every option:
+
+```json
+{
+  "op": "open",
+  "requestId": "approval-1",
+  "toolCallId": "call-1",
+  "ui": {
+    "purpose": "permission",
+    "kind": "confirm",
+    "question": "Allow this tool?",
+    "options": [
+      {"title": "Allow once", "permission": "allow_once"},
+      {"title": "Reject", "permission": "reject_once"}
+    ]
+  }
+}
+```
+
+Decisions are `allow_once`, `allow_always`, `reject_once`, or `reject_always`.
+Titles are nonempty, unique and have no surrounding whitespace. Permission
+questions do not accept nested questions, multiple answers or freeform input.
+`dialogs::validate` and `dialogs::permission_options` share these checks between
+hosts and adapters. Answers retain the selected original title in `values`.
+Transport adapters that cannot show ordinary questions cancel them explicitly;
+they must not reinterpret them as permission choices.

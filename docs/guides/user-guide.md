@@ -197,6 +197,15 @@ rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ```
 
+### 跳到最新消息
+
+在 `--tui-mode fullscreen` 和 `--connect` 中，向上滚动回看历史时，消息区底部会显示
+`↓ Jump to latest message · End`。点击提示或按 `End` 即可回到最新消息，并恢复跟随输出；
+输入框中的草稿和焦点会保留。
+
+可在 `settings.json` 的 `keybindings` 中设置 `"tui.altScreen.bottom": "ctrl+end"`。
+提示会显示实际快捷键；设置为 `null` 可禁用按键，点击入口仍可使用。
+
 ### 远程模式（`--server` / `--connect`）
 
 把 agent 跑在无头服务端，另一个进程用 TUI 远程驱动。客户端**无任何本地 agent 资源**。

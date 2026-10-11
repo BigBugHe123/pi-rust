@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Default)]
 pub struct ExtensionStatusMailbox {
     entries: Arc<Mutex<BTreeMap<String, String>>>,
-    panels: Arc<Mutex<BTreeMap<String, crate::ExtensionPanel>>>,
+    components: Arc<Mutex<BTreeMap<(u64, String), (crate::ExtensionPanel, bool)>>>,
     /// Bumped on every accepted write so readers can skip unchanged frames.
     revision: Arc<AtomicU64>,
 }
@@ -56,43 +56,14 @@ impl ExtensionStatusMailbox {
         changed
     }
 
-    /// Handle the `SetStatus` runtime action. Legacy `value` updates the footer;
-    /// opt-in `panel` updates a passive positioned panel (`null` removes it).
-    /// The registries are independent, so old status callers remain unchanged.
+    /// Handle the legacy SetStatus footer action.
     pub fn handle(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let key = args
             .get("key")
             .and_then(serde_json::Value::as_str)
             .ok_or("set_status requires a string `key`")?;
-        if let Some(panel) = args.get("panel") {
-            if key.trim().is_empty() {
-                return Err("panel requires a nonempty key".into());
-            }
-            let panel = if panel.is_null() {
-                None
-            } else {
-                let panel: crate::ExtensionPanel = serde_json::from_value(panel.clone())
-                    .map_err(|e| format!("invalid panel: {e}"))?;
-                panel.validate()?;
-                Some(panel)
-            };
-            let mut panels = self
-                .panels
-                .lock()
-                .map_err(|_| "panel registry unavailable")?;
-            let changed = match panel {
-                Some(panel) => {
-                    if !panels.contains_key(key.trim()) && panels.len() >= 32 {
-                        return Err("too many panels (maximum 32)".into());
-                    }
-                    panels.insert(key.trim().to_string(), panel.clone()) != Some(panel)
-                }
-                None => panels.remove(key.trim()).is_some(),
-            };
-            if changed {
-                self.revision.fetch_add(1, Ordering::SeqCst);
-            }
-            return Ok(serde_json::json!({"ok":true,"changed":changed}));
+        if args.get("panel").is_some() {
+            return Err("panel was removed; use UiComponent".into());
         }
         let value = args
             .get("value")
@@ -100,6 +71,165 @@ impl ExtensionStatusMailbox {
             .unwrap_or("");
         let changed = self.set(key, value);
         Ok(serde_json::json!({ "ok": true, "changed": changed }))
+    }
+
+    pub fn component(
+        &self,
+        owner: u64,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let id = args["id"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty() && s.len() <= 128)
+            .ok_or("invalid component id")?;
+        let key = (owner, id.to_owned());
+        let op = args["op"].as_str().ok_or("missing component operation")?;
+        let mut entries = self
+            .components
+            .lock()
+            .map_err(|_| "component registry unavailable")?;
+        let before = entries.get(&key).cloned();
+        let allowed: &[&str] = match op {
+            "register" => &[
+                "op",
+                "id",
+                "type",
+                "slot",
+                "order",
+                "visible",
+                "anchor",
+                "offsetX",
+                "offsetY",
+                "width",
+                "maxHeight",
+                "minScreenWidth",
+                "border",
+            ],
+            "configure" => &[
+                "op",
+                "id",
+                "slot",
+                "order",
+                "anchor",
+                "offsetX",
+                "offsetY",
+                "width",
+                "maxHeight",
+                "minScreenWidth",
+                "border",
+            ],
+            "update" => &["op", "id", "text", "title"],
+            _ => &["op", "id"],
+        };
+        if args
+            .as_object()
+            .ok_or("component payload must be an object")?
+            .keys()
+            .any(|k| !allowed.contains(&k.as_str()))
+        {
+            return Err("unexpected component field".into());
+        }
+        let next = match op {
+            "register" if before.is_some() => before.clone(),
+            "remove" => None,
+            "register" | "configure" | "update" | "show" | "hide" => {
+                let (mut spec, mut visible) = if op == "register" {
+                    if entries.keys().filter(|(o, _)| *o == owner).count() >= 32 {
+                        return Err("too many components".into());
+                    }
+                    if args.get("type").and_then(|v| v.as_str()).unwrap_or("text") != "text" {
+                        return Err("unsupported component type".into());
+                    }
+                    (
+                        serde_json::json!({"version":1,"lines":[]}),
+                        args["visible"].as_bool().unwrap_or(true),
+                    )
+                } else {
+                    let (panel, visible) = before.clone().ok_or("component is not registered")?;
+                    (
+                        serde_json::to_value(panel).map_err(|e| e.to_string())?,
+                        visible,
+                    )
+                };
+                if op == "register" || op == "configure" {
+                    if let Some(slot) = args.get("slot") {
+                        let (layout, anchor) = match slot.as_str().ok_or("invalid slot")? {
+                            "footer.after" => ("footer", "top-right"),
+                            "sidebar.left" => ("sidebar", "top-left"),
+                            "sidebar.right" => ("sidebar", "top-right"),
+                            "overlay" => ("overlay", "top-right"),
+                            _ => return Err("unsupported component slot".into()),
+                        };
+                        spec["layout"] = layout.into();
+                        spec["anchor"] = anchor.into();
+                    }
+                    for field in [
+                        "order",
+                        "anchor",
+                        "offsetX",
+                        "offsetY",
+                        "width",
+                        "maxHeight",
+                        "minScreenWidth",
+                        "border",
+                    ] {
+                        if let Some(v) = args.get(field) {
+                            spec[field] = v.clone();
+                        }
+                    }
+                } else if op == "update" {
+                    if args
+                        .as_object()
+                        .unwrap()
+                        .keys()
+                        .any(|k| !["op", "id", "text", "title"].contains(&k.as_str()))
+                    {
+                        return Err(
+                            "update accepts text and title; use configure for layout".into()
+                        );
+                    }
+                    if let Some(v) = args.get("text") {
+                        spec["lines"] = serde_json::json!(v
+                            .as_str()
+                            .ok_or("text must be a string")?
+                            .split('\n')
+                            .collect::<Vec<_>>());
+                    }
+                    if let Some(v) = args.get("title") {
+                        spec["title"] = v.as_str().ok_or("title must be a string")?.into();
+                    }
+                } else {
+                    visible = op == "show";
+                }
+                let panel: crate::ExtensionPanel =
+                    serde_json::from_value(spec).map_err(|e| e.to_string())?;
+                panel.validate()?;
+                Some((panel, visible))
+            }
+            _ => return Err("unknown component operation".into()),
+        };
+        let changed = before != next;
+        if changed {
+            match next {
+                Some(v) => {
+                    entries.insert(key, v);
+                }
+                None => {
+                    entries.remove(&key);
+                }
+            }
+            self.revision.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(serde_json::json!({"ok":true,"changed":changed}))
+    }
+    pub fn remove_owner(&self, owner: u64) {
+        if let Ok(mut entries) = self.components.lock() {
+            let size = entries.len();
+            entries.retain(|(o, _), _| *o != owner);
+            if size != entries.len() {
+                self.revision.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     /// Monotonic write counter; changes whenever any entry changed.
@@ -114,10 +244,21 @@ impl ExtensionStatusMailbox {
 
     /// Snapshot declarative panels separately from the legacy footer registry.
     pub fn panels(&self) -> BTreeMap<String, crate::ExtensionPanel> {
-        self.panels
-            .lock()
-            .map(|panels| panels.clone())
-            .unwrap_or_default()
+        let mut panels = BTreeMap::new();
+        if let Ok(entries) = self.components.lock() {
+            for ((owner, id), (spec, visible)) in entries.iter() {
+                if *visible {
+                    panels.insert(
+                        format!(
+                            "component:{:010}:{owner}:{id}",
+                            (spec.order as i64) - (i32::MIN as i64)
+                        ),
+                        spec.clone(),
+                    );
+                }
+            }
+        }
+        panels
     }
 
     /// Render visible footer entries, omitting keys consumed by richer UI.
@@ -158,70 +299,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn panels_are_independent_from_legacy_status_and_can_update_move_and_clear() {
-        let mailbox = ExtensionStatusMailbox::new();
-        mailbox.set("voice", "voice: listening");
-        let panel = serde_json::json!({"version":1,"anchor":"bottom-left","lines":["anything"]});
-        let out = mailbox
-            .handle(serde_json::json!({"key":"plugin-a","panel":panel}))
+    fn components_keep_layout_content_visibility_and_owners_independent() {
+        let m = ExtensionStatusMailbox::new();
+        let register =
+            serde_json::json!({"op":"register","id":"stats","slot":"footer.after","visible":false});
+        m.component(1, register.clone()).unwrap();
+        m.component(2, register.clone()).unwrap();
+        assert!(m.panels().is_empty());
+        m.component(
+            1,
+            serde_json::json!({"op":"update","id":"stats","text":"TPS 252"}),
+        )
+        .unwrap();
+        m.component(1, serde_json::json!({"op":"show","id":"stats"}))
             .unwrap();
-        assert_eq!(out["changed"], true);
-        let revision = mailbox.revision();
+        let rev = m.revision();
+        m.component(1, register).unwrap();
+        assert_eq!(m.revision(), rev);
         assert_eq!(
-            mailbox
-                .handle(serde_json::json!({"key":"plugin-a","panel":panel}))
-                .unwrap()["changed"],
-            false
+            m.panels()["component:2147483648:1:stats"].layout,
+            crate::PanelLayout::Footer
         );
-        assert_eq!(mailbox.revision(), revision);
-        mailbox.handle(serde_json::json!({"key":"plugin-b","panel":{"version":1,"anchor":"center","lines":["second"]}})).unwrap();
-        assert_eq!(mailbox.panels().len(), 2);
-        assert_eq!(
-            mailbox.panels()["plugin-a"].anchor,
-            crate::PanelAnchor::BottomLeft
-        );
-        assert_eq!(mailbox.text(), "voice: listening");
-        assert_eq!(mailbox.text_except(&[]), "voice: listening");
-        mailbox
-            .handle(serde_json::json!({"key":"plugin-a","value":"legacy footer"}))
-            .unwrap();
-        assert_eq!(mailbox.panels().len(), 2);
-        mailbox.handle(serde_json::json!({"key":"plugin-a","panel":{"version":1,"anchor":"top-right","lines":["updated"]}})).unwrap();
-        assert_eq!(
-            mailbox.panels()["plugin-a"].anchor,
-            crate::PanelAnchor::TopRight
-        );
-        mailbox
-            .handle(serde_json::json!({"key":"plugin-a","panel":null}))
-            .unwrap();
-        assert_eq!(mailbox.panels().len(), 1);
-        assert_eq!(mailbox.get("plugin-a").as_deref(), Some("legacy footer"));
-    }
-    #[test]
-    fn invalid_panels_do_not_replace_valid_panels_or_change_revision() {
-        let mailbox = ExtensionStatusMailbox::new();
-        mailbox
-            .handle(serde_json::json!({"key":"test","panel":{"version":1,"lines":["original"]}}))
-            .unwrap();
-        let revision = mailbox.revision();
-        for bad in [
-            serde_json::json!({"version":2,"lines":[]}),
-            serde_json::json!({"version":1,"anchor":"wrong","lines":[]}),
-            serde_json::json!({"version":1,"width":999999,"lines":[]}),
-            serde_json::json!({"version":1,"lines":[42]}),
-            serde_json::json!({"version":1,"maxHeight":0,"lines":[]}),
-        ] {
-            assert!(mailbox
-                .handle(serde_json::json!({"key":"test","panel":bad}))
-                .is_err());
-            assert_eq!(mailbox.revision(), revision);
-            assert_eq!(mailbox.panels()["test"].lines, ["original"]);
-        }
-        assert!(mailbox
-            .handle(serde_json::json!({"key":" ","panel":null}))
+        assert!(m
+            .component(
+                1,
+                serde_json::json!({"op":"update","id":"stats","slot":"overlay"})
+            )
             .is_err());
+        assert!(m
+            .component(
+                3,
+                serde_json::json!({"op":"update","id":"stats","text":"x"})
+            )
+            .is_err());
+        m.component(1, serde_json::json!({"op":"hide","id":"stats"}))
+            .unwrap();
+        m.component(
+            1,
+            serde_json::json!({"op":"configure","id":"stats","slot":"sidebar.left"}),
+        )
+        .unwrap();
+        m.component(1, serde_json::json!({"op":"show","id":"stats"}))
+            .unwrap();
+        assert_eq!(
+            m.panels()["component:2147483648:1:stats"].lines,
+            ["TPS 252"]
+        );
+        m.remove_owner(1);
+        assert!(m.panels().is_empty());
+        m.component(2, serde_json::json!({"op":"show","id":"stats"}))
+            .unwrap();
+        assert_eq!(m.panels().len(), 1);
     }
-
     #[test]
     fn set_and_clear_round_trip() {
         let mailbox = ExtensionStatusMailbox::new();

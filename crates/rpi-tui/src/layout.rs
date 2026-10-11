@@ -576,7 +576,8 @@ pub fn composite_tui_line(
         )
     } else if overlay_actual_width > effective_width {
         // Truncate
-        slice_by_column(overlay, 0, effective_width, true)
+        crate::line_diff::slice(overlay, 0, effective_width)
+            .unwrap_or_else(|| slice_by_column(overlay, 0, effective_width, true))
     } else {
         overlay.to_string()
     };
@@ -587,19 +588,17 @@ pub fn composite_tui_line(
 
     // Get before portion from base
     let before = if before_width > 0 {
-        slice_by_column(base, 0, before_width, true)
+        crate::line_diff::slice(base, 0, before_width)
+            .unwrap_or_else(|| slice_by_column(base, 0, before_width, true))
     } else {
         String::new()
     };
 
     // Get after portion from base
     let after = if after_start < base_width {
-        slice_by_column(
-            base,
-            after_start,
-            base_width.saturating_sub(after_start),
-            true,
-        )
+        let width = base_width.saturating_sub(after_start);
+        crate::line_diff::slice(base, after_start, width)
+            .unwrap_or_else(|| slice_by_column(base, after_start, width, true))
     } else {
         String::new()
     };
@@ -608,8 +607,8 @@ pub fn composite_tui_line(
     const SEGMENT_RESET: &str = "\x1b[0m\x1b]8;;\x07";
 
     // Calculate padding
-    let before_pad = if visible_width(&before) < before_width {
-        " ".repeat(before_width - visible_width(&before))
+    let before_pad = if visible_width(&before) < start_col {
+        " ".repeat(start_col - visible_width(&before))
     } else {
         String::new()
     };
@@ -706,6 +705,23 @@ pub fn strip_cursor_markers(lines: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlay_composition_pads_to_its_hit_column_and_keeps_existing_styles() {
+        let output = super::composite_tui_line("\x1b[32mabc\x1b[0m", "Jump", 10, 4, 20);
+        assert_eq!(crate::ansi::strip_ansi(&output), "abc       Jump      ");
+        assert!(output.contains("\x1b[32mabc"));
+        let output = super::composite_tui_line(
+            "\x1b[31mabcdefghijklmnop\x1b[0m",
+            "\x1b[44mJump\x1b[49m",
+            4,
+            4,
+            16,
+        );
+        assert!(output.contains("\x1b[31mabcd"));
+        assert!(output.contains("\x1b[31mijklmnop"));
+        assert_eq!(crate::ansi::strip_ansi(&output), "abcdJumpijklmnop");
+    }
+
     use super::*;
     use crate::{
         Container, Editor, EditorOptions, EditorStyle, Focusable, ScrollView, ScrollViewOptions,

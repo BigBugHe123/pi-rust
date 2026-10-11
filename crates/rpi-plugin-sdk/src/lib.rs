@@ -60,13 +60,17 @@ use core::ffi::c_char;
 use core::ffi::c_void;
 use core::ptr;
 
-#[cfg(feature = "json")]
 pub mod callbacks;
+#[cfg(feature = "json")]
+#[cfg(feature = "json")]
+pub mod dialogs;
 #[cfg(feature = "json")]
 pub mod events;
 pub mod handles;
 #[cfg(feature = "process")]
 pub mod process;
+#[cfg(feature = "stdio")]
+pub mod stdio;
 
 // ---------------------------------------------------------------------------
 // StbString — owned UTF-8 crossing as ptr+len with an explicit free
@@ -983,9 +987,7 @@ pub enum RuntimeActionId {
     /// Args: `{"key":"langfuse","value":"langfuse ✓ (trace sent)"}`; an
     /// empty/absent `value` clears that key. Result: `{"ok":true,"changed":bool}`.
     /// Headless hosts accept the write but have nothing to render.
-    /// Legacy footer text (`key`, `value`) or an opt-in positioned text panel
-    /// (`key`, `panel`). See the SDK README for the versioned JSON contract.
-    /// Setting `panel` to null removes that panel without changing footer text.
+    /// Legacy footer text (`key`, `value`). Use UiComponent for registered UI.
     SetStatus = 18,
     /// Put text into the interactive editor (the prompt input box) instead of
     /// sending it. Args: `{"text":"...", "mode":"append"|"replace",
@@ -996,6 +998,12 @@ pub enum RuntimeActionId {
     /// Return the current session branch entries oldest-first as JSON.
     /// Args: `{}`; result: `{"entries":[...]}`.
     GetSessionBranch = 20,
+    /// Inspect or finish a plugin-owned stdio server lifecycle. Args:
+    /// `{"op":"status"}` or `{"op":"finish","exitCode":0}`. Only the
+    /// declaring owner may finish; the host performs normal session shutdown.
+    StdioLifecycle = 21,
+    /// Plugin-owned text component lifecycle and content updates.
+    UiComponent = 22,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1037,6 +1045,8 @@ impl TryFrom<u32> for RuntimeActionId {
             18 => Ok(Self::SetStatus),
             19 => Ok(Self::SetEditorText),
             20 => Ok(Self::GetSessionBranch),
+            21 => Ok(Self::StdioLifecycle),
+            22 => Ok(Self::UiComponent),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1662,6 +1672,8 @@ mod tests {
             RuntimeActionId::SetStatus,
             RuntimeActionId::SetEditorText,
             RuntimeActionId::GetSessionBranch,
+            RuntimeActionId::StdioLifecycle,
+            RuntimeActionId::UiComponent,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -1671,8 +1683,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(21),
-            Err(UnknownRuntimeActionId(21))
+            RuntimeActionId::try_from(23),
+            Err(UnknownRuntimeActionId(23))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),

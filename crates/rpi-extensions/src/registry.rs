@@ -335,7 +335,8 @@ pub struct ExtensionRegistry {
     /// belong to the plugin (an ACP/MCP-style stdio server), so the host must
     /// defer `read_piped_stdin` until after extension load and run the headless
     /// `Rpc` lifecycle instead of Print/TUI. Monotonic across `absorb` (any
-    /// claiming plugin wins). Default `false`.
+    /// claiming plugin projects `true`). The scoped ActionBridge arbitrates
+    /// exclusivity before registries are merged. Default `false`.
     owns_stdio: bool,
     /// Shared staleness flag. `true` while the session owning this registry is
     /// active; set `false` on swap/`/reload`. Tool/event dispatch checks it.
@@ -770,8 +771,8 @@ impl ExtensionRegistry {
             self.renderers.push(r);
         }
         // stdio ownership is a claim: any claiming plugin makes the merged
-        // session own stdio (first-wins on *which* plugin is not needed — the
-        // host only needs to know whether *some* plugin does).
+        // session own stdio. The live bridge has already checked the exclusive
+        // owner; this flag projects that claim into the immutable snapshot.
         self.owns_stdio |= other.owns_stdio;
     }
 }

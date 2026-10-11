@@ -61,6 +61,7 @@ pub mod session_driver;
 pub mod settings;
 pub mod source_info;
 pub mod timings;
+mod transcript_navigation;
 pub mod transcript_view;
 pub mod trust;
 pub mod tui_shell;
