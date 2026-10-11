@@ -142,6 +142,26 @@ rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 </code></pre>
+<h3 id="_4">启动资源清单</h3>
+<p>启动 TUI 时，<code>Context</code> 会列出实际加载成功的系统提示词和项目指令文件路径，
+包括 <code>SYSTEM.md</code>、<code>APPEND_SYSTEM.md</code> 以及 <code>AGENTS.md</code> / <code>CLAUDE.md</code>。
+项目 <code>SYSTEM.md</code> 和 <code>APPEND_SYSTEM.md</code> 优先于全局同名文件；清单只显示生效的来源。
+没有加载文件时，启动页会省略 <code>Context</code>。<code>/context</code> 可查看当前完整资源清单，
+成功执行 <code>/reload</code> 后，启动页的 <code>Context</code> 和 <code>/context</code> 都会更新。
+设置 <code>quietStartup: true</code> 可隐藏启动资源清单。</p>
+<h3 id="_5">更新日志</h3>
+<p><code>/changelog</code> 显示当前二进制对应的最新发布说明；<code>/changelog all</code> 显示完整历史。
+更新后第一次启动新交互会话，会展示自上次阅读以来的新版本说明，后续启动不再重复。
+恢复已有会话时，提示会延后到下一次新会话。</p>
+<p>rpi 使用全局 <code>settings.json</code> 中的 <code>lastRpiChangelogVersion</code> 记录已读版本，避免导入的
+<code>lastChangelogVersion</code> 干扰。已有配置缺少 rpi 标记时，只补充展示当前版本一次；首次安装
+直接建立基线。设置 <code>collapseChangelog: true</code> 可显示简短更新提示。</p>
+<h3 id="_6">跳到最新消息</h3>
+<p>在 <code>--tui-mode fullscreen</code> 和 <code>--connect</code> 中，向上滚动回看历史时，消息区底部会显示
+<code>↓ Jump to latest message · End</code>。点击提示或按 <code>End</code> 即可回到最新消息，并恢复跟随输出；
+输入框中的草稿和焦点会保留。</p>
+<p>可在 <code>settings.json</code> 的 <code>keybindings</code> 中设置 <code>"tui.altScreen.bottom": "ctrl+end"</code>。
+提示会显示实际快捷键；设置为 <code>null</code> 可禁用按键，点击入口仍可使用。</p>
 <h3 id="-server-connect">远程模式（<code>--server</code> / <code>--connect</code>）</h3>
 <p>把 agent 跑在无头服务端，另一个进程用 TUI 远程驱动。客户端<strong>无任何本地 agent 资源</strong>。</p>
 <pre><code class="language-bash">rpi --server --port 9899          # 服务端：启动时打印 token
@@ -244,11 +264,11 @@ while let Some(event) = events.recv().await {
 </code></pre>
 <p>自定义工具实现 <code>rpi-agent::AgentTool</code>；Provider 实现 <code>rpi-ai::Provider</code>。使用 <code>faux provider</code> 和 <code>InMemoryExecutionEnv</code> 可以在没有网络、API key 或真实文件系统的情况下测试 Agent loop。</p>
 <h2 id="8">8. 故障排查</h2>
-<h3 id="_4">找不到模型或接口报错</h3>
+<h3 id="_7">找不到模型或接口报错</h3>
 <p>运行 <code>rpi auth check</code>，确认 provider、<code>models.json</code>、环境变量和 <code>baseUrl</code>。使用 <code>--provider</code> 和完整的 <code>provider/model</code> 避免同名模型歧义。接口错误会保留 provider 返回的诊断文本；先检查 endpoint、认证头和模型 ID。</p>
-<h3 id="_5">扩展加载失败</h3>
+<h3 id="_8">扩展加载失败</h3>
 <p>确认 Rust 插件是 <code>cdylib</code> 并与当前平台匹配；临时使用 <code>--extensions-dir</code> 指向生成目录。加载失败时保留宿主输出的完整错误信息，检查扩展是否声明了宿主未提供的能力。</p>
-<h3 id="_6">扩展事件处理器没触发或启动被中止</h3>
+<h3 id="_9">扩展事件处理器没触发或启动被中止</h3>
 <pre><code class="language-bash">export RPI_EVENT_LOG=1
 rpi            # 记录所有扩展事件处理器调用
 rpi events tail   # 跟踪日志；看 result 是 Continue 还是 Error/Abort/Panic/Timeout
@@ -256,9 +276,9 @@ rpi events tail   # 跟踪日志；看 result 是 Continue 还是 Error/Abort/Pa
 <p>日志默认在 <code>~/.rpi/logs/events.jsonl</code>（可用 <code>RPI_EVENT_LOG_PATH</code> 覆盖）。如果
 <code>BeforeTuiStart</code> 阶段有扩展返回 veto（<code>EVENT_HANDLER_ABORT</code>），CLI 以退出码 <code>3</code>
 中止启动并打印原因。</p>
-<h3 id="_7">资源没有出现在欢迎页</h3>
+<h3 id="_10">资源没有出现在欢迎页</h3>
 <p>确认文件位于 <code>.rpi</code>（或兼容的 <code>.pi</code>）或全局 <code>~/.rpi/agent</code>。使用 <code>rpi --debug-system-prompt</code> 查看最终系统提示词、skills 和资源计数；同名资源优先检查 <code>.rpi</code> 是否覆盖了 <code>.pi</code>。</p>
-<h3 id="_8">远程模式连不上</h3>
+<h3 id="_11">远程模式连不上</h3>
 <p>确认服务端已用 <code>rpi --server --port &lt;port&gt;</code> 启动且 token 正确（或通过
 <code>RPI_SERVER_TOKEN</code> 提供）。客户端是纯显示端，不加载任何本地 provider/工具/扩展；
 会话文件在服务端。</p>
