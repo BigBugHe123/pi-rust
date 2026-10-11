@@ -8,6 +8,54 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 struct Panel(Mutex<ExtensionPanel>);
+/// Generic plugin rows below the built-in usage footer, in both terminal modes.
+pub(super) struct FooterPanels(pub rpi_extensions::ExtensionStatusMailbox);
+impl Component for FooterPanels {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.0
+            .panels()
+            .into_values()
+            .filter(|p| p.layout == PanelLayout::Footer && width >= p.min_screen_width)
+            .flat_map(|spec| Panel(Mutex::new(spec)).render(width))
+            .collect()
+    }
+    fn invalidate(&self) {}
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+/// Native scrollback has no constrained transcript viewport. Keep sidebar
+/// content adjacent to the editor instead of attaching it to historical rows.
+pub(super) struct RegularPanels {
+    pub mailbox: rpi_extensions::ExtensionStatusMailbox,
+    pub enabled: bool,
+}
+impl Component for RegularPanels {
+    fn render(&self, width: usize) -> Vec<String> {
+        if !self.enabled {
+            return vec![];
+        }
+        let mut rows = Vec::new();
+        for spec in self
+            .mailbox
+            .panels()
+            .into_values()
+            .filter(|p| p.layout == PanelLayout::Sidebar && width >= p.min_screen_width)
+        {
+            let left = left_anchor(spec.anchor);
+            let panel = Panel(Mutex::new(spec));
+            for row in panel.render(width) {
+                let padding = " ".repeat(width.saturating_sub(visible_width(&row)));
+                rows.push(if left { row } else { format!("{padding}{row}") });
+            }
+        }
+        rows
+    }
+    fn invalidate(&self) {}
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 fn clean(s: &str) -> String {
     rpi_tui::strip_ansi(s)
         .chars()
@@ -164,6 +212,7 @@ struct Dock {
 }
 #[derive(Default)]
 pub(super) struct Panels {
+    pub regular_mode: bool,
     entries: BTreeMap<String, (Arc<Panel>, Arc<dyn OverlayHandle>)>,
     dock: Option<Dock>,
     revision: Option<u64>,
@@ -236,7 +285,7 @@ impl Panels {
                 }
             }
             // Keep at least 48 columns for chat. Narrow screens use the original full-width layout.
-            if viewport.0.saturating_sub(left + right) < 48 {
+            if self.regular_mode || viewport.0.saturating_sub(left + right) < 48 {
                 left = 0;
                 right = 0;
             }
@@ -324,25 +373,133 @@ impl Drop for Panels {
 
 #[cfg(test)]
 mod tests {
+    fn set_component(
+        m: &rpi_extensions::ExtensionStatusMailbox,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let id = args["key"].as_str().unwrap();
+        let p = &args["panel"];
+        if p.is_null() {
+            return m.component(0, serde_json::json!({"op":"remove","id":id}));
+        }
+        m.component(0, serde_json::json!({"op":"register","id":id}))?;
+        let mut config = p.clone();
+        let obj = config.as_object_mut().unwrap();
+        let layout = obj
+            .remove("layout")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or("overlay".into());
+        obj.remove("version");
+        obj.remove("lines");
+        obj.remove("title");
+        obj.insert(
+            "slot".into(),
+            serde_json::json!(match layout.as_str() {
+                "footer" => "footer.after",
+                "sidebar" => "sidebar.right",
+                _ => "overlay",
+            }),
+        );
+        obj.insert("op".into(), serde_json::json!("configure"));
+        obj.insert("id".into(), serde_json::json!(id));
+        m.component(0, config)?;
+        let text = p["lines"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        m.component(0,serde_json::json!({"op":"update","id":id,"text":text,"title":p["title"].as_str().unwrap_or("")}))
+    }
+
     use super::*;
+    #[test]
+    fn footer_monitor_follows_usage_row_and_hides_without_taking_sidebar_space() {
+        let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
+        let monitor = Arc::new(FooterPanels(mailbox.clone()));
+        assert!(monitor.render(120).is_empty());
+        set_component(&mailbox,serde_json::json!({"key":"monitor","panel":{"version":1,"layout":"footer","width":240,"maxHeight":1,"border":false,"lines":["Turns 1 · Steps 87 · TPS 252 · TTFT 0.42s · Latency 2.1s · TPM 15.1k"]}})).unwrap();
+        let root = VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(Arc::new(Text::new(
+                "↑315k ↓315k R86M CH99.7%",
+                0,
+                0,
+            )))),
+            StackChild::Entry(StackEntry::new(monitor.clone())),
+        ]);
+        let rows = root.render(120);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("↑315k"));
+        assert!(rows[1].contains("TPS 252"));
+        assert_eq!(monitor.render(40).len(), 1);
+        assert!(monitor
+            .render(40)
+            .iter()
+            .all(|row| visible_width(row) <= 40));
+        set_component(&mailbox, serde_json::json!({"key":"monitor","panel":null})).unwrap();
+        assert!(monitor.render(120).is_empty());
+    }
+    #[test]
+    fn regular_mode_keeps_monitor_next_to_editor_without_reserving_chat_columns() {
+        let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
+        set_component(&mailbox,serde_json::json!({"key":"monitor","panel":{"version":1,"layout":"sidebar","width":24,"maxHeight":11,"minScreenWidth":80,"border":false,"title":"RUN STATS","lines":["TTFT 0.42 s","TPS 252 tok/s","Cost USD 0.0123"]}})).unwrap();
+        let fallback = Arc::new(RegularPanels {
+            mailbox: mailbox.clone(),
+            enabled: true,
+        });
+        assert_eq!(fallback.render(120).len(), 4);
+        assert!(fallback.render(120)[1].contains("TTFT"));
+        assert!(fallback.render(79).is_empty());
+        assert!(RegularPanels {
+            mailbox: mailbox.clone(),
+            enabled: false
+        }
+        .render(120)
+        .is_empty());
+        let root = VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(Arc::new(Text::new(
+                "history\n".repeat(100),
+                0,
+                0,
+            )))),
+            StackChild::Entry(StackEntry::new(fallback)),
+            StackChild::Entry(StackEntry::new(Arc::new(Text::new("INPUT", 0, 0)))),
+        ]);
+        let rows = root.render(120);
+        assert!(rows.iter().rev().take(5).any(|row| row.contains("TTFT")));
+        let tui = TuiAltScreen::new(Box::new(ProcessTerminal::new()), false, None);
+        let scroll = Arc::new(ScrollView::new(
+            Arc::new(Text::new("chat", 0, 0)),
+            ScrollViewOptions::default(),
+        ));
+        let stack = Arc::new(rpi_tui::HStack::new());
+        let mut panels = Panels::with_sidebar(stack.clone(), scroll, mailbox.clone());
+        panels.regular_mode = true;
+        panels.sync_viewport(&tui, &mailbox, (120, 0));
+        assert_eq!(stack.get_children().len(), 1);
+    }
     #[test]
     fn overlay_visibility_uses_terminal_width_and_reflows_with_resize() {
         let tui = TuiAltScreen::new(Box::new(ProcessTerminal::new()), false, None);
         let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
         let mut panels = Panels::default();
-        mailbox.handle(serde_json::json!({"key":"monitor","panel":{"version":1,"width":24,"minScreenWidth":80,"lines":["visible"]}})).unwrap();
+        set_component(&mailbox,serde_json::json!({"key":"monitor","panel":{"version":1,"width":24,"minScreenWidth":80,"lines":["visible"]}})).unwrap();
         panels.sync_viewport(&tui, &mailbox, (120, 21));
-        let panel = panels.entries["monitor"].0.clone();
+        let panel = panels.entries["component:2147483648:0:monitor"].0.clone();
         assert!(panel.render(24).join("\n").contains("visible"));
         panels.sync_viewport(&tui, &mailbox, (64, 21));
         assert!(panels.entries.is_empty());
         panels.sync_viewport(&tui, &mailbox, (120, 21));
-        assert!(panels.entries["monitor"]
+        assert!(panels.entries["component:2147483648:0:monitor"]
             .0
             .render(24)
             .join("\n")
             .contains("visible"));
-        assert!(!Arc::ptr_eq(&panel, &panels.entries["monitor"].0));
+        assert!(!Arc::ptr_eq(
+            &panel,
+            &panels.entries["component:2147483648:0:monitor"].0
+        ));
     }
     #[test]
     fn sidebar_reserves_space_preserves_scroll_and_editor_and_restores_layout_when_hidden() {
@@ -374,7 +531,7 @@ mod tests {
         panels.sync_viewport(&tui, &mailbox, (120, 21));
         let frame = rpi_tui::layout::render_layout_frame(root.clone(), 120, 24);
         assert_eq!(frame.root.children[0].children[0].rect.width, 120);
-        mailbox.handle(serde_json::json!({"key":"monitor","panel":{"version":1,"layout":"sidebar","width":24,"minScreenWidth":80,"border":false,"lines":["TTFT 0.42 s","TPS 252 tok/s"]}})).unwrap();
+        set_component(&mailbox,serde_json::json!({"key":"monitor","panel":{"version":1,"layout":"sidebar","width":24,"minScreenWidth":80,"border":false,"lines":["TTFT 0.42 s","TPS 252 tok/s"]}})).unwrap();
         panels.sync_viewport(&tui, &mailbox, (120, 21));
         let frame = rpi_tui::layout::render_layout_frame(root.clone(), 120, 24);
         assert_eq!(frame.primary_scroll_view.unwrap().viewport_height(), 21);
@@ -393,9 +550,7 @@ mod tests {
         let frame = rpi_tui::layout::render_layout_frame(root.clone(), 64, 24);
         assert_eq!(frame.root.children[0].children.len(), 1);
         assert_eq!(frame.root.children[0].children[0].rect.width, 64);
-        mailbox
-            .handle(serde_json::json!({"key":"monitor","panel":null}))
-            .unwrap();
+        set_component(&mailbox, serde_json::json!({"key":"monitor","panel":null})).unwrap();
         panels.sync_viewport(&tui, &mailbox, (120, 21));
         let frame = rpi_tui::layout::render_layout_frame(root, 120, 24);
         assert_eq!(frame.root.children[0].children[0].rect.width, 120);
@@ -408,26 +563,35 @@ mod tests {
         tui.set_focus(Some(editor.clone()));
         let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
         let mut panels = Panels::default();
-        mailbox.handle(serde_json::json!({"key":"a","panel":{"version":1,"anchor":"top-left","lines":["first"]}})).unwrap();
-        mailbox.handle(serde_json::json!({"key":"b","panel":{"version":1,"anchor":"bottom-right","lines":["other"]}})).unwrap();
+        set_component(&mailbox,serde_json::json!({"key":"a","panel":{"version":1,"anchor":"top-left","lines":["first"]}})).unwrap();
+        set_component(&mailbox,serde_json::json!({"key":"b","panel":{"version":1,"anchor":"bottom-right","lines":["other"]}})).unwrap();
         panels.sync(&tui, &mailbox);
         assert_eq!(panels.entries.len(), 2);
         assert!(Arc::ptr_eq(&tui.get_focus().unwrap(), &editor));
-        let original = panels.entries["a"].0.clone();
-        mailbox.handle(serde_json::json!({"key":"a","panel":{"version":1,"anchor":"top-left","lines":["updated"]}})).unwrap();
+        let original = panels.entries["component:2147483648:0:a"].0.clone();
+        set_component(&mailbox,serde_json::json!({"key":"a","panel":{"version":1,"anchor":"top-left","lines":["updated"]}})).unwrap();
         panels.sync(&tui, &mailbox);
-        assert!(Arc::ptr_eq(&original, &panels.entries["a"].0));
+        assert!(Arc::ptr_eq(
+            &original,
+            &panels.entries["component:2147483648:0:a"].0
+        ));
         assert!(original.render(80).join("\n").contains("updated"));
-        mailbox.handle(serde_json::json!({"key":"a","panel":{"version":1,"anchor":"bottom-left","offsetX":2,"lines":["moved"]}})).unwrap();
+        set_component(&mailbox,serde_json::json!({"key":"a","panel":{"version":1,"anchor":"bottom-left","offsetX":2,"lines":["moved"]}})).unwrap();
         panels.sync(&tui, &mailbox);
-        assert!(!Arc::ptr_eq(&original, &panels.entries["a"].0));
+        assert!(!Arc::ptr_eq(
+            &original,
+            &panels.entries["component:2147483648:0:a"].0
+        ));
         assert_eq!(
-            panels.entries["a"].0 .0.lock().unwrap().anchor,
+            panels.entries["component:2147483648:0:a"]
+                .0
+                 .0
+                .lock()
+                .unwrap()
+                .anchor,
             PanelAnchor::BottomLeft
         );
-        mailbox
-            .handle(serde_json::json!({"key":"a","panel":null}))
-            .unwrap();
+        set_component(&mailbox, serde_json::json!({"key":"a","panel":null})).unwrap();
         panels.sync(&tui, &mailbox);
         assert_eq!(panels.entries.len(), 1);
         assert!(tui.has_overlay());

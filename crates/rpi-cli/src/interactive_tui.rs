@@ -54,6 +54,7 @@ mod pet;
 mod tests;
 
 mod state;
+pub(crate) use state::configured_keybindings;
 use state::*;
 
 use std::collections::HashMap;
@@ -1034,6 +1035,7 @@ pub async fn interactive_tui(
     // editor renders full-width `─` top/bottom borders with padding-only lines
     // (see Editor::render). padding_x:1 gives a 1-col inset inside the box.
     let keybindings = configured_keybindings();
+    crate::transcript_navigation::install(&tui, keybindings.clone());
     let editor = Arc::new(Editor::new(
         EditorOptions {
             padding_x: editor_padding_x,
@@ -1251,6 +1253,10 @@ pub async fn interactive_tui(
     editor_container.add_child(editor.clone());
 
     let dock = Arc::new(VStack::from_children(vec![
+        StackChild::Entry(StackEntry::new(Arc::new(panels::RegularPanels {
+            mailbox: reload_context.ext_status.clone(),
+            enabled: matches!(args.tui_mode, crate::args::TuiMode::Regular),
+        }))),
         StackChild::Entry(StackEntry::new(state.pending_container().clone())),
         StackChild::Entry(StackEntry::new(status_container.clone())),
         StackChild::Entry(StackEntry::new(autocomplete_container.clone())),
@@ -1266,6 +1272,9 @@ pub async fn interactive_tui(
         ),
         StackChild::Entry(StackEntry::new(state.search_bar.clone())),
         StackChild::Entry(StackEntry::new(footer.clone())),
+        StackChild::Entry(StackEntry::new(Arc::new(panels::FooterPanels(
+            reload_context.ext_status.clone(),
+        )))),
     ]));
 
     let transcript_stack = Arc::new(rpi_tui::HStack::from_entries(vec![StackEntry::new(
@@ -1509,6 +1518,7 @@ pub async fn interactive_tui(
         scroll_view.clone(),
         reload_context.ext_status.clone(),
     );
+    plugin_panels.regular_mode = matches!(args.tui_mode, crate::args::TuiMode::Regular);
     plugin_panels.sync(tui.as_ref(), &reload_context.ext_status);
     let scroll_tick = scroll_view.clone();
     let tick_handle = tokio::spawn(async move {
@@ -1671,6 +1681,11 @@ pub async fn interactive_tui(
             // scrolling). Previously every non-Key event was dropped, so a
             // wheel had zero effect
             if let Event::Mouse(m) = ev {
+                if tui_for_key.handle_scroll_to_end_indicator_mouse_event(&m) {
+                    *state_for_key.selection_start.lock().unwrap() = None;
+                    *state_for_key.selection_end.lock().unwrap() = None;
+                    continue;
+                }
                 use crossterm::event::MouseEventKind;
                 match m.kind {
                     MouseEventKind::ScrollUp => {
@@ -2403,28 +2418,7 @@ pub async fn interactive_tui(
             // 5. Global transcript scroll. PageUp/PageDown use the actual
             // viewport height with four rows of overlap (upstream behavior),
             // while Home/End jump to the transcript boundaries.
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::PageUp {
-                let delta = -transcript_page_size(scroll_for_key.viewport_height());
-                if scroll_for_key.scroll_by(delta) != delta {
-                    tui_for_key.request_render_reusing_scroll_content();
-                }
-                continue;
-            }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::PageDown {
-                let delta = transcript_page_size(scroll_for_key.viewport_height());
-                if scroll_for_key.scroll_by(delta) != delta {
-                    tui_for_key.request_render_reusing_scroll_content();
-                }
-                continue;
-            }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Home {
-                scroll_for_key.scroll_to_start();
-                tui_for_key.request_render_reusing_scroll_content();
-                continue;
-            }
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::End {
-                scroll_for_key.scroll_to_end();
-                tui_for_key.request_render_reusing_scroll_content();
+            if crate::transcript_navigation::handle_key(&tui_for_key, &keybindings_for_key, &key) {
                 continue;
             }
 

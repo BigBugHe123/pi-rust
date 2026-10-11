@@ -78,6 +78,41 @@ fn context(atoms: &[Atom<'_>]) -> String {
     }
     format!("{sgr}{link}")
 }
+/// Slice terminal columns without losing SGR/OSC8 context or splitting wide graphemes.
+/// Unsupported control protocols retain their existing unsliced fallback path.
+pub(crate) fn slice(line: &str, start: usize, width: usize) -> Option<String> {
+    let atoms = atoms(line)?;
+    let end = start.saturating_add(width);
+    let mut column = 0usize;
+    let mut started = false;
+    let mut output = String::new();
+    for (index, atom) in atoms.iter().enumerate() {
+        if atom.width == 0 {
+            if started {
+                output.push_str(atom.text);
+            }
+            continue;
+        }
+        let next = column + atom.width;
+        if column >= end {
+            break;
+        }
+        if next > start {
+            if !started {
+                output.push_str(&context(&atoms[..index]));
+                started = true;
+            }
+            if column >= start && next <= end {
+                output.push_str(atom.text);
+            } else {
+                output.push_str(&" ".repeat(next.min(end).saturating_sub(column.max(start))));
+            }
+        }
+        column = next;
+    }
+    Some(output)
+}
+
 /// Return the first changed column and its replacement. Unsupported terminal
 /// protocols fall back to the normal row writer rather than slicing controls.
 pub(crate) fn patch(old: &str, new: &str) -> Option<(usize, String)> {

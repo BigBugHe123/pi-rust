@@ -100,6 +100,7 @@ pub use translate::{
     dispatch_lifecycle_event, dispatch_tool_call_event, ExtensionEmitter, TeeEmitter,
 };
 
+pub use stdio::StdioLifecycle;
 mod actions;
 mod editor_text;
 mod event_log;
@@ -111,6 +112,7 @@ mod provider_hooks;
 mod registry;
 mod resources;
 mod status;
+mod stdio;
 mod tool;
 mod translate;
 
@@ -219,18 +221,20 @@ impl HostApi {
     /// via the bridge. The bridge is cloned into every plugin's vtable
     /// `user_data` so post-register `runtime_action` calls recover it on any
     /// thread. `rpi-cli` keeps one master `Arc<ActionBridge>` per session; the
-    /// `HostApi` here holds a clone only for the duration of `load_one` (it is
-    /// dropped after `take_registry`, but the master arc in `rpi-cli` keeps the
-    /// pointer valid). `name` is the registering plugin's display name.
+    /// plugin gets a scoped context sharing the session's facilities. The
+    /// loader retains that context with the library, so its pointer stays valid
+    /// after registration. `name` is the registering plugin's display name.
     pub fn with_action_bridge(
         name: impl Into<String>,
         registry: ExtensionRegistry,
         _diagnostics: Arc<dyn PluginDiagnostics>,
         action_bridge: Arc<ActionBridge>,
     ) -> Arc<Self> {
+        let name = name.into();
+        let action_bridge = action_bridge.for_plugin(&name);
         Arc::new(Self {
             registry: Mutex::new(Some(registry)),
-            name: name.into(),
+            name,
             action_bridge: Some(action_bridge),
         })
     }
@@ -261,8 +265,8 @@ impl HostApi {
     /// cannot use the thread-local (plugin calls from foreign threads), so when
     /// a bridge is present `user_data` is repurposed to point at the
     /// `ActionBridge` (the SDK-designated "host's opaque context"). The bridge's
-    /// master `Arc` is kept by `rpi-cli` for the harness lifetime, so the
-    /// pointer a plugin stores during register stays valid.
+    /// scoped `Arc` is retained by the loaded plugin and session keepalive, so
+    /// the pointer a plugin stores during register stays valid.
     pub fn build_vtable(self: &Arc<Self>) -> rpi_plugin_sdk::PluginApi {
         // When a bridge is present, user_data carries it (post-register action
         // recovery). Otherwise keep the register-path HostApi pointer (harmless
@@ -534,7 +538,24 @@ extern "C" fn trampoline_declare(json: StbStringRef) -> i32 {
     // SAFETY: the plugin guarantees `json` is valid UTF-8 for the call; we read
     // it immediately (copy into the registry) and never retain the borrow.
     let text = unsafe { json.as_str() };
-    match with_current_api(|api| api.with_registry(|reg| reg.apply_declaration_json(text))) {
+    match with_current_api(|api| {
+        api.with_registry(|reg| {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
+                return false;
+            };
+            if value.get("ownsStdio").and_then(serde_json::Value::as_bool) == Some(true) {
+                if let Some(bridge) = &api.action_bridge {
+                    if let Err(error) = bridge.claim_stdio() {
+                        tracing::error!("{error}");
+                        return false;
+                    }
+                } else {
+                    return false; // A stdio owner requires a live lifecycle bridge.
+                }
+            }
+            reg.apply_declaration_json(text)
+        })
+    }) {
         Some(Some(true)) => 0,
         Some(Some(false)) => 1,
         _ => -1,

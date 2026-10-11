@@ -69,6 +69,8 @@ pub struct LoadedPlugin {
     /// The registry snapshot built from this plugin's registrations. The host
     /// merges snapshots from all loaded plugins into one session registry.
     pub registry: ExtensionRegistry,
+    /// Retains the plugin-scoped runtime context used by its FFI callbacks.
+    pub action_bridge: Option<Arc<ActionBridge>>,
 }
 
 fn call_register(register: RpiPluginRegisterUnified, host_api: &Arc<HostApi>) -> i32 {
@@ -114,9 +116,8 @@ fn call_register(register: RpiPluginRegisterUnified, host_api: &Arc<HostApi>) ->
 /// [`trampoline_runtime_action`] and carries the bridge in `user_data`, so the
 /// plugin can invoke host runtime actions post-register from any thread. `None`
 /// keeps the stub (actions return `-1`). `rpi-cli` builds ONE master
-/// `Arc<ActionBridge>` per session and clones it into every `load_one` — every
-/// plugin's `user_data` points at the same bridge (Arc-ptr-stable, kept alive
-/// by `rpi-cli` for the harness lifetime).
+/// `Arc<ActionBridge>` per session. Each plugin gets a scoped bridge sharing
+/// those facilities, retained alongside its library for the session lifetime.
 pub fn load_one(
     path: impl AsRef<Path>,
     diagnostics: Arc<dyn PluginDiagnostics>,
@@ -169,6 +170,9 @@ pub fn load_one(
     clear_current_api();
 
     if rc != 0 {
+        if let Some(bridge) = &host_api.action_bridge {
+            bridge.release_stdio_claim();
+        }
         // The plugin refused (its register returned nonzero — e.g. it saw an
         // ABI version it didn't like), or its body panicked and the SDK
         // converted that into `REGISTER_PANIC_STATUS`. Skip + diag. The
@@ -204,6 +208,7 @@ pub fn load_one(
     tracing::debug!(path = %path.display(), abi_version, "loaded native plugin");
 
     Ok(LoadedPlugin {
+        action_bridge: host_api.action_bridge.clone(),
         library,
         path,
         abi_version,
@@ -229,30 +234,35 @@ pub fn load_dir(
     diagnostics: Arc<dyn PluginDiagnostics>,
     action_bridge: Option<Arc<ActionBridge>>,
 ) -> Vec<LoadedPlugin> {
-    let dir = dir.as_ref();
-    let mut out = Vec::new();
-    let read = match std::fs::read_dir(dir) {
-        Ok(r) => r,
-        Err(e) => {
+    scan_dir(dir.as_ref(), diagnostics.as_ref())
+        .into_iter()
+        .filter_map(
+            |path| match load_one(&path, Arc::clone(&diagnostics), action_bridge.clone()) {
+                Ok(plugin) => Some(plugin),
+                Err(error) => {
+                    diagnostics.warn(&format!("skipped plugin {}: {error}", path.display()));
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
+fn scan_dir(dir: &Path, diagnostics: &dyn PluginDiagnostics) -> Vec<PathBuf> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| is_cdylib(path))
+            .collect(),
+        Err(error) => {
             diagnostics.warn(&format!(
-                "extensions dir {} unreadable: {}",
-                dir.display(),
-                e
+                "extensions dir {} unreadable: {error}",
+                dir.display()
             ));
-            return out;
-        }
-    };
-    for entry in read.flatten() {
-        let path = entry.path();
-        if !is_cdylib(&path) {
-            continue;
-        }
-        match load_one(&path, Arc::clone(&diagnostics), action_bridge.clone()) {
-            Ok(p) => out.push(p),
-            Err(e) => diagnostics.warn(&format!("skipped plugin {}: {e}", path.display())),
+            Vec::new()
         }
     }
-    out
 }
 
 /// Whether `path`'s extension is a known cdylib extension.
@@ -300,6 +310,7 @@ pub struct PluginKeepalive {
     /// loaded, or in tests.
     #[allow(dead_code)]
     action_bridge: Option<Arc<ActionBridge>>,
+    plugin_bridges: Vec<Arc<ActionBridge>>,
 }
 
 impl PluginKeepalive {
@@ -308,6 +319,7 @@ impl PluginKeepalive {
     /// real plugins.
     pub fn new(libraries: Vec<Library>, action_bridge: Option<Arc<ActionBridge>>) -> Self {
         Self {
+            plugin_bridges: Vec::new(),
             libraries,
             action_bridge,
         }
@@ -481,16 +493,20 @@ pub fn load_session_mixed(
     action_bridge: Option<Arc<ActionBridge>>,
 ) -> ExtensionSession {
     let mut loaded: Vec<LoadedPlugin> = Vec::new();
-    for dir in dirs {
-        loaded.extend(load_dir(
-            dir,
-            Arc::clone(&diagnostics),
-            action_bridge.clone(),
-        ));
-    }
-    for f in files {
-        if let Ok(plugin) = load_one(f, Arc::clone(&diagnostics), action_bridge.clone()) {
-            loaded.push(plugin);
+    let mut seen = std::collections::HashSet::new();
+    let paths = dirs
+        .iter()
+        .flat_map(|dir| scan_dir(dir, diagnostics.as_ref()))
+        .chain(files.iter().cloned());
+    for path in paths {
+        // Repeated configured dirs, explicit files and aliases must register once.
+        let identity = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(identity) {
+            continue;
+        }
+        match load_one(&path, Arc::clone(&diagnostics), action_bridge.clone()) {
+            Ok(plugin) => loaded.push(plugin),
+            Err(error) => diagnostics.warn(&format!("skipped plugin {}: {error}", path.display())),
         }
     }
     if loaded.is_empty() {
@@ -499,18 +515,25 @@ pub fn load_session_mixed(
     let loaded_paths: Vec<PathBuf> = loaded.iter().map(|p| p.path.clone()).collect();
     let session_registry = merge_registries(&mut loaded);
     let mut libs: Vec<Library> = Vec::with_capacity(loaded.len());
+    let mut plugin_bridges = Vec::new();
     for p in loaded {
         let LoadedPlugin {
+            action_bridge: plugin_bridge,
             library,
             registry: _,
             path: _,
             abi_version: _,
         } = p;
+        if let Some(bridge) = plugin_bridge {
+            plugin_bridges.push(bridge);
+        }
         libs.push(library);
     }
+    let mut keepalive = PluginKeepalive::new(libs, action_bridge.clone());
+    keepalive.plugin_bridges = plugin_bridges;
     let snapshot = Arc::new(session_registry.snapshot());
     ExtensionSession {
-        keepalive: Arc::new(PluginKeepalive::new(libs, action_bridge.clone())),
+        keepalive: Arc::new(keepalive),
         snapshot: Some(snapshot),
         loaded_paths,
         action_bridge,
@@ -695,6 +718,35 @@ pub extern "C" fn rpi_plugin_register(_: *const c_void) -> i32 {{
             "diagnostic should mention the panic: {warns:?}"
         );
         drop(fixture);
+    }
+
+    #[test]
+    fn repeated_discovery_and_explicit_alias_register_the_library_once() {
+        let fixture = build_cdylib_fixture(
+            "register_once",
+            r#"
+use std::sync::atomic::{AtomicUsize, Ordering};
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(_: *const std::ffi::c_void) -> i32 {
+    if COUNT.fetch_add(1, Ordering::SeqCst) == 0 { 0 } else { 73 }
+}
+"#,
+        );
+        let diag = Arc::new(CapturingDiag::default());
+        let alias = fixture
+            .dir
+            .join(".")
+            .join(fixture.path.file_name().unwrap());
+        let session = load_session_mixed(
+            &[fixture.dir.clone(), fixture.dir.clone()],
+            &[alias],
+            diag.clone(),
+            None,
+        );
+        assert_eq!(session.loaded_paths().len(), 1);
+        assert!(diag.warns.lock().unwrap().is_empty());
+        drop(session);
     }
 
     #[test]

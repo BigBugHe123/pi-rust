@@ -124,6 +124,7 @@ pub struct TuiAltScreen {
     /// they race, an older frame can otherwise overwrite `previous_screen`
     /// after a newer frame has already reached the terminal.
     render_lock: Mutex<()>,
+    jump_to_end: crate::jump_to_end::JumpToEnd,
     terminal: Arc<Mutex<Box<dyn Terminal>>>,
     terminal_proxy: TerminalProxy,
     container: Container,
@@ -179,6 +180,7 @@ impl TuiAltScreen {
         };
         Self {
             render_lock: Mutex::new(()),
+            jump_to_end: crate::jump_to_end::JumpToEnd::default(),
             terminal,
             terminal_proxy,
             container: Container::new(),
@@ -400,8 +402,43 @@ impl TuiAltScreen {
         self.stick_to_bottom.lock().map(|s| *s).unwrap_or(true)
     }
 
+    /// Set a clickable label shown while the follow-end primary view is scrolled up.
+    /// The label is recomputed for each frame, allowing live theme and key hints.
+    pub fn set_scroll_to_end_indicator(
+        &self,
+        label: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    ) {
+        self.jump_to_end.set_label(label);
+        if self.is_running() {
+            self.request_render_reusing_scroll_content();
+        }
+    }
+
+    /// Handle a click before the host starts text selection or other mouse actions.
+    pub fn handle_scroll_to_end_indicator_mouse_event(
+        &self,
+        event: &crossterm::event::MouseEvent,
+    ) -> bool {
+        if self.uses_main_screen() || self.has_overlay() || !self.jump_to_end.hit(event) {
+            return false;
+        }
+        let Some(scroll) = self.get_primary_scroll_view() else {
+            return false;
+        };
+        if scroll.is_following_end() || !scroll.follows_end() {
+            return false;
+        }
+        self.scroll_to_bottom();
+        true
+    }
+
     /// Scroll by the given number of lines.
     pub fn scroll_by(&self, lines: i32) {
+        if let Some(scroll) = self.get_primary_scroll_view() {
+            scroll.scroll_by(lines);
+            self.request_render_reusing_scroll_content();
+            return;
+        }
         if let Ok(mut scroll_top) = self.scroll_top.lock() {
             if lines > 0 {
                 *scroll_top = scroll_top.saturating_add(lines as usize);
@@ -419,6 +456,11 @@ impl TuiAltScreen {
 
     /// Scroll to the top.
     pub fn scroll_to_top(&self) {
+        if let Some(scroll) = self.get_primary_scroll_view() {
+            scroll.scroll_to_start();
+            self.request_render_reusing_scroll_content();
+            return;
+        }
         if let Ok(mut scroll_top) = self.scroll_top.lock() {
             *scroll_top = 0;
         }
@@ -430,6 +472,11 @@ impl TuiAltScreen {
 
     /// Scroll to the bottom.
     pub fn scroll_to_bottom(&self) {
+        if let Some(scroll) = self.get_primary_scroll_view() {
+            scroll.scroll_to_end();
+            self.request_render_reusing_scroll_content();
+            return;
+        }
         if let Ok(mut stick) = self.stick_to_bottom.lock() {
             *stick = true;
         }
@@ -862,7 +909,9 @@ impl TuiAltScreen {
         }
 
         // Get screen lines and composite modal overlays above the layout.
-        let mut visible = frame.lines;
+        let mut visible = frame.lines.clone();
+        self.jump_to_end
+            .paint(&frame, &mut visible, self.has_overlay());
         self.paint_overlays(&mut visible, width, height);
 
         // Cursor markers are an internal layout protocol, not terminal output.
@@ -1397,6 +1446,83 @@ mod tests {
             assert!(frame.contains("short"));
             assert!(!frame.contains("\x1b[2K"));
         }
+    }
+
+    #[test]
+    fn jump_click_resumes_following_and_preserves_the_editor_draft_and_focus() {
+        use crate::{StackChild, StackEntry, VStack};
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let tui = TuiAltScreen::new(
+            Box::new(RecordingTerminal {
+                output: Arc::new(Mutex::new(String::new())),
+            }),
+            false,
+            None,
+        );
+        let text = Arc::new(Text::new(
+            (1..=20)
+                .map(|n| format!("message {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            0,
+            0,
+        ));
+        let scroll = Arc::new(ScrollView::primary(text.clone()));
+        let editor = Arc::new(Editor::simple());
+        editor.set_text("未发送的草稿");
+        let root = Arc::new(VStack::from_children(vec![
+            StackChild::Entry(StackEntry::new(scroll.clone()).basis(0).grow(1).min_size(1)),
+            StackChild::Entry(StackEntry::new(editor.clone())),
+        ]));
+        tui.set_layout_root(Some(root));
+        tui.set_focus(Some(editor.clone()));
+        tui.set_scroll_to_end_indicator(Some(Arc::new(|| {
+            " ↓ Jump to latest message · End ".to_owned()
+        })));
+        tui.start_readerless();
+        tui.scroll_by(-4);
+        assert!(!scroll.is_following_end());
+        assert!(tui
+            .previous_screen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("Jump to latest")));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: (scroll.viewport_height() - 1) as u16,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(tui.handle_scroll_to_end_indicator_mouse_event(&click));
+        assert!(scroll.is_following_end());
+        assert!(!tui
+            .previous_screen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("Jump to latest")));
+        assert_eq!(editor.get_text(), "未发送的草稿");
+        let focused: Arc<dyn Component> = editor.clone();
+        assert!(Arc::ptr_eq(&tui.get_focus().unwrap(), &focused));
+        text.set_text(
+            (1..=24)
+                .map(|n| format!("message {n}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        tui.do_render(false);
+        assert_eq!(
+            scroll.scroll_top(),
+            scroll.content_height() - scroll.viewport_height()
+        );
+        assert!(tui
+            .previous_screen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("message 24")));
+        tui.stop(Default::default());
     }
 
     struct RecordingTerminal {

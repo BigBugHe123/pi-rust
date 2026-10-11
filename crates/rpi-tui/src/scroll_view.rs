@@ -168,6 +168,11 @@ impl ScrollView {
             .unwrap_or(false)
     }
 
+    /// Whether this view can automatically follow newly appended content.
+    pub fn follows_end(&self) -> bool {
+        self.options.follow == FollowMode::End
+    }
+
     /// Get the viewport height.
     pub fn viewport_height(&self) -> usize {
         self.state.lock().map(|s| s.viewport_height).unwrap_or(0)
@@ -434,10 +439,13 @@ impl ScrollView {
             };
             for (i, line) in visible.iter_mut().enumerate() {
                 let on = i >= thumb_top && i < thumb_top + thumb;
-                if on {
-                    line.push_str(&self.scrollbar_style(" "));
-                } else {
-                    line.push(' ');
+                if width > 0 && !line.contains("\x1b_G") && !line.contains("\x1b]1337;File=") {
+                    let cell = if on {
+                        self.scrollbar_style(" ")
+                    } else {
+                        " ".to_owned()
+                    };
+                    *line = crate::layout::composite_tui_line(line, &cell, width - 1, 1, width);
                 }
             }
         }

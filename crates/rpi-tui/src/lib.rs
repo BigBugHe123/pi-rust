@@ -27,6 +27,7 @@ pub mod fuzzy;
 pub mod hstack;
 pub mod image;
 pub mod input;
+mod jump_to_end;
 pub mod keybinding_hints;
 pub mod keybindings;
 pub mod keys;

@@ -21,7 +21,7 @@ categories = ["api-bindings", "development-tools::ffi"]
 serde_json = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", optional = true, features = ["Win32_Foundation", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_Security", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Pipes"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
@@ -34,3 +34,4 @@ rustdoc-args = ["--cfg", "docsrs"]
 default = ["json"]
 json = ["dep:serde_json"]
 process = ["dep:windows-sys", "dep:libc"]
+stdio = ["dep:windows-sys", "dep:libc"]
