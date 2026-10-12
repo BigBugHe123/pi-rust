@@ -377,10 +377,64 @@ pub fn repair_orphaned_tool_calls(
     (repaired, report)
 }
 
-/// The harness converter. It repairs interrupted tool calls, then mirrors
-/// TS `convertToLlm`: renders custom roles as user text and passes through
-/// normal user/assistant/tool-result messages.
+/// Move each assistant message's tool results directly after it, pushing any
+/// message that was interleaved between `tool_calls` and its results to after
+/// the results.
+///
+/// Strict OpenAI-compatible providers require an assistant message carrying
+/// `tool_calls` to be immediately followed by the matching tool messages. A
+/// message appended while a tool batch is still in flight — an extension calling
+/// the `append_entry` runtime action from inside its tool, e.g. `rpi-goal`
+/// injecting the goal state — would otherwise sit between them, and the request
+/// is rejected with HTTP 400 ("An assistant message with 'tool_calls' must be
+/// followed by tool messages…"). This repairs it at the provider boundary, so
+/// no extension has to know about tool-batch timing.
+fn ensure_tool_results_adjacent(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
+    use std::collections::HashMap;
+
+    let mut result_index: HashMap<&str, usize> = HashMap::new();
+    for (index, message) in messages.iter().enumerate() {
+        if let AgentMessage::ToolResult(result) = message {
+            result_index
+                .entry(result.tool_call_id.as_str())
+                .or_insert(index);
+        }
+    }
+
+    // Results already emitted next to their assistant; the main loop skips them
+    // when it reaches their original position.
+    let mut consumed = vec![false; messages.len()];
+    let mut out = Vec::with_capacity(messages.len());
+    for (index, message) in messages.iter().enumerate() {
+        if consumed[index] {
+            continue;
+        }
+        match message {
+            AgentMessage::Assistant(assistant) => {
+                out.push(message.clone());
+                for content in &assistant.content {
+                    if let Content::ToolCall(call) = content {
+                        if let Some(&result_at) = result_index.get(call.id.as_str()) {
+                            if !consumed[result_at] {
+                                consumed[result_at] = true;
+                                out.push(messages[result_at].clone());
+                            }
+                        }
+                    }
+                }
+            }
+            _ => out.push(message.clone()),
+        }
+    }
+    out
+}
+
+/// The harness converter. It moves tool results next to their assistant and
+/// repairs interrupted tool calls, then mirrors TS `convertToLlm`: renders
+/// custom roles as user text and passes through normal user/assistant/tool-result
+/// messages.
 pub fn convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
+    let messages = ensure_tool_results_adjacent(messages);
     let (messages, report) = repair_orphaned_tool_calls(messages);
     if !report.repaired_call_ids.is_empty() {
         tracing::warn!(
@@ -590,5 +644,35 @@ mod tests {
         let c = CustomMessage::new("weird".to_string(), Vec::new(), serde_json::Value::Null, 1);
         let out = convert_to_llm(vec![AgentMessage::Custom(c)]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn convert_to_llm_moves_an_interleaved_message_after_the_tool_results() {
+        // A context injection appended mid tool-batch lands between the
+        // assistant's tool_calls and its result. It must be moved after the
+        // result, or strict providers reject the request with HTTP 400.
+        let custom = CustomMessage::new(
+            CUSTOM_ROLE.to_string(),
+            vec![Content::text("injected")],
+            serde_json::Value::Null,
+            1,
+        );
+        let messages = vec![
+            assistant_with_calls(&[("call_a", "goal")]),
+            AgentMessage::Custom(custom),
+            tool_result("call_a", "goal"),
+        ];
+        let out = convert_to_llm(messages);
+        assert_eq!(out.len(), 3);
+        match (&out[0], &out[1], &out[2]) {
+            (Message::Assistant(a), Message::ToolResult(t), Message::User(_)) => {
+                assert!(a
+                    .content
+                    .iter()
+                    .any(|c| matches!(c, Content::ToolCall(tc) if tc.id == "call_a")));
+                assert_eq!(t.tool_call_id, "call_a");
+            }
+            _ => panic!("assistant tool_calls must be immediately followed by its tool result"),
+        }
     }
 }
