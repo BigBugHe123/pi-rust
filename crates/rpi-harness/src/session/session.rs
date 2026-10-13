@@ -133,14 +133,14 @@ pub fn assert_json_serializable(value: &Value) -> SessionResult<()> {
 /// `Session<TMetadata>`. Holds shared handles (`Arc`) so it is cheaply
 /// [`Clone`] — a `view` of any lane shares the same storage + id generator.
 pub struct Session {
-    storage: RwLock<Arc<dyn SessionStorage>>,
+    storage: Arc<RwLock<Arc<dyn SessionStorage>>>,
     id_generator: Arc<dyn IdGenerator>,
 }
 
 impl Clone for Session {
     fn clone(&self) -> Self {
         Self {
-            storage: RwLock::new(self.storage_arc()),
+            storage: Arc::clone(&self.storage),
             id_generator: Arc::clone(&self.id_generator),
         }
     }
@@ -154,7 +154,7 @@ impl Session {
         id_generator: Option<Arc<dyn IdGenerator>>,
     ) -> Self {
         Self {
-            storage: RwLock::new(storage),
+            storage: Arc::new(RwLock::new(storage)),
             id_generator: id_generator.unwrap_or_else(|| Arc::new(DefaultIdGenerator::new())),
         }
     }

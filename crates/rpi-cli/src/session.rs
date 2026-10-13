@@ -2400,16 +2400,18 @@ pub(crate) async fn set_active_session(
     session: Session,
     tool_context: Option<&rpi_extensions::ToolCallContext>,
 ) -> Result<(), String> {
-    if let Ok(metadata) = session.get_metadata().await {
+    let metadata = session.get_metadata().await.ok();
+    harness
+        .set_session(session)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(metadata) = metadata {
         std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
         if let Some(context) = tool_context {
             context.set_session_id(metadata.id);
         }
     }
-    harness
-        .set_session(session)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// Fork the harness's current session into a new JSONL session (new id, parent

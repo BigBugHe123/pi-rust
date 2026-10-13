@@ -1465,8 +1465,8 @@ pub async fn interactive_tui(
     tui.start_readerless();
 
     // Consume local self-update results even when network checks are disabled.
-    // Keep package discovery separate so package managers and Git remotes
-    // cannot delay an rpi update notice or a prior helper failure.
+    // Check rpi and installed registry packages in the background so startup
+    // remains responsive while their latest versions are fetched.
     let mut update_check_handles = Vec::new();
     let rpi_chat = chat_container.clone();
     let rpi_tui = tui.clone();
@@ -1477,8 +1477,6 @@ pub async fn interactive_tui(
         }
         rpi_tui.request_render(false);
     }));
-
-    // Only the rpi self-update check runs.
 
     // ---- Streaming drain task ----
     let drain_handle = if let Some(rx) = event_rx {

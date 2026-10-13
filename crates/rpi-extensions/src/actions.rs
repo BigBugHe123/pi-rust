@@ -362,12 +362,18 @@ impl UiDialogMailbox {
 /// exhaustive switch that connects the FFI id to the method.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
-    /// `SendMessage` — drive a full agent run from an assistant/user message.
+    /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
+    /// Defaults append while idle and steer while running; explicit `true`
+    /// starts an idle run, `false` only updates context, and `nextTurn` waits
+    /// for a new explicit prompt. Results distinguish appended/queued/run.
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SendUserMessage` — drive a run from a user-text message.
     async fn send_user_message(&self, args: serde_json::Value)
         -> Result<serde_json::Value, String>;
-    /// `AppendEntry` — append a raw entry to the session transcript (no run).
+    /// `AppendEntry` — append without starting a run. `customType`/`data`
+    /// persists extension data only. A `message` is durably queued during an
+    /// operation and committed after its current turn; the returned `entryId`
+    /// is reserved and may not yet resolve to a transcript entry.
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SetSessionName` — set the session's display name.
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;

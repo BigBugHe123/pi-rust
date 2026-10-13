@@ -78,7 +78,8 @@ use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
 use crate::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
-    DrivingMode, HarnessTool, HarnessToolExecution, PromptTemplate, RetryPolicy, Skill,
+    DrivingMode, HarnessTool, HarnessToolExecution, MessageDelivery, PromptTemplate, RetryPolicy,
+    SendMessageOptions, Skill,
 };
 use crate::watcher::{watch_listener, HarnessWatcher};
 
@@ -181,6 +182,15 @@ pub struct NavigationResult {
 #[derive(Debug, Clone)]
 pub struct QueueResult {
     pub entry_id: String,
+}
+
+/// Outcome of sending a message. Queued entry ids are stable reservations;
+/// their transcript entries become readable when the selected queue is drained.
+#[derive(Debug, Clone)]
+pub enum SendMessageResult {
+    Appended { entry_id: String },
+    Queued { entry_id: String, queue: QueueKind },
+    Run(RunResult),
 }
 
 /// Result of `abort`. Mirrors TS `AbortResult`.
@@ -337,6 +347,13 @@ pub trait AgentLane: Send + Sync {
         images: Vec<rpi_ai::types::ImageContent>,
     ) -> HarnessResult<RunResult>;
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult>;
+    /// Send using Pi's `triggerTurn`/`deliverAs` semantics. Active-run deliveries
+    /// enqueue immediately rather than waiting for the executing tool to finish.
+    async fn send_message(
+        &self,
+        message: AgentMessage,
+        options: SendMessageOptions,
+    ) -> HarnessResult<SendMessageResult>;
     async fn prompt_messages(&self, messages: Vec<AgentMessage>) -> HarnessResult<RunResult>;
     async fn skill(
         &self,
@@ -434,6 +451,8 @@ pub trait AgentLane: Send + Sync {
 /// loop on `main`. The `signal` is a child of the harness root token; cancel it
 /// to abort. `idle` fires when the guard is released.
 struct ActiveRun {
+    /// The durable operation ended, but its final callbacks still own admission.
+    finishing: bool,
     run_id: String,
     lane: String,
     signal: CancellationToken,
@@ -535,11 +554,12 @@ impl MessageQueue {
 /// early `?` caused by session I/O or configuration errors.
 struct ActiveRunLease<'a> {
     harness: &'a AgentHarness,
+    run_id: String,
 }
 
 impl Drop for ActiveRunLease<'_> {
     fn drop(&mut self) {
-        self.harness.release_run();
+        self.harness.release_run(&self.run_id);
     }
 }
 
@@ -615,6 +635,8 @@ struct HarnessInner {
     steering_queue: SharedMessageQueue,
     follow_up_queue: SharedMessageQueue,
     next_run_queue: SharedMessageQueue,
+    /// Fast path only; durable context enqueue records remain authoritative.
+    pending_context_lanes: std::collections::HashSet<String>,
 }
 
 // ===========================================================================
@@ -631,6 +653,9 @@ pub struct AgentHarness {
     inner: Arc<Mutex<HarnessInner>>,
     bus: HarnessEventBus,
     lane: String,
+    /// Serializes external appends with operation admission and boundary drains.
+    /// Never held while executing a tool or invoking an external event handler.
+    message_writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl AgentHarness {
@@ -664,7 +689,7 @@ impl AgentHarness {
         // For a fresh session this is empty, and for the non-restore path there is
         // nothing to read.
         let rebuilt_queue = if options.allow_existing_session {
-            Self::rebuild_queues(&options.session, "main").await
+            Self::rebuild_queues(&options.session, "main").await?
         } else {
             Vec::new()
         };
@@ -737,22 +762,31 @@ impl AgentHarness {
             steering_queue: Arc::new(Mutex::new(MessageQueue::new(options.steering_mode))),
             follow_up_queue: Arc::new(Mutex::new(MessageQueue::new(options.follow_up_mode))),
             next_run_queue: Arc::new(Mutex::new(MessageQueue::new(QueueMode::All))),
+            pending_context_lanes: Default::default(),
         };
         for (kind, item) in rebuilt_queue {
             let queue = match kind {
                 QueueKind::Steer => &inner.steering_queue,
                 QueueKind::FollowUp => &inner.follow_up_queue,
                 QueueKind::NextRun => &inner.next_run_queue,
+                // Context writes are drained from durable records at boundaries.
+                QueueKind::Context => continue,
             };
             queue.lock().unwrap().pending.push_back(item);
         }
 
-        Ok(Self {
+        let harness = Self {
             session: options.session,
             inner: Arc::new(Mutex::new(inner)),
             bus: HarnessEventBus::new(),
             lane: "main".to_string(),
-        })
+            message_writes: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        if options.allow_existing_session {
+            let messages = harness.flush_context_messages_locked().await?;
+            harness.emit_appended_messages(messages).await;
+        }
+        Ok(harness)
     }
 
     /// Whether the run died waiting to retry a retryable failure.
@@ -762,8 +796,9 @@ impl AgentHarness {
     /// merely `pending`), and a failed attempt leaves no other trace because a
     /// `step_attempt` is only written when a message commits.
     ///
-    /// "Waiting" means the attempt it scheduled never landed: once that attempt's
-    /// entry exists, the retry succeeded and there is nothing to redo.
+    /// Only the latest retry intent matters. A frame binding naming its reserved
+    /// result means generation has started, so those new frames must be salvaged
+    /// normally rather than discarded as the previous failed attempt.
     async fn died_awaiting_retry(session: &Session, run_id: &str) -> bool {
         let records = match session
             .find_records(&RecordQuery {
@@ -777,22 +812,38 @@ impl AgentHarness {
             Ok(records) => records,
             Err(_) => return false,
         };
-        let entries = match session
-            .find_entries(&EntryQuery {
-                order: Some(EntryOrder::OldestFirst),
+        let Some(pending) = records.into_iter().rev().find_map(|record| match record {
+            LaneRecord::RetryPending(pending) => Some(pending),
+            _ => None,
+        }) else {
+            return false;
+        };
+        if session
+            .get_entry(&pending.result_entry_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return false;
+        }
+        let frames = match session
+            .find_records(&RecordQuery {
+                record_type: Some(crate::frame_progress::ASSISTANT_FRAME_RECORD_TYPE),
+                run_id: Some(run_id.to_string()),
                 ..Default::default()
             })
             .await
         {
-            Ok(entries) => entries,
+            Ok(frames) => frames,
             Err(_) => return false,
         };
-        let landed: std::collections::BTreeSet<&str> =
-            entries.iter().map(|entry| entry.id()).collect();
-        records.into_iter().any(|record| match record {
-            LaneRecord::RetryPending(pending) => !landed.contains(pending.result_entry_id.as_str()),
-            _ => false,
-        })
+        !frames.into_iter().any(|record| matches!(record,
+            LaneRecord::AssistantFrame(frame)
+                if frame.base.seq > pending.base.seq
+                    && frame.op == crate::session::types::AssistantFrameOp::CommitStream
+                    && frame.frame.as_ref().and_then(|value| value.get("entryId")).and_then(|value| value.as_str()) == Some(pending.result_entry_id.as_str())
+        ))
     }
 
     /// Whether the lane's branch ends in a state a run can continue from.
@@ -817,13 +868,49 @@ impl AgentHarness {
             Ok(entries) => entries,
             Err(_) => return false,
         };
-        match entries.last() {
-            Some(Entry::Message(message)) => {
-                matches!(message.message, AgentMessage::ToolResult(_))
-                    && message.terminate != Some(true)
+        let queues = Self::queued_entry_kinds(session, lane).await;
+        for entry in entries.iter().rev() {
+            let message = match entry {
+                Entry::Message(message) => message,
+                Entry::Custom(_) => continue, // extension data is not model input
+                _ => return false,
+            };
+            match queues.get(&message.base.id) {
+                Some(QueueKind::Steer | QueueKind::FollowUp) => return true,
+                // A silent context update doesn't request a reply. Look behind
+                // it to see whether the interrupted tool batch still did.
+                Some(QueueKind::Context) => continue,
+                _ => {
+                    return matches!(message.message, AgentMessage::ToolResult(_))
+                        && message.terminate != Some(true)
+                }
             }
-            _ => false,
         }
+        false
+    }
+
+    /// Recovery uses the accepted delivery mode, not a custom message's role,
+    /// to distinguish queued continuations from context-only updates.
+    async fn queued_entry_kinds(session: &Session, lane: &str) -> BTreeMap<String, QueueKind> {
+        session
+            .find_records(&RecordQuery {
+                lane: Some(lane.to_string()),
+                record_type: Some("queue_enqueued"),
+                ..Default::default()
+            })
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|record| {
+                let LaneRecord::QueueEnqueued(record) = record else {
+                    return None;
+                };
+                Some((
+                    Self::target_entry_id(&record.target)?.to_string(),
+                    record.queue,
+                ))
+            })
+            .collect()
     }
 
     /// The resume chain a run belongs to: `(origin run id, resumes so far)`.
@@ -875,9 +962,27 @@ impl AgentHarness {
     /// the user asking a question, which is why it is bounded and why it announces
     /// itself in the transcript.
     pub async fn resume_pending(&self) -> HarnessResult<Option<RunResult>> {
-        let Some(pending) = self.inner.lock().unwrap().pending_resume.take() else {
-            return Ok(None);
+        // Take admission before any session reads or notices. Clearing the
+        // pending marker on a session swap cannot cancel a resume that already
+        // took it; the operation lease must protect that whole preparation.
+        let gate = self.message_writes.lock().await;
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            if inner.pending_resume.is_none() {
+                return Ok(None);
+            }
+        }
+        let admission = self.acquire_run_locked(OperationKind::Run)?;
+        let _run_lease = ActiveRunLease {
+            harness: self,
+            run_id: admission.0.clone(),
         };
+        // A rejected admission leaves the marker intact for a later attempt.
+        let pending = self.inner.lock().unwrap().pending_resume.take().unwrap();
+        drop(gate);
         if pending.attempt >= MAX_RESUME_ATTEMPTS {
             tracing::warn!(
                 run_id = %pending.interrupted_run_id,
@@ -912,7 +1017,9 @@ impl AgentHarness {
         .await;
         // An empty prompt is exactly a continuation: the loop's next action is the
         // provider call the interrupted run never reached.
-        self.run_core(Vec::new()).await.map(Some)
+        self.run_core_with_admission(Vec::new(), false, admission, Some(pending))
+            .await
+            .map(Some)
     }
 
     /// Record the user-visible "why is a run starting by itself" notice.
@@ -952,6 +1059,7 @@ impl AgentHarness {
             inner: Arc::clone(&self.inner),
             bus: self.bus.clone(),
             lane: name.to_string(),
+            message_writes: Arc::clone(&self.message_writes),
         })
     }
 
@@ -1018,12 +1126,392 @@ impl AgentHarness {
     }
 
     /// `appendMessage(message)` — persist an out-of-band message entry on the
-    /// lane without running the agent. Mirrors TS `AgentHarness.appendMessage`.
+    /// lane without running the agent. During an operation the message is
+    /// durably queued until a turn boundary. The returned id is reserved, so
+    /// `get_entry` may return `None` until the message has been committed.
     pub async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
-        self.view()
-            .append_message(message)
+        let gate = self.message_writes.lock().await;
+        let (id, _, appended) = self.append_message_locked(message).await?;
+        drop(gate);
+        self.emit_appended_messages(appended).await;
+        Ok(id)
+    }
+
+    /// Caller holds the message admission gate.
+    async fn append_message_locked(
+        &self,
+        message: AgentMessage,
+    ) -> HarnessResult<(String, bool, Vec<AgentMessage>)> {
+        let active = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            inner
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.lane == self.lane)
+        };
+        let operation_open = !self
+            .session
+            .find_open_operations(&self.lane, Some(1))
             .await
-            .map_err(session_to_harness_err)
+            .map_err(session_to_harness_err)?
+            .is_empty();
+        if active || operation_open {
+            let entry_id = self.next_entry_id();
+            // Not tied to the operation: accepted context must survive aborts,
+            // retries and the operation finishing before its final drain.
+            self.write_queue_enqueued(QueueKind::Context, &entry_id, &message)
+                .await?;
+            self.inner
+                .lock()
+                .unwrap()
+                .pending_context_lanes
+                .insert(self.lane.clone());
+            return Ok((entry_id, true, Vec::new()));
+        }
+        let mut appended = self.flush_context_messages_locked().await?;
+        let id = self
+            .view()
+            .append_message(message.clone())
+            .await
+            .map_err(session_to_harness_err)?;
+        appended.push(message);
+        Ok((id, false, appended))
+    }
+
+    /// Send a message through the shared lane delivery queues. Like Pi, default
+    /// idle sends are context-only, default active sends steer, and `nextTurn`
+    /// never starts or joins the current run. Admission and delivery selection
+    /// are serialized so a concurrent prompt cannot turn an idle send into a
+    /// reentrant run or insert it inside a tool batch.
+    pub async fn send_message(
+        &self,
+        message: AgentMessage,
+        options: SendMessageOptions,
+    ) -> HarnessResult<SendMessageResult> {
+        let message = normalize_user_images(message).await?;
+        let gate = self.message_writes.lock().await;
+        let active = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            inner
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.lane == self.lane)
+        };
+        let queue = match options.deliver_as {
+            MessageDelivery::NextTurn => Some(QueueKind::NextRun),
+            MessageDelivery::FollowUp if active && options.trigger_turn != Some(false) => {
+                Some(QueueKind::FollowUp)
+            }
+            MessageDelivery::Steer if active && options.trigger_turn != Some(false) => {
+                Some(QueueKind::Steer)
+            }
+            _ => None,
+        };
+        if let Some(queue) = queue {
+            // Sends can arrive before operation_started or after abort/finish.
+            // Their acceptance belongs to the lane, not the current operation.
+            let queued = self.enqueue_message_locked(message, queue).await?;
+            return Ok(SendMessageResult::Queued {
+                entry_id: queued.entry_id,
+                queue,
+            });
+        }
+        if !active && options.trigger_turn == Some(true) {
+            let admission = self.acquire_run_locked(OperationKind::Run)?;
+            drop(gate);
+            return self
+                .run_core_with_admission(vec![message], false, admission, None)
+                .await
+                .map(SendMessageResult::Run);
+        }
+        let (entry_id, queued, messages) = self.append_message_locked(message).await?;
+        drop(gate);
+        self.emit_appended_messages(messages).await;
+        Ok(if queued {
+            SendMessageResult::Queued {
+                entry_id,
+                queue: QueueKind::Context,
+            }
+        } else {
+            SendMessageResult::Appended { entry_id }
+        })
+    }
+
+    /// Pending context targets are consumed by committing their reserved entry,
+    /// not by cancelling the enqueue first. A crash between those two writes
+    /// would otherwise lose an acknowledged message. Entry existence makes
+    /// replay idempotent, including a crash immediately after the commit.
+    async fn pending_context_entries(&self) -> HarnessResult<Vec<ProvisionedEntry>> {
+        let records = self
+            .session
+            .find_records(&RecordQuery {
+                lane: Some(self.lane.clone()),
+                record_type: Some("queue_enqueued"),
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .map_err(session_to_harness_err)?;
+        let mut pending = Vec::new();
+        for record in records {
+            let LaneRecord::QueueEnqueued(record) = record else {
+                continue;
+            };
+            if record.queue != QueueKind::Context {
+                continue;
+            }
+            let id = Self::target_entry_id(&record.target)
+                .ok_or_else(|| HarnessError::io("context enqueue has no entry id"))?;
+            if self
+                .view()
+                .get_entry(id)
+                .await
+                .map_err(session_to_harness_err)?
+                .is_some()
+            {
+                continue;
+            }
+            let message = Self::message_from_target(&record.target)
+                .ok_or_else(|| HarnessError::io("context enqueue has an invalid message"))?;
+            pending.push(ProvisionedEntry {
+                id: id.to_string(),
+                kind: ProvisionedKind::Message {
+                    message,
+                    terminate: None,
+                },
+            });
+        }
+        Ok(pending)
+    }
+
+    /// Caller owns `message_writes`, or is constructing an unshared harness.
+    async fn commit_context_entries(
+        &self,
+        entries: Vec<ProvisionedEntry>,
+    ) -> HarnessResult<Vec<AgentMessage>> {
+        let mut messages = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let ProvisionedKind::Message { message, .. } = &entry.kind else {
+                unreachable!()
+            };
+            let message = message.clone();
+            self.append_provisioned(entry).await?;
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    async fn flush_context_messages_locked(&self) -> HarnessResult<Vec<AgentMessage>> {
+        let messages = self
+            .commit_context_entries(self.pending_context_entries().await?)
+            .await?;
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_context_lanes
+            .remove(&self.lane);
+        Ok(messages)
+    }
+
+    fn has_pending_context(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_context_lanes
+            .contains(&self.lane)
+    }
+
+    /// Context-only messages are already durable. Emit directly to the client
+    /// emitter so they do not increment the loop's persistence indices.
+    async fn emit_appended_messages(&self, messages: Vec<AgentMessage>) {
+        let emitter = self.inner.lock().unwrap().agent_emitter.clone();
+        if let Some(emitter) = emitter {
+            for message in messages {
+                emitter
+                    .emit(AgentEvent::MessageStart {
+                        message: message.clone(),
+                    })
+                    .await;
+                emitter.emit(AgentEvent::MessageEnd { message }).await;
+            }
+        }
+    }
+
+    /// Commit the current turn before appending external context, then return
+    /// that context to the running loop. This also handles a final assistant
+    /// message that normally would only be persisted at run end.
+    async fn append_context_at_boundary(
+        &self,
+        assistant: &AssistantMessage,
+        new_messages: &[AgentMessage],
+        settle: &crate::settle::SettleState,
+    ) -> HarnessResult<Vec<AgentMessage>> {
+        let retry = self.inner.lock().unwrap().retry.clone();
+        if crate::settle::will_retry(
+            assistant,
+            retry.enabled,
+            settle.attempt(),
+            retry.max_retries,
+        ) {
+            return Ok(Vec::new());
+        }
+        let gate = self.message_writes.lock().await;
+        let pending = self.pending_context_entries().await?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let committed = settle.committed_indices();
+        for (index, message) in new_messages.iter().enumerate() {
+            if committed.contains(&index) {
+                continue;
+            }
+            let entry_id = settle.reserve_entry_id(index, self);
+            settle.prepare_commit(index, &entry_id, self).await?;
+            self.append_provisioned(ProvisionedEntry {
+                id: entry_id.clone(),
+                kind: ProvisionedKind::Message {
+                    message: message.clone(),
+                    terminate: None,
+                },
+            })
+            .await?;
+            settle.record_commit(index, &entry_id);
+        }
+        let messages = self.commit_context_entries(pending).await?;
+        self.inner
+            .lock()
+            .unwrap()
+            .pending_context_lanes
+            .remove(&self.lane);
+        drop(gate);
+        self.emit_appended_messages(messages.clone()).await;
+        Ok(messages)
+    }
+
+    /// Finish callbacks before admitting another operation. RunEnd and the
+    /// returned outcome use the same snapshot; writes from RunEnd listeners
+    /// are drained afterward without changing that completed run's leaf.
+    async fn finish_context_writes(
+        &self,
+        run_id: &str,
+        end: Option<RunEndOutcome>,
+    ) -> HarnessResult<Option<String>> {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(active) = inner
+                .active_run
+                .as_mut()
+                .filter(|active| active.run_id == run_id)
+            {
+                active.finishing = true;
+            }
+        }
+        let mut first_drain = true;
+        let mut end_emitted = false;
+        let mut terminal_leaf = None;
+        loop {
+            let gate = self.message_writes.lock().await;
+            let messages = if first_drain || self.has_pending_context() {
+                self.flush_context_messages_locked().await?
+            } else {
+                Vec::new()
+            };
+            first_drain = false;
+            if !messages.is_empty() {
+                drop(gate);
+                self.emit_appended_messages(messages).await;
+                continue;
+            }
+            if !end_emitted {
+                terminal_leaf = self
+                    .view()
+                    .get_leaf_id()
+                    .await
+                    .map_err(session_to_harness_err)?;
+                if let Some(outcome) = end {
+                    drop(gate);
+                    // External listeners run with no locks held, while the
+                    // operation's lease still prevents overlapping admission.
+                    self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
+                        lane: self.lane.clone(),
+                        run_id: run_id.to_string(),
+                        outcome,
+                        leaf_id: terminal_leaf.clone().unwrap_or_default(),
+                    }));
+                    end_emitted = true;
+                    continue;
+                }
+            }
+            self.release_run(run_id);
+            drop(gate);
+            return Ok(terminal_leaf);
+        }
+    }
+
+    /// Compose boundary delivery with compaction. The common path borrows the
+    /// existing context unchanged; only an actual queued append needs a snapshot.
+    fn context_boundary_hook(
+        &self,
+        next: Option<AfterToolResults>,
+        settle: Arc<crate::settle::SettleState>,
+        signal: CancellationToken,
+        error: Arc<Mutex<Option<String>>>,
+    ) -> AfterToolResults {
+        let harness = self.clone();
+        Arc::new(move |ctx: ShouldStopAfterTurnContext<'_>| {
+            if !harness.has_pending_context() {
+                return match &next {
+                    Some(next) => next(ctx),
+                    None => Box::pin(async { None }),
+                };
+            }
+            let harness = harness.clone();
+            let settle = Arc::clone(&settle);
+            let signal = signal.clone();
+            let error = Arc::clone(&error);
+            let next = next.clone();
+            let assistant = ctx.message.clone();
+            let tool_results = ctx.tool_results.to_vec();
+            let new_messages = ctx.new_messages.to_vec();
+            let mut context = ctx.context.clone();
+            Box::pin(async move {
+                let messages = match harness
+                    .append_context_at_boundary(&assistant, &new_messages, &settle)
+                    .await
+                {
+                    Ok(messages) => messages,
+                    Err(failure) => {
+                        *error.lock().unwrap() = Some(failure.to_string());
+                        signal.cancel();
+                        return None;
+                    }
+                };
+                let changed = !messages.is_empty();
+                context.messages.extend(messages);
+                if let Some(next) = next {
+                    if let Some(update) = next(ShouldStopAfterTurnContext {
+                        message: &assistant,
+                        tool_results: &tool_results,
+                        new_messages: &new_messages,
+                        context: &context,
+                    })
+                    .await
+                    {
+                        return Some(update);
+                    }
+                }
+                changed.then_some(rpi_agent::AgentLoopTurnUpdate {
+                    context: Some(context),
+                    ..Default::default()
+                })
+            })
+        })
     }
 
     /// `appendCustomEntry(customType, data?)` — persist a custom entry on the
@@ -1539,17 +2027,63 @@ impl AgentHarness {
     /// `run_core` re-reads the session on every run (branch path, leaf id,
     /// context build), so replacing `inner.session` makes the next run
     /// continue in the new session file — no harness rebuild, no lane/event
-    /// wiring churn. The caller is responsible for aborting any in-flight run
-    /// first.
+    /// wiring churn. Abort and wait for any in-flight operation before switching;
+    /// otherwise this rejects with `LaneBusy` and leaves the old session intact.
     pub async fn set_session(&self, session: Session) -> HarnessResult<()> {
-        let inner = self.inner.lock().unwrap();
+        let _gate = self.message_writes.lock().await;
+        {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            if let Some(active) = &inner.active_run {
+                return Err(HarnessError::lane_busy(
+                    self.lane.clone(),
+                    active.run_id.clone(),
+                    active.kind,
+                    "Wait for the active operation to finish before switching sessions",
+                ));
+            }
+        }
+        // Prepare everything against a pinned target before publishing the swap.
+        // A failed read must leave the old session and its queues untouched.
+        let target = Session::new(
+            session.storage(),
+            Some(Arc::clone(self.session.id_generator())),
+        );
+        let lanes = target.get_lanes().await.map_err(session_to_harness_err)?;
+        if !lanes.iter().any(|lane| lane.lane == self.lane) {
+            return Err(HarnessError::io(
+                "Target session does not contain the bound lane",
+            ));
+        }
+        let mut rebuilt = Vec::new();
+        for lane in lanes {
+            rebuilt.extend(Self::rebuild_queues(&target, &lane.lane).await?);
+        }
+        let mut inner = self.inner.lock().unwrap();
+        // Keep the queue handles: existing lane handles share these Arcs.
         if inner.closed {
             return Err(HarnessError::closed());
         }
-        drop(inner);
-        // Swap the durable backing on the shared facade — every lane handle /
-        // config snapshot observes the new storage immediately.
-        self.session.set_storage(session.storage());
+        inner.steering_queue.lock().unwrap().pending.clear();
+        inner.follow_up_queue.lock().unwrap().pending.clear();
+        inner.next_run_queue.lock().unwrap().pending.clear();
+        inner.pending_context_lanes.clear();
+        inner.pending_resume = None;
+        for (kind, item) in rebuilt {
+            let queue = match kind {
+                QueueKind::Steer => &inner.steering_queue,
+                QueueKind::FollowUp => &inner.follow_up_queue,
+                QueueKind::NextRun => &inner.next_run_queue,
+                QueueKind::Context => {
+                    inner.pending_context_lanes.insert(item.lane);
+                    continue;
+                }
+            };
+            queue.lock().unwrap().pending.push_back(item);
+        }
+        self.session.set_storage(target.storage());
         Ok(())
     }
 
@@ -1672,7 +2206,16 @@ impl AgentHarness {
     /// Reject if closed or if a lane already has an active operation. On
     /// success, installs the `ActiveRun` guard and returns `(run_id, signal,
     /// idle_notify)`.
-    fn acquire_run(
+    async fn acquire_run(
+        &self,
+        kind: OperationKind,
+    ) -> HarnessResult<(String, CancellationToken, Arc<tokio::sync::Notify>)> {
+        let _gate = self.message_writes.lock().await;
+        self.acquire_run_locked(kind)
+    }
+
+    /// Caller holds `message_writes` while deciding whether to start a run.
+    fn acquire_run_locked(
         &self,
         kind: OperationKind,
     ) -> HarnessResult<(String, CancellationToken, Arc<tokio::sync::Notify>)> {
@@ -1696,6 +2239,7 @@ impl AgentHarness {
         let signal = CancellationToken::new();
         let idle = Arc::new(tokio::sync::Notify::new());
         inner.active_run = Some(ActiveRun {
+            finishing: false,
             run_id: run_id.clone(),
             lane: self.lane.clone(),
             signal: signal.clone(),
@@ -1706,10 +2250,18 @@ impl AgentHarness {
     }
 
     /// Release the active-run guard and notify idle waiters.
-    fn release_run(&self) {
+    fn release_run(&self, run_id: &str) {
         let idle = {
             let mut inner = self.inner.lock().unwrap();
-            inner.active_run.take().map(|a| a.idle)
+            if inner
+                .active_run
+                .as_ref()
+                .is_some_and(|run| run.run_id == run_id)
+            {
+                inner.active_run.take().map(|a| a.idle)
+            } else {
+                None
+            }
         };
         if let Some(idle) = idle {
             idle.notify_waiters();
@@ -1764,29 +2316,36 @@ impl AgentHarness {
         message: AgentMessage,
         kind: QueueKind,
     ) -> HarnessResult<QueueResult> {
-        let (entry_id, queue, run_id) = {
+        let _gate = self.message_writes.lock().await;
+        self.enqueue_message_locked(message, kind).await
+    }
+
+    /// Publish to the in-memory queue only after the durable enqueue succeeds.
+    /// Caller holds `message_writes`, shared with queue drains.
+    async fn enqueue_message_locked(
+        &self,
+        message: AgentMessage,
+        kind: QueueKind,
+    ) -> HarnessResult<QueueResult> {
+        let (entry_id, queue) = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
             }
-            let active = inner.active_run.as_ref().filter(|a| a.lane == self.lane);
             let queue = match kind {
                 QueueKind::Steer => Arc::clone(&inner.steering_queue),
                 QueueKind::FollowUp => Arc::clone(&inner.follow_up_queue),
                 QueueKind::NextRun => Arc::clone(&inner.next_run_queue),
+                QueueKind::Context => unreachable!("context appends use the boundary writer"),
             };
-            // The run the item belongs to. A cancellation must carry the same run
-            // id (the reducer matches on it), so it is recorded with the item.
-            let run_id = active.map(|active| active.run_id.clone());
-            (self.session.id_generator().next(), queue, run_id)
+            (self.session.id_generator().next(), queue)
         };
+        self.write_queue_enqueued(kind, &entry_id, &message).await?;
         queue.lock().unwrap().pending.push_back(QueuedMessage {
             entry_id: entry_id.clone(),
             lane: self.lane.clone(),
             message: message.clone(),
         });
-        self.write_queue_enqueued(kind, run_id.as_deref(), &entry_id, &message)
-            .await?;
         Ok(QueueResult { entry_id })
     }
 
@@ -1794,7 +2353,6 @@ impl AgentHarness {
     async fn write_queue_enqueued(
         &self,
         kind: QueueKind,
-        run_id: Option<&str>,
         entry_id: &str,
         message: &AgentMessage,
     ) -> HarnessResult<()> {
@@ -1809,7 +2367,9 @@ impl AgentHarness {
             .append_record(LaneRecord::QueueEnqueued(QueueEnqueuedRecord {
                 base: self.record_base(),
                 queue: kind,
-                run_id: run_id.map(str::to_string),
+                // Queue acceptance belongs to the lane. It can precede the
+                // operation's durable start or survive its completion.
+                run_id: None,
                 target,
             }))
             .await
@@ -1874,61 +2434,25 @@ impl AgentHarness {
         queue: SharedMessageQueue,
         settle: &Arc<crate::settle::SettleState>,
     ) -> Vec<AgentMessage> {
+        let _gate = self.message_writes.lock().await;
         let items = queue.lock().unwrap().drain_for_lane(&self.lane);
         let mut messages = Vec::with_capacity(items.len());
         for item in items {
-            if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
-                if let Err(error) = self
-                    .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
-                    .await
-                {
-                    tracing::warn!(
-                        entry_id = %item.entry_id,
-                        %error,
-                        "could not record a queue consumption"
-                    );
-                }
-            }
+            // Its reserved entry consumes the enqueue when it commits. Keeping
+            // the record pending until then makes a crash before MessageEnd safe.
             settle.push_injected(item.entry_id.clone(), item.message.clone());
             messages.push(item.message);
         }
         messages
     }
 
-    /// Take every queued item for this lane, recording each consumption.
-    async fn drain_queue(&self, kind: QueueKind) -> Vec<AgentMessage> {
-        let queue = {
-            let inner = self.inner.lock().unwrap();
-            match kind {
-                QueueKind::Steer => Arc::clone(&inner.steering_queue),
-                QueueKind::FollowUp => Arc::clone(&inner.follow_up_queue),
-                QueueKind::NextRun => Arc::clone(&inner.next_run_queue),
-            }
-        };
-        self.drain_shared_queue(queue).await
-    }
-
-    /// Consumption is recorded *before* the message can become an entry, because
-    /// the reducer requires the cancelled target to not exist yet.
-    async fn drain_shared_queue(&self, queue: SharedMessageQueue) -> Vec<AgentMessage> {
+    /// Take next-turn messages without cancelling their durable enqueue. Each
+    /// reserved entry consumes its record when prompt persistence commits it.
+    async fn take_next_run_messages(&self) -> Vec<QueuedMessage> {
+        let _gate = self.message_writes.lock().await;
+        let queue = Arc::clone(&self.inner.lock().unwrap().next_run_queue);
         let items = queue.lock().unwrap().drain_for_lane(&self.lane);
-        let mut messages = Vec::with_capacity(items.len());
-        for item in items {
-            if let Some(enqueued) = self.find_enqueue(&item.entry_id).await {
-                if let Err(error) = self
-                    .write_queue_cancelled(&item.entry_id, enqueued.run_id.as_deref())
-                    .await
-                {
-                    tracing::warn!(
-                        entry_id = %item.entry_id,
-                        %error,
-                        "could not record a queue consumption"
-                    );
-                }
-            }
-            messages.push(item.message);
-        }
-        messages
+        items
     }
 
     /// Rebuild the in-memory queues from the durable records.
@@ -1936,21 +2460,18 @@ impl AgentHarness {
     /// An item is still queued when its enqueue has no matching cancellation.
     /// Reconstructed in recorded order, so a restart delivers what was pending in
     /// the order the user wrote it.
-    async fn rebuild_queues(session: &Session, lane: &str) -> Vec<(QueueKind, QueuedMessage)> {
-        let records = match session
+    async fn rebuild_queues(
+        session: &Session,
+        lane: &str,
+    ) -> HarnessResult<Vec<(QueueKind, QueuedMessage)>> {
+        let records = session
             .find_records(&RecordQuery {
                 lane: Some(lane.to_string()),
                 order: Some(EntryOrder::OldestFirst),
                 ..Default::default()
             })
             .await
-        {
-            Ok(records) => records,
-            Err(error) => {
-                tracing::warn!(lane, %error, "could not read the queue records");
-                return Vec::new();
-            }
-        };
+            .map_err(session_to_harness_err)?;
         let mut cancelled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut pending: Vec<QueueEnqueuedRecord> = Vec::new();
         for record in records {
@@ -1962,24 +2483,34 @@ impl AgentHarness {
                 _ => {}
             }
         }
-        pending
-            .into_iter()
-            .filter_map(|enqueued| {
-                let entry_id = Self::target_entry_id(&enqueued.target)?;
-                if cancelled.contains(entry_id) {
-                    return None;
-                }
-                let message = Self::message_from_target(&enqueued.target)?;
-                Some((
-                    enqueued.queue,
-                    QueuedMessage {
-                        entry_id: entry_id.to_string(),
-                        lane: lane.to_string(),
-                        message,
-                    },
-                ))
-            })
-            .collect()
+        let mut rebuilt = Vec::new();
+        for enqueued in pending {
+            let Some(entry_id) = Self::target_entry_id(&enqueued.target) else {
+                continue;
+            };
+            if cancelled.contains(entry_id)
+                || session
+                    .view(lane)
+                    .get_entry(entry_id)
+                    .await
+                    .map_err(session_to_harness_err)?
+                    .is_some()
+            {
+                continue;
+            }
+            let Some(message) = Self::message_from_target(&enqueued.target) else {
+                continue;
+            };
+            rebuilt.push((
+                enqueued.queue,
+                QueuedMessage {
+                    entry_id: entry_id.to_string(),
+                    lane: lane.to_string(),
+                    message,
+                },
+            ));
+        }
+        Ok(rebuilt)
     }
 
     /// A record base for this lane. The store re-stamps `seq`/`lane`/`timestamp`,
@@ -2114,10 +2645,14 @@ impl AgentHarness {
             Ok(entries) => entries,
             Err(_) => return false,
         };
-        matches!(
-            entries.last(),
-            Some(Entry::Message(message)) if matches!(message.message, AgentMessage::User(_))
-        )
+        let Some(Entry::Message(message)) = entries.last() else {
+            return false;
+        };
+        matches!(message.message, AgentMessage::User(_))
+            && Self::queued_entry_kinds(session, lane)
+                .await
+                .get(&message.base.id)
+                != Some(&QueueKind::Context)
     }
 
     /// Whether the branch tip is an assistant message.
@@ -2766,6 +3301,19 @@ impl AgentHarness {
         outcome: OperationOutcome,
         error: Option<OperationError>,
     ) -> HarnessResult<()> {
+        let _gate = self.message_writes.lock().await;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            if let Some(active) = inner
+                .active_run
+                .as_mut()
+                .filter(|active| active.run_id == run_id)
+            {
+                // Serialize this transition with legacy queue enqueues too:
+                // their records must not name an operation that just closed.
+                active.finishing = true;
+            }
+        }
         let record = LaneRecord::OperationFinished(OperationFinishedRecord {
             base: RecordBase {
                 id: self.session.id_generator().next(),
@@ -2793,7 +3341,7 @@ impl AgentHarness {
         &self,
         new_messages: &[AgentMessage],
         start_index: usize,
-        committed: &std::collections::BTreeSet<usize>,
+        settle: &crate::settle::SettleState,
     ) -> HarnessResult<(Option<String>, Option<String>)> {
         // `start_index` is where `new_messages[0]` sits in the loop's full message
         // sequence, so a settle-committed index lines up with slice offsets.
@@ -2804,19 +3352,28 @@ impl AgentHarness {
             .get_leaf_id()
             .await
             .map_err(session_to_harness_err)?;
+        let committed = settle.committed_indices();
         let mut final_entry_id: Option<String> = leaf_id.clone();
         for (offset, msg) in new_messages.iter().enumerate() {
             // A message the settle observer already committed is durable; writing
             // it again would duplicate it in the branch.
             if committed.contains(&(start_index + offset)) {
+                final_entry_id = settle.entry_at(start_index + offset).or(final_entry_id);
                 continue;
             }
-            let id = self
-                .session
-                .view(&self.lane)
-                .append_message(msg.clone())
-                .await
-                .map_err(session_to_harness_err)?;
+            let id = settle.reserve_entry_id(start_index + offset, self);
+            settle
+                .prepare_commit(start_index + offset, &id, self)
+                .await?;
+            self.append_provisioned(ProvisionedEntry {
+                id: id.clone(),
+                kind: ProvisionedKind::Message {
+                    message: msg.clone(),
+                    terminate: None,
+                },
+            })
+            .await?;
+            settle.record_commit(start_index + offset, &id);
             leaf_id = Some(id.clone());
             final_entry_id = Some(id);
         }
@@ -2922,16 +3479,39 @@ impl AgentHarness {
         prompts: Vec<AgentMessage>,
         from_assistant: bool,
     ) -> HarnessResult<RunResult> {
-        let (run_id, signal, _idle) = self.acquire_run(OperationKind::Run)?;
+        let admission = self.acquire_run(OperationKind::Run).await?;
+        self.run_core_with_admission(prompts, from_assistant, admission, None)
+            .await
+    }
+
+    async fn run_core_with_admission(
+        &self,
+        prompts: Vec<AgentMessage>,
+        from_assistant: bool,
+        admission: (String, CancellationToken, Arc<tokio::sync::Notify>),
+        resume: Option<PendingResume>,
+    ) -> HarnessResult<RunResult> {
+        let (run_id, signal, _idle) = admission;
+        let _run_lease = ActiveRunLease {
+            harness: self,
+            run_id: run_id.clone(),
+        };
 
         // `nextRun` messages are consumed when a new run starts, before the
         // caller's prompt. This matches pi's ordering and keeps them durable
         // through the normal prompt persistence path below.
-        // The in-memory queue is drained through the recording path, so the
-        // consumed items are durably un-queued rather than reappearing next start.
-        let queued = self.drain_queue(QueueKind::NextRun).await;
-        let prompts: Vec<AgentMessage> = queued.into_iter().chain(prompts).collect();
-        let _run_lease = ActiveRunLease { harness: self };
+        // Resuming an interrupted/deferred run is not an explicit next turn.
+        let queued = if prompts.is_empty() || from_assistant {
+            Vec::new()
+        } else {
+            self.take_next_run_messages().await
+        };
+        let queued_ids: Vec<String> = queued.iter().map(|item| item.entry_id.clone()).collect();
+        let prompts: Vec<AgentMessage> = queued
+            .into_iter()
+            .map(|item| item.message)
+            .chain(prompts)
+            .collect();
         // Recovery runs before the source leaf is snapshotted, so the salvaged
         // messages are part of the base history this run builds on.
         let recovery_tools = self.get_tools().await?;
@@ -2945,6 +3525,16 @@ impl AgentHarness {
             true,
         )
         .await?;
+
+        // Recovery resolves interrupted calls before accepted context is added.
+        let gate = self.message_writes.lock().await;
+        let restored = if from_assistant {
+            Vec::new()
+        } else {
+            self.flush_context_messages_locked().await?
+        };
+        drop(gate);
+        self.emit_appended_messages(restored).await;
 
         // Snapshot the source leaf (before persisting prompts) for the
         // operation_started record.
@@ -2966,25 +3556,18 @@ impl AgentHarness {
         // unused placeholder until now; the attempt budget has to be durable,
         // because the crash that makes it matter also destroys every in-memory
         // counter that could have held it.
-        let resume_data = self
-            .inner
-            .lock()
-            .unwrap()
-            .pending_resume
-            .clone()
-            .filter(|pending| pending.attempt < MAX_RESUME_ATTEMPTS)
-            .map(|pending| {
-                let mut data = std::collections::BTreeMap::new();
-                data.insert(
-                    "resumedFrom".to_string(),
-                    JsonValue::String(pending.chain_origin_run_id),
-                );
-                data.insert(
-                    "resumeAttempt".to_string(),
-                    JsonValue::from(pending.attempt + 1),
-                );
-                data
-            });
+        let resume_data = resume.map(|pending| {
+            let mut data = std::collections::BTreeMap::new();
+            data.insert(
+                "resumedFrom".to_string(),
+                JsonValue::String(pending.chain_origin_run_id),
+            );
+            data.insert(
+                "resumeAttempt".to_string(),
+                JsonValue::from(pending.attempt + 1),
+            );
+            data
+        });
         let intent = OperationIntent::Run {
             original_prompt: prompts.clone(),
             initial_messages: Vec::new(),
@@ -2995,13 +3578,26 @@ impl AgentHarness {
             .await?;
 
         // Persist prompts (the user's input) BEFORE the run so they're durable.
-        for msg in &prompts {
-            self.session
-                .view(&self.lane)
-                .append_message(msg.clone())
-                .await
-                .map_err(session_to_harness_err)?;
+        for (index, msg) in prompts.iter().enumerate() {
+            if let Some(entry_id) = queued_ids.get(index) {
+                self.append_provisioned(ProvisionedEntry {
+                    id: entry_id.clone(),
+                    kind: ProvisionedKind::Message {
+                        message: msg.clone(),
+                        terminate: None,
+                    },
+                })
+                .await?;
+            } else {
+                self.view()
+                    .append_message(msg.clone())
+                    .await
+                    .map_err(session_to_harness_err)?;
+            }
         }
+
+        self.emit_appended_messages(prompts.iter().take(queued_ids.len()).cloned().collect())
+            .await;
 
         // Snapshot config.
         let snap = self.snapshot_config()?;
@@ -3016,13 +3612,10 @@ impl AgentHarness {
                     }),
                 )
                 .await;
-            let leaf = source_leaf.unwrap_or_default();
-            self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
-                lane: self.lane.clone(),
-                run_id: run_id.clone(),
-                outcome: RunEndOutcome::Failed,
-                leaf_id: leaf.clone(),
-            }));
+            let leaf = self
+                .finish_context_writes(&run_id, Some(RunEndOutcome::Failed))
+                .await?
+                .unwrap_or_default();
             return Ok(RunResult {
                 run_id,
                 outcome: HarnessRunOutcome::Failed {
@@ -3111,12 +3704,10 @@ impl AgentHarness {
                                         Some(err.clone()),
                                     )
                                     .await;
-                                self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
-                                    lane: self.lane.clone(),
-                                    run_id: run_id.clone(),
-                                    outcome: RunEndOutcome::Failed,
-                                    leaf_id: leaf.clone(),
-                                }));
+                                let leaf = self
+                                    .finish_context_writes(&run_id, Some(RunEndOutcome::Failed))
+                                    .await?
+                                    .unwrap_or(leaf);
                                 return Ok(RunResult {
                                     run_id,
                                     outcome: HarnessRunOutcome::Failed {
@@ -3144,7 +3735,7 @@ impl AgentHarness {
         );
         let tools = Self::active_tools(&snap.tools, &snap.active_tool_names);
 
-        let agent_context = AgentContext {
+        let mut agent_context = AgentContext {
             system_prompt,
             messages: ctx.messages,
             tools,
@@ -3202,7 +3793,8 @@ impl AgentHarness {
                 })
                 .collect(),
         ));
-        let config = AgentLoopConfig {
+        let context_write_error = Arc::new(Mutex::new(None));
+        let mut config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
             transform_context: snap.transform_context.clone(),
@@ -3299,6 +3891,21 @@ impl AgentHarness {
             signal: signal.clone(),
         };
 
+        // Deliver accepted context before compaction and again after turn-end
+        // handlers, including turns with no tools. Neither hook drives a turn.
+        config.after_tool_results = Some(self.context_boundary_hook(
+            config.after_tool_results.take(),
+            Arc::clone(&settle_state),
+            signal.clone(),
+            Arc::clone(&context_write_error),
+        ));
+        config.prepare_next_turn = Some(self.context_boundary_hook(
+            None,
+            Arc::clone(&settle_state),
+            signal.clone(),
+            Arc::clone(&context_write_error),
+        ));
+
         // Emitter: use the caller's override if one was supplied (e.g. the TUI
         // installs a BroadcastEmitter so it can render AgentEvents live);
         // otherwise fall back to a collector that discards events (the harness
@@ -3391,7 +3998,6 @@ impl AgentHarness {
             }
 
             retry_attempt += 1;
-            settle_state.set_attempt(retry_attempt);
             // Record the retry before waiting, so a crash during the wait is
             // recognised as "this run was about to retry" rather than looking like
             // an interrupted run. The reserved id is that attempt's assistant
@@ -3402,6 +4008,23 @@ impl AgentHarness {
                 .await
             {
                 tracing::warn!(%error, "could not record a scheduled retry");
+            }
+            // Discard only this failed generation, not every stream in the run.
+            // Once the next generation starts, recovery must retain its progress.
+            if let Some(stream_index) = attempt_result.as_ref().ok().and_then(|messages| {
+                messages
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(index, message)| {
+                        matches!(message, AgentMessage::Assistant(_))
+                            .then(|| settle_state.stream_at(index))
+                            .flatten()
+                    })
+            }) {
+                if let Err(error) = frame_recorder.clear_stream(stream_index).await {
+                    tracing::warn!(%error, "could not retire the failed retry generation");
+                }
             }
             let delay_ms = retry_policy
                 .base_delay_ms
@@ -3419,16 +4042,33 @@ impl AgentHarness {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                 _ = signal.cancelled() => break attempt_result,
             }
+            if signal.is_cancelled() {
+                break attempt_result;
+            }
+            // Only discard the old attempt's indices once another invocation
+            // will actually run. Compaction cuts use the same per-attempt
+            // new_messages indices and must restart with them.
+            settle_state.set_attempt(retry_attempt);
+            settle_state.reserve_retry_result(retry_result_id);
+            post_compaction_cut.store(0, Ordering::Release);
+            // Prior tools and delivered context are durable. Rebuild after the
+            // wait so any writes accepted during it are included as well.
+            let path = self.branch_path_oldest_first().await?;
+            agent_context.messages = build_session_context(&path, &build_opts).messages;
         };
 
+        if let Some(error) = context_write_error.lock().unwrap().take() {
+            // Keep the operation's recovery frames and context enqueue intact.
+            return Err(HarnessError::io(error));
+        }
+
         // Persist new messages + derive outcome.
-        let (leaf_id, _final_entry_id, outcome, op_outcome, op_error) = match result {
+        let (_leaf_id, _final_entry_id, mut outcome, op_outcome, op_error) = match result {
             Ok(new_messages) => {
                 let cut = post_compaction_cut.load(Ordering::Acquire);
                 let start = cut.min(new_messages.len());
-                let committed = settle_state.committed_indices();
                 let (leaf, final_id) = self
-                    .persist_new_messages(&new_messages[start..], start, &committed)
+                    .persist_new_messages(&new_messages[start..], start, &settle_state)
                     .await?;
                 // A budget stop ends the run "Completed" (the loop's normal exit
                 // path), which would otherwise look like a finished task. Record
@@ -3554,21 +4194,22 @@ impl AgentHarness {
             let _ = self
                 .write_operation_finished(&run_id, op_outcome, op_error)
                 .await;
-        }
-
-        // Emit RunEnd (skip for Suspended - a suspended run never emits run_end).
-        if let Some(run_end_outcome) = match &outcome {
-            HarnessRunOutcome::Completed { .. } => Some(RunEndOutcome::Completed),
-            HarnessRunOutcome::Aborted { .. } => Some(RunEndOutcome::Aborted),
-            HarnessRunOutcome::Failed { .. } => Some(RunEndOutcome::Failed),
-            HarnessRunOutcome::Suspended { .. } => None,
-        } {
-            self.bus.emit(&HarnessEvent::RunEnd(RunEndEvent {
-                lane: self.lane.clone(),
-                run_id: run_id.clone(),
-                outcome: run_end_outcome,
-                leaf_id: leaf_id.clone().unwrap_or_default(),
-            }));
+            let end_outcome = match &outcome {
+                HarnessRunOutcome::Completed { .. } => RunEndOutcome::Completed,
+                HarnessRunOutcome::Aborted { .. } => RunEndOutcome::Aborted,
+                HarnessRunOutcome::Failed { .. } => RunEndOutcome::Failed,
+                HarnessRunOutcome::Suspended { .. } => unreachable!("handled above"),
+            };
+            let leaf_id = self
+                .finish_context_writes(&run_id, Some(end_outcome))
+                .await?;
+            let leaf = leaf_id.clone().unwrap_or_default();
+            match &mut outcome {
+                HarnessRunOutcome::Completed { leaf_id, .. }
+                | HarnessRunOutcome::Aborted { leaf_id, .. }
+                | HarnessRunOutcome::Failed { leaf_id, .. } => *leaf_id = leaf,
+                HarnessRunOutcome::Suspended { .. } => {}
+            }
         }
 
         Ok(RunResult { run_id, outcome })
@@ -3580,8 +4221,11 @@ impl AgentHarness {
         &self,
         custom_instructions: Option<String>,
     ) -> HarnessResult<CompactionResult> {
-        let (run_id, signal, _idle) = self.acquire_run(OperationKind::Compaction)?;
-        let _run_lease = ActiveRunLease { harness: self };
+        let (run_id, signal, _idle) = self.acquire_run(OperationKind::Compaction).await?;
+        let _run_lease = ActiveRunLease {
+            harness: self,
+            run_id: run_id.clone(),
+        };
         let recovery_tools = self.get_tools().await?;
         // `true`: a run starting here retries through its own retry loop, so a
         // leftover failed attempt is settled the ordinary way.
@@ -3639,6 +4283,7 @@ impl AgentHarness {
                                         Some(err.clone()),
                                     )
                                     .await;
+                                self.finish_context_writes(&run_id, None).await?;
                                 return Ok(CompactionResult {
                                     run_id,
                                     outcome: CompactionOutcome::Failed {
@@ -3730,6 +4375,7 @@ impl AgentHarness {
             }
         };
 
+        self.finish_context_writes(&run_id, None).await?;
         Ok(CompactionResult { run_id, outcome })
     }
 }
@@ -3784,6 +4430,13 @@ async fn normalize_user_images(mut message: AgentMessage) -> HarnessResult<Agent
 
 #[async_trait::async_trait]
 impl AgentLane for AgentHarness {
+    async fn send_message(
+        &self,
+        message: AgentMessage,
+        options: SendMessageOptions,
+    ) -> HarnessResult<SendMessageResult> {
+        AgentHarness::send_message(self, message, options).await
+    }
     async fn has_pending_resume(&self) -> bool {
         self.pending_resume().is_some()
     }
@@ -3970,6 +4623,7 @@ impl AgentLane for AgentHarness {
     }
 
     async fn cancel_queued(&self, entry_id: &str) -> HarnessResult<CancelQueuedResult> {
+        let _gate = self.message_writes.lock().await;
         // Scoped: the guard must not live into the awaits below (it is not
         // `Send`, and holding it across one makes the whole run future non-Send).
         let removed = {
@@ -4037,6 +4691,7 @@ impl AgentLane for AgentHarness {
     }
 
     async fn clear_queue(&self) -> HarnessResult<QueuedMessages> {
+        let _gate = self.message_writes.lock().await;
         let (steering_items, follow_up_items) = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
@@ -4105,13 +4760,34 @@ impl AgentLane for AgentHarness {
         entry_id: Option<&str>,
         details: Option<JsonValue>,
     ) -> HarnessResult<RecordUsageResult> {
+        // Keep the operation association and write atomic with session swaps
+        // and operation_finished. End callbacks still hold admission, but no
+        // longer own an open durable operation to associate usage with.
+        let _gate = self.message_writes.lock().await;
         // Scope the !Send `std::sync::MutexGuard` before the `.await`.
         let run_id = {
             let inner = self.inner.lock().unwrap();
             if inner.closed {
                 return Err(HarnessError::closed());
             }
-            inner.active_run.as_ref().map(|a| a.run_id.clone())
+            inner
+                .active_run
+                .as_ref()
+                .filter(|active| active.lane == self.lane && !active.finishing)
+                .map(|active| active.run_id.clone())
+        };
+        // Admission also covers preparation before operation_started is
+        // durable. Usage from that phase is a lane fact, not a run record.
+        let run_id = if let Some(run_id) = run_id {
+            self.session
+                .find_open_operations(&self.lane, None)
+                .await
+                .map_err(session_to_harness_err)?
+                .iter()
+                .any(|operation| operation.base.id == run_id)
+                .then_some(run_id)
+        } else {
+            None
         };
 
         let record = LaneRecord::Usage(UsageRecord {
@@ -4138,20 +4814,37 @@ impl AgentLane for AgentHarness {
     }
 
     async fn wait_for_idle(&self) -> HarnessResult<()> {
-        let notify = {
-            let inner = self.inner.lock().unwrap();
-            if inner.closed {
-                return Err(HarnessError::closed());
+        loop {
+            let active = {
+                let inner = self.inner.lock().unwrap();
+                if inner.closed {
+                    return Err(HarnessError::closed());
+                }
+                inner
+                    .active_run
+                    .as_ref()
+                    .map(|active| (active.run_id.clone(), Arc::clone(&active.idle)))
+            };
+            let Some((run_id, notify)) = active else {
+                return Ok(());
+            };
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            // Register before rechecking: notify_waiters does not retain a
+            // permit for a future created after the operation finished.
+            notified.as_mut().enable();
+            if !self
+                .inner
+                .lock()
+                .unwrap()
+                .active_run
+                .as_ref()
+                .is_some_and(|active| active.run_id == run_id)
+            {
+                continue;
             }
-            match &inner.active_run {
-                Some(active) => Some(Arc::clone(&active.idle)),
-                None => None,
-            }
-        };
-        if let Some(notify) = notify {
-            notify.notified().await;
+            notified.await;
         }
-        Ok(())
     }
 
     async fn run_when_idle(
@@ -4325,6 +5018,7 @@ pub struct LaneHandle {
     /// `watch`/`events` are surfaced for non-main lanes; v1 leaves it unused.
     #[allow(dead_code)]
     bus: HarnessEventBus,
+    message_writes: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl LaneHandle {
@@ -4334,12 +5028,20 @@ impl LaneHandle {
             inner: Arc::clone(&self.inner),
             bus: self.bus.clone(),
             lane: self.lane.clone(),
+            message_writes: Arc::clone(&self.message_writes),
         }
     }
 }
 
 #[async_trait::async_trait]
 impl AgentLane for LaneHandle {
+    async fn send_message(
+        &self,
+        message: AgentMessage,
+        options: SendMessageOptions,
+    ) -> HarnessResult<SendMessageResult> {
+        self.runner().send_message(message, options).await
+    }
     async fn has_pending_resume(&self) -> bool {
         self.runner().pending_resume().is_some()
     }
@@ -4470,20 +5172,7 @@ impl AgentLane for LaneHandle {
     }
 
     async fn wait_for_idle(&self) -> HarnessResult<()> {
-        let notify = {
-            let inner = self.inner.lock().unwrap();
-            if inner.closed {
-                return Err(HarnessError::closed());
-            }
-            match &inner.active_run {
-                Some(active) => Some(Arc::clone(&active.idle)),
-                None => None,
-            }
-        };
-        if let Some(notify) = notify {
-            notify.notified().await;
-        }
-        Ok(())
+        self.runner().wait_for_idle().await
     }
 
     async fn run_when_idle(
@@ -4590,10 +5279,7 @@ impl AgentLane for LaneHandle {
     }
 
     async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
-        self.view
-            .append_message(message)
-            .await
-            .map_err(session_to_harness_err)
+        self.runner().append_message(message).await
     }
 
     async fn append_custom_entry(
@@ -4866,6 +5552,38 @@ mod session_switch_tests {
             entry_transforms: Vec::new(),
             provider_hooks: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn context_accepted_at_run_start_is_drained_even_without_a_provider() {
+        let harness = AgentHarness::create(opts()).await.unwrap();
+        let reserved = Arc::new(Mutex::new(None));
+        let writer = harness.clone();
+        let captured = Arc::clone(&reserved);
+        let _subscription = harness.bus.on::<RunStartEvent, _>(move |_| {
+            let id = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(writer.append_message(
+                    crate::messages::create_custom_message(
+                        "goal",
+                        UserContent::Text("accepted context".into()),
+                        true,
+                        None,
+                        0,
+                    ),
+                ))
+            })
+            .unwrap();
+            *captured.lock().unwrap() = Some(id);
+        });
+        let result = harness.prompt_text("answer", Vec::new()).await.unwrap();
+        let HarnessRunOutcome::Failed { leaf_id, error, .. } = result.outcome else {
+            panic!("no provider")
+        };
+        assert_eq!(error.code, "no_provider");
+        let id = reserved.lock().unwrap().clone().unwrap();
+        assert_eq!(leaf_id, id);
+        assert!(harness.get_entry(&id).await.unwrap().is_some());
+        assert!(!harness.has_pending_context());
     }
 
     #[tokio::test]

@@ -22,6 +22,28 @@ use serde::{Deserialize, Serialize};
 use crate::session::context::{ContextEntryTransform, CustomEntryContextMessageProjector};
 use crate::session::Session;
 
+/// When a message sent during a run becomes model input. Matches Pi's
+/// `deliverAs` values; `NextTurn` waits for a new explicit prompt.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MessageDelivery {
+    #[default]
+    Steer,
+    FollowUp,
+    NextTurn,
+}
+
+/// Pi-compatible message delivery options. Omission of `triggerTurn` appends
+/// context while idle and steers while running. Explicit `false` never starts
+/// another model turn. `nextTurn` takes precedence over `triggerTurn`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SendMessageOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_turn: Option<bool>,
+    pub deliver_as: MessageDelivery,
+}
+
 /// A skill loaded from a `SKILL.md` file or provided by an application. Mirrors
 /// TS `Skill`.
 ///

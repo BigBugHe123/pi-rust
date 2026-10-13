@@ -811,7 +811,8 @@ pub struct AssistantFrameRecord {
     pub stream_index: usize,
     pub op: AssistantFrameOp,
     /// Present for [`AssistantFrameOp::Append`]: the encoded frame
-    /// (`rpi_ai::frames::AssistantMessageFrame` as JSON).
+    /// (`rpi_ai::frames::AssistantMessageFrame` as JSON). For `CommitStream`,
+    /// carries `{ "entryId": ... }`, the entry reserved before committing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<serde_json::Value>,
 }
@@ -821,6 +822,10 @@ pub struct AssistantFrameRecord {
 pub enum AssistantFrameOp {
     /// One frame to append to the stream.
     Append,
+    /// Bind a stream to a reserved entry before writing that entry. Recovery
+    /// retires the stream only if the entry exists, covering crashes on either
+    /// side of the commit without discarding uncommitted progress.
+    CommitStream,
     /// Retire one stream: its message has been committed as an entry, so salvage
     /// must not replay it.
     ///
@@ -891,6 +896,9 @@ pub enum QueueKind {
     Steer,
     FollowUp,
     NextRun,
+    /// Context-only messages appended during an operation. They are committed
+    /// at a turn boundary and never start a new model turn by themselves.
+    Context,
 }
 
 impl QueueKind {
@@ -899,6 +907,7 @@ impl QueueKind {
             QueueKind::Steer => "steer",
             QueueKind::FollowUp => "followUp",
             QueueKind::NextRun => "nextRun",
+            QueueKind::Context => "context",
         }
     }
 }
@@ -909,6 +918,8 @@ pub struct QueueEnqueuedRecord {
     #[serde(flatten)]
     pub base: RecordBase,
     pub queue: QueueKind,
+    /// Legacy accepting-operation association. New queues belong to the lane
+    /// and leave this unset, so acceptance can precede or outlive a run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub target: ProvisionedEntryJSON,
@@ -919,6 +930,8 @@ pub struct QueueEnqueuedRecord {
 pub struct QueueCancelledRecord {
     #[serde(flatten)]
     pub base: RecordBase,
+    /// Matches the original enqueue, including legacy operation associations;
+    /// the cancellation may be recorded after that operation has ended.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
     pub entry_id: String,
@@ -1032,8 +1045,9 @@ impl LaneRecord {
             LaneRecord::RetryPending(_) => "retry_pending",
         }
     }
-    /// `runId` property of operation-owned records (mirrors TS `hasRunId`). The
-    /// operation_started record's *identity* is its `id`, handled separately.
+    /// `runId` association (mirrors TS `hasRunId`), including the provenance of
+    /// legacy queues. A queue cancellation can outlive its accepting operation.
+    /// The operation_started record's *identity* is its `id`, handled separately.
     pub fn run_id(&self) -> Option<&str> {
         match self {
             LaneRecord::OperationStarted(_) => None,

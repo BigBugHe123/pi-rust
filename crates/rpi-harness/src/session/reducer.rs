@@ -20,7 +20,7 @@
 //! |---|---|
 //! | `MultipleOpenOperations` | ≥2 unfinished `operation_started` in the slice |
 //! | `UnknownOperation` | a `runId`-bearing record references an unstarted operation |
-//! | `RecordAfterFinish` | a record follows its operation's `operation_finished` |
+//! | `RecordAfterFinish` | an operation-owned record follows `operation_finished` (legacy queue cancellations may follow) |
 //! | `NonConsecutiveAttempt` | a step attempt's number skips within its series |
 //! | `InvalidCompactionReason` | a non-compaction attempt carries a reason, or vice-versa |
 //! | `QueueAfterAbort` | a steer/follow-up enqueue arrives after the op aborted |
@@ -198,7 +198,11 @@ pub fn validate_record_log(input: &RecordLogSlice) -> Result<(), RecordLogCorrup
                 );
             }
             if let Some(finish_seq) = finished_at.get(run_id) {
-                if record.seq() > *finish_seq {
+                // Older queue records carried the accepting run's id. Their
+                // cancellation is a lane action that may happen after that run
+                // ended. Keep its provenance for matching the enqueue below;
+                // every other operation record still obeys the finish barrier.
+                if record.seq() > *finish_seq && !matches!(record, LaneRecord::QueueCancelled(_)) {
                     return corrupt(
                         RecordLogCorruptionReason::RecordAfterFinish,
                         format!(

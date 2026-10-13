@@ -1244,6 +1244,42 @@ fn empty_update_report_does_not_add_transcript_content() {
 }
 
 #[test]
+fn package_updates_render_without_an_rpi_update() {
+    let chat = Arc::new(Container::new());
+    let package_notice = crate::updates::UpdateNotice {
+        name: "rpi-im-message".into(),
+        current: "0.1.9".into(),
+        latest: "0.1.10".into(),
+        command: "rpi install rpi-im-message --force".into(),
+    };
+
+    for include_rpi in [false, true] {
+        chat.clear();
+        let mut report = crate::updates::UpdateReport {
+            notices: vec![package_notice.clone()],
+            warnings: Vec::new(),
+        };
+        if include_rpi {
+            report.notices.push(crate::updates::UpdateNotice {
+                name: "rpi".into(),
+                current: "0.3.20".into(),
+                latest: "0.3.21".into(),
+                command: "rpi update".into(),
+            });
+        }
+
+        add_update_notices(&chat, &report);
+
+        assert_eq!(chat.child_count(), 1);
+        let plain = strip_ansi(&chat.render(80).join("\n"));
+        assert!(plain.contains("Package Update Available"), "{plain}");
+        assert!(plain.contains("rpi-im-message 0.1.9 -> 0.1.10"), "{plain}");
+        assert!(plain.contains(&package_notice.command), "{plain}");
+        assert_eq!(plain.contains("rpi update"), include_rpi, "{plain}");
+    }
+}
+
+#[test]
 fn welcome_capabilities_show_empty_state() {
     let plain = strip_ansi(&welcome_capability_line("Skills", &[]));
     assert_eq!(plain, "Skills (0) none");

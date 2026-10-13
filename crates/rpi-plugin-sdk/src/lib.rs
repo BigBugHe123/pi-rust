@@ -960,8 +960,15 @@ pub type BeforeAgentStartFn =
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeActionId {
+    /// Send `message` (stored AgentMessage or Pi customType/content/display/
+    /// details) or `text`. Options `triggerTurn` and `deliverAs` can be flat or
+    /// nested under `options`. Default: idle append, active steer. Use explicit
+    /// `triggerTurn: true` to start an idle run. `nextTurn` always defers.
     SendMessage = 0,
     SendUserMessage = 1,
+    /// Append without starting a run. `{"customType": ..., "data": ...}` stores
+    /// extension data; `{"message": ...}` queues context until the active turn
+    /// settles. The returned `entryId` can be reserved before its entry exists.
     AppendEntry = 2,
     SetSessionName = 3,
     GetActiveTools = 4,

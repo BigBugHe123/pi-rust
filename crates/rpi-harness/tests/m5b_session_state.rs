@@ -419,6 +419,114 @@ fn reducer_record_after_finish() {
     expect_corruption(&slice, RecordLogCorruptionReason::RecordAfterFinish);
 }
 
+fn legacy_closed_queue_records(kind: QueueKind) -> Vec<LaneRecord> {
+    vec![
+        LaneRecord::OperationStarted(run_started(1, "run-1")),
+        LaneRecord::QueueEnqueued(QueueEnqueuedRecord {
+            base: rec_base("enqueue-1", 2, "main"),
+            queue: kind,
+            run_id: Some("run-1".into()),
+            target: provisioned_json(msg_provisioned("queue-1", user_message("queued"))),
+        }),
+        operation_finished(3, "finish-1", "run-1"),
+    ]
+}
+
+fn legacy_queue_cancel(run_id: Option<&str>, entry_id: &str) -> LaneRecord {
+    LaneRecord::QueueCancelled(QueueCancelledRecord {
+        base: rec_base("cancel-1", 6, "main"),
+        run_id: run_id.map(str::to_string),
+        entry_id: entry_id.into(),
+    })
+}
+
+#[test]
+fn reducer_legacy_queue_cancellation_after_finish_is_valid() {
+    for kind in [QueueKind::Steer, QueueKind::FollowUp, QueueKind::NextRun] {
+        let mut records = legacy_closed_queue_records(kind);
+        records.push(legacy_queue_cancel(Some("run-1"), "queue-1"));
+        validate_record_log(&recovery_slice(records, vec![])).unwrap();
+    }
+}
+
+#[test]
+fn reducer_late_legacy_cancellation_requires_a_matching_unconsumed_enqueue() {
+    for (run_id, entry_id, consumed, reason) in [
+        (
+            None,
+            "queue-1",
+            false,
+            RecordLogCorruptionReason::InvalidQueueCancellation,
+        ),
+        (
+            Some("run-2"),
+            "queue-1",
+            false,
+            RecordLogCorruptionReason::InvalidQueueCancellation,
+        ),
+        (
+            Some("missing-run"),
+            "queue-1",
+            false,
+            RecordLogCorruptionReason::UnknownOperation,
+        ),
+        (
+            Some("run-1"),
+            "missing-entry",
+            false,
+            RecordLogCorruptionReason::InvalidQueueCancellation,
+        ),
+        (
+            Some("run-1"),
+            "queue-1",
+            true,
+            RecordLogCorruptionReason::InvalidQueueCancellation,
+        ),
+    ] {
+        let mut records = legacy_closed_queue_records(QueueKind::FollowUp);
+        records.push(LaneRecord::OperationStarted(run_started(4, "run-2")));
+        records.push(operation_finished(5, "finish-2", "run-2"));
+        records.push(legacy_queue_cancel(run_id, entry_id));
+        let entries = if consumed {
+            vec![msg_entry("queue-1", user_message("queued"), 7, None)]
+        } else {
+            vec![]
+        };
+        expect_corruption(&recovery_slice(records, entries), reason);
+    }
+}
+
+#[test]
+fn reducer_finish_barrier_still_rejects_new_enqueues_and_usage() {
+    let invalid = [
+        LaneRecord::QueueEnqueued(QueueEnqueuedRecord {
+            base: rec_base("late-enqueue", 4, "main"),
+            queue: QueueKind::FollowUp,
+            run_id: Some("run-1".into()),
+            target: provisioned_json(msg_provisioned("queue-2", user_message("late"))),
+        }),
+        LaneRecord::Usage(UsageRecord {
+            base: rec_base("late-usage", 4, "main"),
+            usage: usage_fixture(),
+            cause: UsageCause::Assistant,
+            run_id: Some("run-1".into()),
+            entry_id: None,
+            attempt: None,
+            stop_reason: None,
+            tool_call_id: None,
+            details: None,
+        }),
+    ];
+    for record in invalid {
+        let mut records = legacy_closed_queue_records(QueueKind::Steer);
+        records.push(record);
+        expect_corruption(
+            &recovery_slice(records, vec![]),
+            RecordLogCorruptionReason::RecordAfterFinish,
+        );
+    }
+}
+
 #[test]
 fn reducer_non_consecutive_attempt() {
     let slice = recovery_slice(

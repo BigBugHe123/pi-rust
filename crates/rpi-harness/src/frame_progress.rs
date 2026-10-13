@@ -179,6 +179,7 @@ pub(crate) async fn replay_run_frames(
     // Streams whose message is already an entry (committed mid-run by
     // commit-on-settle). Replaying one would duplicate it in the transcript.
     let mut cleared: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut commits: BTreeMap<usize, Vec<String>> = BTreeMap::new();
     for record in records {
         let LaneRecord::AssistantFrame(frame) = record else {
             continue;
@@ -189,6 +190,19 @@ pub(crate) async fn replay_run_frames(
             AssistantFrameOp::ClearRun => return Ok(Vec::new()),
             AssistantFrameOp::ClearStream => {
                 cleared.insert(frame.stream_index);
+            }
+            AssistantFrameOp::CommitStream => {
+                if let Some(entry_id) = frame
+                    .frame
+                    .as_ref()
+                    .and_then(|value| value.get("entryId"))
+                    .and_then(|value| value.as_str())
+                {
+                    commits
+                        .entry(frame.stream_index)
+                        .or_default()
+                        .push(entry_id.to_string());
+                }
             }
             AssistantFrameOp::Append => {
                 let Some(value) = frame.frame else {
@@ -211,6 +225,23 @@ pub(crate) async fn replay_run_frames(
         if cleared.contains(&index) {
             continue;
         }
+        let mut committed = false;
+        if let Some(entry_ids) = commits.get(&index) {
+            for entry_id in entry_ids {
+                if session
+                    .get_entry(entry_id)
+                    .await
+                    .map_err(|error| HarnessError::io(error.to_string()))?
+                    .is_some()
+                {
+                    committed = true;
+                    break;
+                }
+            }
+        }
+        if committed {
+            continue;
+        }
         match reduce_frames(&frames) {
             Ok(Some(partial)) => replayed.push(partial),
             Ok(None) => {}
@@ -221,6 +252,33 @@ pub(crate) async fn replay_run_frames(
         }
     }
     Ok(replayed)
+}
+
+/// Record the entry a stream will commit under before appending that entry.
+/// Unlike a clear marker, this preserves progress if the commit never lands.
+pub(crate) async fn bind_stream_entry(
+    session: &Session,
+    lane: &str,
+    run_id: &str,
+    stream_index: usize,
+    entry_id: &str,
+) -> HarnessResult<()> {
+    session
+        .append_record(LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: RecordBase {
+                id: session.id_generator().next(),
+                seq: 0,
+                lane: lane.to_string(),
+                timestamp: 0,
+            },
+            run_id: run_id.to_string(),
+            stream_index,
+            op: AssistantFrameOp::CommitStream,
+            frame: Some(serde_json::json!({"entryId": entry_id})),
+        }))
+        .await
+        .map_err(|error| HarnessError::io(error.to_string()))?;
+    Ok(())
 }
 
 /// Replay the committed frames of every stream in `run_id`.
