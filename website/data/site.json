@@ -1,51 +1,51 @@
 {
   "hero": {
-    "eyebrow": "RUST AGENT TOOLKIT",
-    "title": "把 Agent 做成你自己的工具。",
-    "description": "rpi 是一个 library-first 的 Rust SDK。用清晰的分层、可替换的模型 Provider 和真正可测试的工具循环，构建属于你的 coding agent。"
+    "eyebrow": "RUST NATIVE CODING AGENT",
+    "title": "更小，更快，<br /><em>更方便的 Agent。</em>",
+    "description": "一个 Rust 原生编程 Agent，把读写代码、执行命令和会话管理带进你的终端。下载独立二进制，配置模型就能开始；也支持插件扩展与 Rust SDK 嵌入。"
   },
   "stats": [
     {
-      "value": "9",
-      "label": "个核心 crate"
+      "value": "21.8 MiB",
+      "label": "单文件安装体积 · 基准版本"
     },
     {
-      "value": "20",
-      "label": "个可安装扩展"
+      "value": "10.7×",
+      "label": "冷启动更快 · 离线基准 / vs pi"
     },
     {
-      "value": "9.7×",
-      "label": "启动速度（vs pi）"
+      "value": "1/7.6",
+      "label": "启动后内存 · 离线基准 / vs pi"
     },
     {
-      "value": "0",
-      "label": "网络依赖的测试"
+      "value": "1",
+      "label": "独立二进制 · 无需 Node.js 运行时"
     }
   ],
   "features": [
     {
       "number": "01",
-      "title": "Library-first",
-      "description": "核心能力不依赖 CLI。只引入你需要的 crate，从一个 Agent loop 开始。",
-      "tag": "可组合"
+      "title": "更小，一个二进制就够",
+      "description": "原生二进制，无需额外的 Node.js 运行时。把终端编程工具装进一个文件，减少安装体积和环境依赖。",
+      "tag": "轻量安装"
     },
     {
       "number": "02",
-      "title": "Provider agnostic",
-      "description": "Anthropic、OpenAI-compatible 或你自己的服务，都落在同一个 Provider 边界后面。",
-      "tag": "可替换"
+      "title": "更快，少一点启动等待",
+      "description": "Rust 原生启动，降低进程启动与内存开销。冷启动和就绪时内存都有可复现的离线基准，让性能优势有据可查。",
+      "tag": "原生速度"
     },
     {
       "number": "03",
-      "title": "Tool loop ready",
-      "description": "工具参数校验、并行执行、流式事件、取消和 follow-up 都是循环的一部分。",
-      "tag": "可观测"
+      "title": "更方便，打开终端就能做",
+      "description": "预编译版本无需 Rust 工具链。配置模型后即可读写文件、执行命令；会话保存在本地，中断后还能继续。",
+      "tag": "上手省心"
     },
     {
       "number": "04",
-      "title": "Durable by choice",
-      "description": "需要时再接入 Session、JSONL、分支和上下文压缩，不为简单实验提前付复杂度。",
-      "tag": "可持久化"
+      "title": "需要更多？自由扩展",
+      "description": "替换模型 Provider、安装 Rust 插件，或把核心 crate 嵌入你的应用。同一个 Agent，也能成为你的开发基础。",
+      "tag": "SDK 与插件"
     }
   ],
   "architecture": [
@@ -98,16 +98,16 @@
   ],
   "releases": [
     {
-      "version": "0.3.1",
+      "version": "0.3.22",
       "status": "current",
-      "title": "同机实测：启动快 9.7×、内存小 4.9×",
-      "description": "以同一套 JSONL RPC 协议、同一台机器实测：rpi 启动快 9.7×、内存小 4.9×；并让每个 crate 在 crates.io 与 docs.rs 上正确展示。"
+      "title": "崩溃的会话，重新打开",
+      "description": "会话日志支持恢复与自愈，避免多个进程重复写入；插件工具可以获取当前会话信息，让持久化状态与任务关联。"
     },
     {
       "version": "next",
       "status": "building",
-      "title": "更多分发方式",
-      "description": "预编译二进制、更多 Provider 适配器，以及更完整的扩展资源协议。"
+      "title": "更多 Provider 与扩展能力",
+      "description": "继续完善 Provider 适配、扩展资源协议与终端使用体验。"
     },
     {
       "version": "future",

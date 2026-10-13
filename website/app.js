@@ -70,7 +70,7 @@ async function init() {
   $$('[data-content]').forEach((element) => {
     const value = getPath(state.data, element.dataset.content);
     if (!value) return;
-    if (element.dataset.content === 'hero.title') element.innerHTML = value.includes('<') ? value : `<span class="hero-title-line">把 Agent 做成</span><br /><em class="hero-title-line">你自己的工具。</em>`;
+    if (element.dataset.contentHtml === 'true') element.innerHTML = value;
     else element.textContent = value;
   });
   $$('[data-stat]').forEach((element) => { const value = getPath(state.data, element.dataset.stat); if (value) element.textContent = value; });
@@ -84,7 +84,7 @@ async function init() {
     state.data = localizeData(state.rawData, 'site');
     $$('[data-content]').forEach((element) => {
       const value = getPath(state.data, element.dataset.content);
-      if (element.dataset.content === 'hero.title') element.innerHTML = value.includes('<') ? value : `<span class="hero-title-line">把 Agent 做成</span><br /><em class="hero-title-line">你自己的工具。</em>`;
+      if (element.dataset.contentHtml === 'true') element.innerHTML = value;
       else element.textContent = value;
     });
     $$('[data-stat]').forEach((element) => { const value = getPath(state.data, element.dataset.stat); if (value) element.textContent = value; });
