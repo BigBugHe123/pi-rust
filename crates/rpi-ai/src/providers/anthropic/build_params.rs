@@ -612,11 +612,23 @@ fn tool_input_schema(tool: &Tool, strict: Option<bool>) -> Value {
         .get("required")
         .cloned()
         .unwrap_or_else(|| Value::Array(Vec::new()));
-    let legacy = json!({
+    let mut legacy = json!({
         "type": "object",
         "properties": properties,
         "required": required,
     });
+    // `properties` are copied verbatim, so any `$ref` they carry (e.g. the `edit`
+    // tool's `#/definitions/ReplaceEditJson`) must keep its target: carry the
+    // `definitions` / `$defs` sections too, or the schema is not self-contained
+    // and a strict validator rejects it (DeepSeek's Anthropic endpoint returns
+    // `Pointer '/definitions/X' does not exist`).
+    if let Some(object) = legacy.as_object_mut() {
+        for key in ["definitions", "$defs"] {
+            if let Some(section) = params.get(key) {
+                object.insert(key.to_string(), section.clone());
+            }
+        }
+    }
     match strict {
         Some(true) => {
             // Strict: attempt the strict schema; on failure fall back to legacy.
@@ -1501,6 +1513,36 @@ mod tests {
         // Truncation to 64 chars.
         let long: String = "a".repeat(100);
         assert_eq!(normalize_tool_call_id(&long).len(), 64);
+    }
+
+    #[test]
+    fn tool_input_schema_keeps_the_definitions_a_ref_points_at() {
+        // Mirrors the `edit` tool: `properties` carry `$ref`s into `#/definitions`,
+        // so the definitions have to be sent too or the schema is not
+        // self-contained and strict validators reject the request (DeepSeek's
+        // Anthropic endpoint: "Pointer '/definitions/…' does not exist").
+        let tool = Tool {
+            name: "edit".into(),
+            description: String::new(),
+            parameters: Schema::new(json!({
+                "$schema": "http://json-schema.org/draft-07/schema#",
+                "title": "EditInput",
+                "type": "object",
+                "properties": {
+                    "edits": {"type": "array", "items": {"$ref": "#/definitions/ReplaceEditJson"}}
+                },
+                "required": ["edits"],
+                "definitions": {
+                    "ReplaceEditJson": {"type": "object", "properties": {"oldText": {"type": "string"}}}
+                }
+            })),
+            constrained_sampling: None,
+        };
+        let schema = tool_input_schema(&tool, None);
+        assert_eq!(
+            schema["definitions"]["ReplaceEditJson"]["type"], "object",
+            "definitions must accompany the $ref: {schema}"
+        );
     }
 
     #[test]
