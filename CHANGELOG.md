@@ -11,8 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-10-13
+
 ### Changed
 
+- Refresh the homepage, bilingual documentation navigation and extension catalog;
+  show registry-backed release/download metadata and retain SDK access.
 - Forbid unsafe Rust in the AI, agent, harness, tools and telemetry crates.
 - Require explicit unsafe calls to raw SDK string readers and JSON decoding;
   document buffer validity and lifetime requirements without changing the C ABI.
