@@ -22,3 +22,9 @@ task rpi-deploy
 由 Umami 网站设置中的 Replays & Heatmaps 配置控制；添加 recorder 脚本后
 仍须在后台开启 Replays。部署后检查两个脚本、公开 recorder 配置接口，以及
 浏览器中的 `/api/send`（`type: "performance"`）与 `/api/record` 请求。
+
+扩展目录的发布版本和近 90 天下载量来自 crates.io API；功能说明和当前源码
+路径来自 `pi-rust/rpi-package` 的 `main` 分支。`data/packages-meta.json` 记录
+核验时间、源码提交和目录数量。源码仓库中尚未发布到 crates.io 的扩展不提供
+`rpi install <name>` 安装卡片。扩展页默认展示最近发布的扩展，可通过类型筛选
+查看核心 crate。
