@@ -4,7 +4,7 @@ const $ = (sel, scope = document) => scope.querySelector(sel);
 const $$ = (sel, scope = document) => [...scope.querySelectorAll(sel)];
 
 const GUIDES = [
-  { id: 'user-guide', file: './content/user-guide.html', title: { zh: '使用手册', en: 'User Guide' } },
+  { id: 'user-guide', file: { zh: './content/user-guide.html', en: './content/user-guide-en.html' }, title: { zh: '使用手册', en: 'User Guide' } },
   { id: 'extension-authoring', file: './content/extension-authoring.html', title: { zh: '扩展开发', en: 'Extension Authoring' } },
   { id: 'agent-project', file: './content/agent-project.html', title: { zh: 'Agent 项目结构', en: 'Agent Project Structure' } },
 ];
@@ -59,6 +59,7 @@ async function loadGuide(guideId) {
   const guide = GUIDES.find((item) => item.id === guideId) || GUIDES[0];
   currentGuide = guide;
   const locale = getLocale();
+  const file = typeof guide.file === 'string' ? guide.file : (guide.file[locale] || guide.file.zh);
   const title = guide.title[locale] || guide.title.zh;
   $('[data-guide-title]').textContent = title;
   document.title = `${title} · rpi`;
@@ -73,12 +74,12 @@ async function loadGuide(guideId) {
   const body = $('[data-guide-body]');
   body.innerHTML = '<div class="guide-loading">加载中...</div>';
   try {
-    if (!htmlCache[guide.file]) {
-      const response = await fetch(guide.file);
-      if (!response.ok) throw new Error(`Failed to load ${guide.file}: ${response.status}`);
-      htmlCache[guide.file] = await response.text();
+    if (!htmlCache[file]) {
+      const response = await fetch(file);
+      if (!response.ok) throw new Error(`Failed to load ${file}: ${response.status}`);
+      htmlCache[file] = await response.text();
     }
-    body.innerHTML = htmlCache[guide.file];
+    body.innerHTML = htmlCache[file];
     renderToc();
     window.scrollTo({ top: 0, behavior: 'smooth' });
     updateTocHighlight();

@@ -15,3 +15,10 @@ python -m http.server 4173 --directory website
 ```powershell
 task rpi-deploy
 ```
+
+全站六个页面均加载 `https://stat.laofu.online/script.js`，通过
+`data-performance="true"` 开启真实用户性能采集，并在 tracker 之后加载
+同站点 ID 的 `recorder.js`。回放是否启用、采样率、输入遮罩及最长录制时间
+由 Umami 网站设置中的 Replays & Heatmaps 配置控制；添加 recorder 脚本后
+仍须在后台开启 Replays。部署后检查两个脚本、公开 recorder 配置接口，以及
+浏览器中的 `/api/send`（`type: "performance"`）与 `/api/record` 请求。
