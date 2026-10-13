@@ -148,24 +148,9 @@ pub enum PluginToolError {
     NoRuntime(String),
 }
 
-/// The host's `free_string` for [`StbString`]s the host *produces* and hands to
-/// the plugin (event payloads, action outputs, execute params when the host
-/// owns them). The plugin frees what it *receives* via this; the host frees
-/// what it *receives* via the plugin's `free_string` (stored per-tool).
-///
-/// Reconstructs the `Box<[u8]>` from ptr+len and drops it. Idempotent on
-/// empty/null.
-pub extern "C" fn host_free_string(s: StbString) {
-    if s.is_empty() || s.ptr.is_null() {
-        return;
-    }
-    // SAFETY: the host produced this StbString via `StbString::from_owned`/
-    // `from_string` (a `Box<[u8]>`), so ptr+len reconstruct the same allocation.
-    unsafe {
-        let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-        let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-    }
-}
+/// Producer-side deallocator for strings allocated by the host's SDK instance.
+/// Plugin-produced strings must use the plugin's registered deallocator.
+pub use rpi_plugin_sdk::callbacks::free_string as host_free_string;
 
 // ===========================================================================
 // HostApi — the PluginApi the host builds and hands to each plugin's register
@@ -312,43 +297,44 @@ impl HostApi {
 }
 
 // Thread-local "current host api" for the duration of a plugin register call.
-// Set by [`load_one`] before calling register, cleared after. This is the
-// sound way to let `extern "C" fn` trampolines (which cannot capture) reach the
-// host's registry: the register call is synchronous and single-threaded per
-// plugin, so a thread-local is unambiguous.
+// Owned for the duration of registration. Nested registrations restore their
+// caller's context, including when a Rust callback unwinds.
 thread_local! {
-    static CURRENT_HOST_API: std::cell::Cell<*const HostApi> = std::cell::Cell::new(std::ptr::null());
+    static CURRENT_HOST_API: std::cell::RefCell<Option<Arc<HostApi>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// SAFETY: must be called only while the `Arc<HostApi>` pointed to by `api` is
-/// kept alive (i.e. inside `with_current_api`). Sets the thread-local current
-/// api pointer.
-unsafe fn set_current_api(api: &Arc<HostApi>) {
-    CURRENT_HOST_API.with(|c| c.set(Arc::as_ptr(api) as *const HostApi));
+struct CurrentApiGuard {
+    previous: Option<Arc<HostApi>>,
+    // Restoration must run on the same thread that entered registration.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-fn clear_current_api() {
-    CURRENT_HOST_API.with(|c| c.set(std::ptr::null()));
-}
-
-/// Run `f` with the current thread-local host api borrowed. No-op (returns
-/// `false`) if no api is current (e.g. a trampoline called outside register).
-fn with_current_api<R>(f: impl FnOnce(&HostApi) -> R) -> Option<R> {
-    let ptr = CURRENT_HOST_API.with(|c| c.get());
-    if ptr.is_null() {
-        return None;
+impl Drop for CurrentApiGuard {
+    fn drop(&mut self) {
+        let displaced = CURRENT_HOST_API.with(|slot| slot.replace(self.previous.take()));
+        drop(displaced);
     }
-    // SAFETY: the `Arc<HostApi>` is alive for the duration of register (kept by
-    // `load_one`'s stack), and this thread set it; borrowing here is sound.
-    let api = unsafe { &*ptr };
-    Some(f(api))
+}
+
+fn enter_current_api(api: &Arc<HostApi>) -> CurrentApiGuard {
+    let previous = CURRENT_HOST_API.with(|slot| slot.replace(Some(Arc::clone(api))));
+    CurrentApiGuard {
+        previous,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+/// Run `f` with an owned snapshot of the current host api. Release the
+/// RefCell borrow before calling user code so registration can reenter.
+fn with_current_api<R>(f: impl FnOnce(&HostApi) -> R) -> Option<R> {
+    let api = CURRENT_HOST_API.with(|slot| slot.borrow().clone())?;
+    Some(f(&api))
 }
 
 /// True if a current host api is set (cheap check used by trampolines that only
 /// need presence, not the api itself).
 fn current_api_present() -> bool {
-    let ptr = CURRENT_HOST_API.with(|c| c.get());
-    !ptr.is_null()
+    CURRENT_HOST_API.with(|slot| slot.borrow().is_some())
 }
 
 // --- the registrar trampolines (extern "C", forward into the current api) ---
@@ -370,21 +356,24 @@ extern "C" fn trampoline_register_tool(
     // SAFETY: the plugin guarantees `schema` is valid for the call; we copy the
     // strings out immediately (under the borrow) and free them via the plugin's
     // `plugin_free_string` right after, so no retention past the call.
-    let (name, description, parameters_value, schema_owned) = unsafe {
+    let (name, description, parameters_value) = unsafe {
         let s = &*schema;
+        let name =
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(s.name, Some(plugin_free_string));
+        let description = rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+            s.description,
+            Some(plugin_free_string),
+        );
+        let parameters = rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+            s.parameters,
+            Some(plugin_free_string),
+        );
         (
-            s.name.to_string_lossy(),
-            s.description.to_string_lossy(),
-            serde_json::from_str::<serde_json::Value>(&s.parameters.to_string_lossy()).ok(),
-            *s,
+            name.to_string_lossy(),
+            description.to_string_lossy(),
+            serde_json::from_str::<serde_json::Value>(&parameters.to_string_lossy()).ok(),
         )
     };
-    // Free the schema strings via the plugin's free fn (plugin produced them).
-    // `FreeStringFn` is `extern "C" fn(StbString)` — calling a bare fn pointer
-    // is safe (no `unsafe` needed); the idempotent free contract is on the plugin.
-    plugin_free_string(schema_owned.name);
-    plugin_free_string(schema_owned.description);
-    plugin_free_string(schema_owned.parameters);
     let Some(parameters_value) = parameters_value else {
         return 2;
     };
@@ -791,3 +780,91 @@ extern "C" fn stub_runtime_action(
 // Keep the `RuntimeActionFn` type name referenced for doc clarity / future wiring.
 #[allow(dead_code)]
 type _RuntimeActionFnDoc = RuntimeActionFn;
+
+#[cfg(test)]
+mod current_api_tests {
+    use super::*;
+
+    fn api(name: &str) -> Arc<HostApi> {
+        HostApi::new(name, ExtensionRegistry::new(), Arc::new(NullDiagnostics))
+    }
+
+    #[test]
+    fn registration_owns_its_api_and_releases_it_afterward() {
+        let owner = api("owned");
+        let weak = Arc::downgrade(&owner);
+        let registration = enter_current_api(&owner);
+        drop(owner);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            with_current_api(|api| api.name().to_string()).as_deref(),
+            Some("owned")
+        );
+        drop(registration);
+        assert!(!current_api_present());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn nested_registration_can_reenter_and_restores_the_outer_api() {
+        let outer = api("outer");
+        let outer_registration = enter_current_api(&outer);
+        with_current_api(|current| {
+            assert_eq!(current.name(), "outer");
+            let inner = api("inner");
+            let _inner_registration = enter_current_api(&inner);
+            assert_eq!(
+                with_current_api(|api| api.name().to_string()).as_deref(),
+                Some("inner")
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            with_current_api(|api| api.name().to_string()).as_deref(),
+            Some("outer")
+        );
+        drop(outer_registration);
+        assert!(!current_api_present());
+    }
+
+    #[test]
+    fn a_panicking_registration_restores_the_outer_api() {
+        let outer = api("outer");
+        let _outer_registration = enter_current_api(&outer);
+        let inner = api("inner");
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner_registration = enter_current_api(&inner);
+            assert_eq!(
+                with_current_api(|api| api.name().to_string()).as_deref(),
+                Some("inner")
+            );
+            panic!("registration failed");
+        }));
+        assert!(failed.is_err());
+        assert_eq!(
+            with_current_api(|api| api.name().to_string()).as_deref(),
+            Some("outer")
+        );
+    }
+
+    #[test]
+    fn registration_context_is_thread_local() {
+        let parent = api("parent");
+        let _registration = enter_current_api(&parent);
+        std::thread::spawn(|| {
+            assert!(!current_api_present());
+            let child = api("child");
+            let _registration = enter_current_api(&child);
+            assert_eq!(
+                with_current_api(|api| api.name().to_string()).as_deref(),
+                Some("child")
+            );
+        })
+        .join()
+        .unwrap();
+        assert_eq!(
+            with_current_api(|api| api.name().to_string()).as_deref(),
+            Some("parent")
+        );
+    }
+}

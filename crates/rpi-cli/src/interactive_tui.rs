@@ -185,16 +185,21 @@ fn transform_markdown_chain(
                 &mut out as *mut rpi_plugin_sdk::StbString,
                 renderer.user_data,
             );
+            // SAFETY: the callback transfers a live output to its producer.
+            let out = unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(renderer.plugin_free_string),
+                )
+            };
             let text = if rc == 0 {
                 let s = out.to_string_lossy();
                 Some(s)
             } else {
                 None
             };
-            // Reclaim the plugin-owned `out` regardless of rc (rc!=0 may still
-            // have written an error JSON the plugin allocated). `free_with` is
-            // idempotent on an empty `StbString`.
-            out.free_with(Some(renderer.plugin_free_string));
+            // The owner reclaims output regardless of rc, including an error
+            // response a plugin wrote before returning nonzero.
             text
         }));
         let out_text = match outcome {
@@ -1465,8 +1470,8 @@ pub async fn interactive_tui(
     tui.start_readerless();
 
     // Consume local self-update results even when network checks are disabled.
-    // Keep package discovery separate so package managers and Git remotes
-    // cannot delay an rpi update notice or a prior helper failure.
+    // Check rpi and installed registry packages in the background so startup
+    // remains responsive while their latest versions are fetched.
     let mut update_check_handles = Vec::new();
     let rpi_chat = chat_container.clone();
     let rpi_tui = tui.clone();
@@ -1477,8 +1482,6 @@ pub async fn interactive_tui(
         }
         rpi_tui.request_render(false);
     }));
-
-    // Only the rpi self-update check runs.
 
     // ---- Streaming drain task ----
     let drain_handle = if let Some(rx) = event_rx {

@@ -11,6 +11,94 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-10-13
+
+### Changed
+
+- Refresh the homepage, bilingual documentation navigation and extension catalog;
+  show registry-backed release/download metadata and retain SDK access.
+- Forbid unsafe Rust in the AI, agent, harness, tools and telemetry crates.
+- Require explicit unsafe calls to raw SDK string readers and JSON decoding;
+  document buffer validity and lifetime requirements without changing the C ABI.
+- Require explicit unsafe calls to raw string/step deallocators and step-result
+  adoption, including `take_step_result!`. Add a non-copyable `OwnedString` for
+  safe Rust-side reads and automatic producer-side cleanup after ABI adoption.
+
+### Fixed
+
+- Own plugin registration contexts through scoped `Arc` handles instead of
+  thread-local raw pointers, restoring enclosing registrations on nested calls
+  and unwinding. Keep the native plugin ABI unchanged.
+- Use the SDK's safe handle registry and shared string cleanup in `plugin-stub`;
+  invalid, retired and cancelled tool handles no longer dereference raw state.
+- Validate borrowed ABI input strings as UTF-8 before exposing them to callback
+  bodies, replacing unchecked decoding while retaining pointer validity and
+  lifetime requirements at the FFI boundary.
+- Route the stub's discovery, prompt, provider and renderer callbacks through
+  SDK string trampolines that reject missing output slots. Replace raw tool-state
+  pointers in adapter tests with safe handles and reuse SDK string deallocation.
+- Keep standard-library ABI string helpers available with the SDK's default
+  JSON feature disabled, so string callbacks compile in minimal builds.
+- Reclaim tool partial callbacks through the producing plugin's registered
+  deallocator instead of the host allocator, including closed receiver paths.
+  Adopt callback outputs, tool results and schema strings with scoped ownership
+  so early returns and host-side unwinding reclaim each allocation once.
+- Remove duplicate raw string deallocation, leaked prompt-marker contexts and
+  raw callback state in extension/CLI tests, using SDK views and safe handles.
+- Give tool execute callbacks an owned-parameter trampoline that reclaims host
+  inputs on refusal or malformed call IDs. Remove redundant schema `Send`/`Sync`
+  overrides and require explicit unsafe operations inside SDK unsafe functions.
+
+## [0.3.22] - 2026-10-13
+
+### Changed
+
+- Align `send_message` with Pi's `triggerTurn` and `deliverAs` (`steer`,
+  `followUp`, `nextTurn`) semantics. Default idle sends now append context;
+  callers that need an immediate reply must pass `triggerTurn: true`.
+  Running sends enqueue without reentering the agent. Accept Pi custom-message
+  payloads and flat or nested delivery options without changing the plugin ABI.
+
+### Fixed
+
+- Durably queue context messages appended during a run until its tool batch has
+  settled. Preserve accepted messages through cancellation, retries and session
+  recovery without starting extra model turns or splitting tool calls/results.
+- Repair legacy tool-result ordering within each assistant batch, preserving
+  reused call IDs across turns and moving message payloads without deep copies.
+- Preserve reserved entry IDs for steering, follow-up and next-turn messages,
+  commit them before considering their queue items consumed, and keep next-turn
+  messages pending across automatic run recovery.
+- Reset retry message indices and compaction cuts only when the next attempt
+  starts, preserving successful replies after compaction and avoiding duplicate
+  tool results when retry waits are cancelled. Bind assistant frame streams to
+  their reserved entry IDs before committing, so recovery does not replay
+  replies already written at a context boundary or discard uncommitted progress.
+- Link retry intents to their actual assistant entry reservations and inspect
+  only the latest intent during recovery. Successful retries no longer start an
+  extra turn after a crash, and a begun retry retains its own streamed progress.
+- Settle queued messages of every accepted role under their reserved entry IDs,
+  including stored assistant and tool-result messages, so delivered messages do
+  not return to the queue after restarting.
+- Rebuild all lane delivery queues from the target session on a session switch,
+  keeping pending messages in their original session and clearing stale resume
+  state. Existing lane handles and session clones now follow the shared backing
+  when it changes. Wait for an active operation to finish before the TUI swaps
+  sessions, and update plugin session identity only after a successful swap.
+- Finish context callbacks before admitting a new operation and capture run
+  outcomes and `RunEnd` from the same leaf snapshot. Listener writes remain
+  durable without changing the completed run's result.
+- Reserve run admission before automatic resume preparation, so a concurrent
+  session switch cannot redirect the resumed run. Preserve pending resumes on
+  rejected admission and persist their chain and attempt count explicitly.
+- Serialize external usage writes with operation completion and session swaps;
+  associate them only with an open operation on the same lane, keeping start
+  and end callback records valid.
+- Keep all delivery queue records independent of run admission and completion,
+  including `steer`, `follow_up` and `next_run`. Allow cancellation of pending
+  queues from older sessions after their accepting run ends, while preserving
+  enqueue matching and validation of other operation records.
+
 ## [0.3.21] - 2026-10-11
 
 ### Added

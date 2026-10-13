@@ -76,13 +76,40 @@ helpers; packages using a local path dependency must publish that SDK before
 publishing dependent packages.
 
 `string_handler!` adapts command, prompt and runtime-action callbacks to `&str`
-inputs and a lifetime-bound `callbacks::Output`. `Output::write` handles null
-slots and reclaims earlier writes without freeing host-owned input. The SDK's
+inputs and a lifetime-bound `callbacks::Output`. The tuple-input form
+`fn discover((cwd, reason), output, user_data)` supports resource discovery.
+`Output::write` handles null slots and reclaims earlier writes without freeing
+host-owned input. The SDK's
 `callbacks::free_string` is the producer-side ABI deallocator to register for
-SDK-allocated outputs. `execute_handler!` adapts borrowed tool call IDs, and
+SDK-allocated outputs. The two-argument `execute_handler!` form adapts borrowed
+tool call IDs and gives the body an `OwnedString` parameter, reclaiming it even
+on refusal or invalid UTF-8 in the call ID. Its three-argument form preserves
+raw parameters and their deallocator for custom ABI handling.
 `take_step_result!` copies and reclaims a plugin-owned result into the pointer-free
-`callbacks::Step` enum. These are ABI boundaries: the host must still honor
+`callbacks::Step` enum. It requires an explicit unsafe call site, just like the
+underlying function; the macro cannot prove an arbitrary result's ownership.
+`callbacks::take_step_result_with` uses a specified producer's deallocator when
+receiving a result from another plugin. These are ABI boundaries: the host must still honor
 buffer validity and producer allocation ownership.
+
+Raw string readers `StbString::to_string_lossy` and `json::from_stable` require
+an explicit `unsafe` call: their public ABI pointer/length fields cannot prove
+that a buffer is still valid. Keep the allocation live and unchanged during
+the copy, and free owned strings exactly once through their producer afterward.
+This tightens the Rust source API without changing the C ABI. Code using
+`EventView` or the callback trampolines continues to use owned Rust strings in
+its handler body.
+
+`callbacks::OwnedString` owns a string together with its producer's deallocator.
+It cannot be copied or cloned; moving it transfers ownership, and dropping it
+reclaims the allocation even on early returns or unwinding. `from_string` safely
+creates an SDK-owned string. Adopting raw ABI output through `from_raw` requires
+one explicit unsafe ownership contract, after which reading and cleanup are safe.
+`into_raw` transfers ownership back to an ABI receiver without deallocating it.
+Raw `StbString::free_with`, `FreeStringFn`, and SDK deallocation callbacks now
+require unsafe calls because their public pointer inputs cannot prove unique
+ownership or allocator identity. Tool partial callbacks reclaim plugin-produced
+buffers through the tool's registered plugin deallocator, never the host allocator.
 
 The optional `process` feature provides `process::ProcessTree` for terminating
 descendants and closing inherited pipes. Its Win32/libc calls and owned handles

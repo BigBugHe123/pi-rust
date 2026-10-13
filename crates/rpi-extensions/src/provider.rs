@@ -275,10 +275,13 @@ fn run_provider_request_inner(record: &RegisteredProvider, request_json: &str) -
     // allocation, reclaimed via `plugin_free_string`). Start empty.
     let mut out = StbString::empty();
     let rc = (record.request_fn)(req_ref, &mut out as *mut StbString, record.user_data);
+    // SAFETY: the callback transfers its live output to its registered producer.
+    let out = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(record.plugin_free_string))
+    };
     if rc != 0 {
         // Nonzero rc: the plugin signaled failure. Reclaim whatever it wrote
         // (may be empty) before returning.
-        out.free_with(Some(record.plugin_free_string));
         return ProviderOutcome::Err(format!(
             "plugin provider {} returned error code {rc}",
             record.provider_id
@@ -287,7 +290,6 @@ fn run_provider_request_inner(record: &RegisteredProvider, request_json: &str) -
 
     // Read the plugin-owned JSON (borrow `out` for the parse) then reclaim it.
     let response_text = out.to_string_lossy();
-    out.free_with(Some(record.plugin_free_string));
 
     // Parse the response as an AssistantMessage. A plugin that returns a partial
     // or malformed message surfaces a parse error (not a crash) — the host
@@ -370,31 +372,17 @@ mod tests {
     use super::*;
     use crate::registry::ExtensionRegistry;
 
-    /// A stub `ProviderRequestFn` that writes a minimal assistant-message JSON
-    /// into `out`. Mirrors the shape a real plugin's request fn returns.
-    extern "C" fn ok_request_fn(
-        _req: StbStringRef,
-        out: *mut StbString,
-        _ud: *mut std::ffi::c_void,
-    ) -> i32 {
+    rpi_plugin_sdk::string_handler! {
+        /// A stub `ProviderRequestFn` that writes a minimal assistant-message JSON
+        /// into `out`. Mirrors the shape a real plugin's request fn returns.
+        fn ok_request_fn(_req, out, _ud) {
         let json = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"api":"faux","provider":"pluggy","model":"m","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
-        unsafe {
-            *out = StbString::from_string(json.to_string());
-        }
-        0
-    }
+        i32::from(!out.write(json.to_string()))
+    } }
 
     /// A free fn matching the stub's allocation (`StbString::from_string` ⇒ a
     /// `Box<[u8]>` reclaimed by reconstructing the slice).
-    extern "C" fn stub_free(s: StbString) {
-        if s.is_empty() || s.ptr.is_null() {
-            return;
-        }
-        unsafe {
-            let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
+    use rpi_plugin_sdk::callbacks::free_string as stub_free;
 
     /// `run_provider_request_inner` round-trips a nonzero-rc plugin response to
     /// `Err`, and a valid-message response to `Ok` (with provider stamped from

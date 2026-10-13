@@ -112,14 +112,23 @@ pub(super) async fn switch_to_session(
         state.set_status(RunStatus::Aborting);
         let _ = lane.abort().await;
     }
+    if let Err(error) = lane.wait_for_idle().await {
+        add_error_message(chat, &format!("Could not switch session: {error}"));
+        return false;
+    }
     let cwd_str = cwd.to_string_lossy().to_string();
     match crate::session::open_session_by_id(id, &cwd_str).await {
         Ok(new_session) => {
             // Route through the funnel so the plugin channels follow the swap;
             // a bare `set_session` would leave every plugin naming the session
             // it was serving before this call.
-            let _ =
-                crate::session::set_active_session(harness, new_session, Some(tool_context)).await;
+            if let Err(error) =
+                crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+            {
+                add_error_message(chat, &format!("Could not switch session: {error}"));
+                state.set_status(RunStatus::Idle);
+                return false;
+            }
             chat.clear();
             add_welcome_message(chat);
             render_session_history(
@@ -240,7 +249,12 @@ pub(super) async fn fork_session(
         }
     };
     let new_session = rpi_harness::session::session::Session::new(Arc::new(fork_storage), None);
-    let _ = crate::session::set_active_session(harness, new_session, Some(tool_context)).await;
+    if let Err(error) =
+        crate::session::set_active_session(harness, new_session, Some(tool_context)).await
+    {
+        add_error_message(chat, &format!("Could not fork session: {error}"));
+        return;
+    }
     chat.clear();
     add_welcome_message(chat);
     render_session_history(
@@ -468,12 +482,18 @@ pub(super) fn invoke_extension_renderer(
                 &mut out as *mut rpi_plugin_sdk::StbString,
                 renderer.user_data,
             );
+            // SAFETY: the callback transfers a live output to its producer.
+            let out = unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(renderer.plugin_free_string),
+                )
+            };
             let text = if rc == 0 {
                 Some(out.to_string_lossy())
             } else {
                 None
             };
-            out.free_with(Some(renderer.plugin_free_string));
             text
         }))
         .ok()

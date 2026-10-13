@@ -231,8 +231,11 @@ fn voice_registers_a_prompt_transformer_that_respects_the_speech_switch() {
         let mut out = StbString::empty();
         let rc = (h.handler)(StbStringRef::from_str(&envelope), &mut out, h.user_data);
         assert_eq!(rc, 0, "handler must report success");
-        let text = out.to_string_lossy();
-        out.free_with(Some(h.plugin_free_string));
+        // SAFETY: the ABI callback returned a live output, copied before producer-side cleanup.
+        let text = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(h.plugin_free_string))
+        }
+        .to_string_lossy();
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("bad payload {text:?}: {e}"))
     }
 

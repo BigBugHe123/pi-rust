@@ -165,10 +165,11 @@ fn invoke(
         &mut out,
         provider.user_data,
     );
+    // SAFETY: the callback transfers a live output to its registered producer.
+    let out = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(provider.plugin_free_string))
+    };
     let response = out.to_string_lossy();
-    if !out.is_empty() {
-        (provider.plugin_free_string)(out);
-    }
     if status != 0 {
         return Err(OAuthExtensionError::PluginStatus(status, response));
     }
@@ -190,40 +191,27 @@ fn provider_id(provider: &RegisteredOAuthProvider) -> String {
 mod tests {
     use super::*;
     use crate::registry::{ExtensionRegistry, RegisteredOAuthProvider};
-    use std::ffi::c_void;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static FREED: AtomicUsize = AtomicUsize::new(0);
 
-    extern "C" fn free_output(value: StbString) {
-        FREED.fetch_add(1, Ordering::SeqCst);
+    unsafe extern "C" fn free_output(value: StbString) {
         if !value.is_empty() {
-            unsafe {
-                let bytes = std::slice::from_raw_parts(value.ptr as *const u8, value.len);
-                drop(Box::from_raw(bytes as *const [u8] as *mut [u8]));
-            }
+            FREED.fetch_add(1, Ordering::SeqCst);
         }
+        // SAFETY: the test callback transfers one live SDK allocation.
+        unsafe { rpi_plugin_sdk::callbacks::free_string(value) };
     }
 
-    extern "C" fn callback(
-        request: StbStringRef,
-        out: *mut StbString,
-        _user_data: *mut c_void,
-    ) -> i32 {
-        let request = unsafe { request.as_str() };
+    rpi_plugin_sdk::string_handler! { fn callback(request, out, _user_data) {
         let value: Value = serde_json::from_str(request).unwrap();
-        if value.get("action").and_then(Value::as_str) == Some("refresh") {
-            unsafe {
-                *out = StbString::from_string(r#"{"access":"secret"}"#.to_string());
-            }
-            0
+        let response = if value.get("action").and_then(Value::as_str) == Some("refresh") {
+            r#"{"access":"secret"}"#
         } else {
-            unsafe {
-                *out = StbString::from_string(r#"{"ok":true}"#.to_string());
-            }
-            0
-        }
-    }
+            r#"{"ok":true}"#
+        };
+        i32::from(!out.write(response.to_string()))
+    } }
 
     fn snapshot() -> Arc<RegistrySnapshot> {
         let mut registry = ExtensionRegistry::new();

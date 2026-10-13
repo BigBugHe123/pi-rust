@@ -121,6 +121,20 @@ pub(super) fn add_update_notices(
         add_update_panel(&group, "Update Available", &body, colors.warning);
     }
 
+    for notice in report.notices.iter().filter(|notice| notice.name != "rpi") {
+        let body = format!(
+            "{}\n{} {}{}",
+            colors.muted.fg(&format!(
+                "{} {} -> {}",
+                notice.name, notice.current, notice.latest
+            )),
+            colors.muted.fg("Run"),
+            colors.accent.fg(&notice.command),
+            colors.muted.fg(".")
+        );
+        add_update_panel(&group, "Package Update Available", &body, colors.warning);
+    }
+
     // Other transcript producers append concurrently. Add the fully built
     // group in one operation so card borders and content cannot interleave
     // with user, assistant, tool, or extension messages.

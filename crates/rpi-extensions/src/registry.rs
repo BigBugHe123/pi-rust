@@ -54,6 +54,8 @@ impl ExtensionTool {
 }
 
 /// A registered slash command and its plugin callback.
+/// The plugin keeps its opaque context live and makes the callback safe to
+/// invoke from any host thread, as for [`RegisteredHandler`].
 #[derive(Clone)]
 pub struct RegisteredCommand {
     pub name: String,
@@ -76,8 +78,8 @@ pub struct RegisteredShortcut {
     pub plugin: String,
 }
 
-// SAFETY: the plugin owns the callback/context and promises they remain valid
-// for the loaded library lifetime, matching the other registered callbacks.
+// SAFETY: the plugin guarantees both context lifetime and thread-safe callback
+// access. Opaque pointers are only passed back to their registered callbacks.
 unsafe impl Send for RegisteredCommand {}
 unsafe impl Sync for RegisteredCommand {}
 
@@ -201,6 +203,8 @@ pub struct RegisteredOAuthProvider {
     pub plugin_free_string: FreeStringFn,
     pub user_data: *mut std::ffi::c_void,
 }
+// SAFETY: as for RegisteredProvider, the plugin must keep its opaque context
+// live and make request_fn safe to call from any host thread.
 unsafe impl Send for RegisteredOAuthProvider {}
 unsafe impl Sync for RegisteredOAuthProvider {}
 // SAFETY: fn pointers + owned `String`s + an opaque plugin pointer the plugin

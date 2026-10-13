@@ -56,12 +56,13 @@
 //! use `String`/`Vec`/`serde_json` directly. The `json` feature keeps
 //! `serde_json` optional for a plugin that wants to skip it.
 
+#![deny(unsafe_op_in_unsafe_fn)]
+
 use core::ffi::c_char;
 use core::ffi::c_void;
 use core::ptr;
 
 pub mod callbacks;
-#[cfg(feature = "json")]
 #[cfg(feature = "json")]
 pub mod dialogs;
 #[cfg(feature = "json")]
@@ -81,7 +82,7 @@ pub mod stdio;
 /// `Copy` (raw pointers are `Copy`): copying a `StbString` duplicates the
 /// **pointer**, not the allocation. The **receiver** of a `StbString` owns the
 /// allocation and MUST free it **exactly once** by calling the producer's
-/// [`FreeStringFn`] (or [`StbString::free_with`] / [`StbString::free_host`]).
+/// [`FreeStringFn`] (or [`StbString::free_with`]).
 /// Never `free` a `StbString` you did not receive as an owner (e.g. one built
 /// from a borrow via [`StbString::from_ref`], which is non-owning — its `free`
 /// is a no-op only if the producer guarantees the buffer outlives the call; in
@@ -128,12 +129,9 @@ impl StbString {
     }
 }
 
-// Allocating constructors + safe reader need `std` (Box/Vec/String). The ABI
-// type itself (`StbString { ptr, len }`) is POD with no `Drop` — that is what
-// makes the boundary sound. These helpers are available whenever `std` is (the
-// crate is std-using). When the `json` feature is off a plugin still gets these
-// because the crate links std; the gate here keeps `serde_json` truly optional.
-#[cfg(any(feature = "json", test))]
+// Constructors and the raw reader depend only on std, not serde_json. Keep
+// them available when the optional JSON feature is disabled: ABI trampolines
+// still allocate, copy and reclaim strings in that configuration.
 impl StbString {
     /// Wrap an allocation the caller already boxed. The `StbString` takes
     /// ownership: a later `free_with(free_fn)` will deallocate it via the
@@ -171,12 +169,26 @@ impl StbString {
     /// Copy this `StbString`'s bytes into an owned `String` (**without** freeing
     /// the original — the caller still owns the original allocation). Use this
     /// to *read* a received `StbString` into safe Rust; then `free` the original.
-    pub fn to_string_lossy(&self) -> String {
+    /// Invalid UTF-8 is replaced with the Unicode replacement character.
+    ///
+    /// # Safety
+    /// For a non-null pointer and nonzero length, `ptr` must be valid for
+    /// `len` initialized bytes in a single allocation, with `len <= isize::MAX`.
+    /// The bytes must remain live and unchanged during this call. A copied
+    /// `StbString` does not extend the allocation's lifetime.
+    ///
+    /// ```compile_fail
+    /// use rpi_plugin_sdk::StbString;
+    /// let raw = StbString::empty();
+    /// // Reading public ABI pointers requires an explicit validity contract.
+    /// let text = raw.to_string_lossy();
+    /// ```
+    pub unsafe fn to_string_lossy(&self) -> String {
         if self.len == 0 || self.ptr.is_null() {
             return String::new();
         }
-        // SAFETY: the producer guarantees `ptr` is valid for `len` bytes and the
-        // bytes are UTF-8. We only read (no free) here.
+        // SAFETY: the caller guarantees a live, readable, unchanged buffer.
+        // UTF-8 validity is not required by this lossy conversion.
         let slice = unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) };
         String::from_utf8_lossy(slice).into_owned()
     }
@@ -219,25 +231,33 @@ impl StbStringRef {
 
     /// Read into a safe `&str` for the callee's lifetime `'a`.
     ///
+    /// Panics on invalid UTF-8; SDK callback trampolines contain that panic.
+    ///
     /// # Safety
-    /// The caller guarantees `ptr` is valid for `len` bytes and they are UTF-8,
-    /// and the borrow survives `'a`.
+    /// The caller guarantees `ptr` is valid for `len` initialized bytes in a
+    /// single allocation, with `len <= isize::MAX`, and those bytes remain live
+    /// and unchanged for the borrow's lifetime `'a`.
     pub unsafe fn as_str<'a>(&self) -> &'a str {
         if self.len == 0 || self.ptr.is_null() {
             return "";
         }
         let slice = unsafe { core::slice::from_raw_parts(self.ptr as *const u8, self.len) };
-        unsafe { core::str::from_utf8_unchecked(slice) }
+        core::str::from_utf8(slice).expect("ABI string input must be valid UTF-8")
     }
 }
 
 /// Function pointer a plugin exports to free a [`StbString`] it produced.
-/// Idempotent: freeing an already-freed or empty `StbString` is a no-op.
+/// Empty strings require no deallocation. Transfer each non-empty allocation
+/// exactly once; freeing another copy of an already-freed string is invalid.
 ///
 /// The host calls this for every [`StbString`] it receives from the plugin; the
 /// plugin calls the **host's** `free_string` (from [`PluginApi`]) for every
 /// [`StbString`] it receives from the host.
-pub type FreeStringFn = extern "C" fn(s: StbString);
+///
+/// # Safety
+/// The caller must transfer a live allocation made by this producer exactly
+/// once. Calling with a forged, borrowed or already-freed buffer is invalid.
+pub type FreeStringFn = unsafe extern "C" fn(s: StbString);
 
 impl StbString {
     /// Free this `StbString` via the given `free_string` fn, if non-null and
@@ -245,10 +265,23 @@ impl StbString {
     /// caller relinquishes the allocation).
     ///
     /// After this call the bytes are invalid; do not use the `StbString` again.
-    pub fn free_with(self, free_fn: Option<FreeStringFn>) {
+    ///
+    /// # Safety
+    /// A non-empty string must be a live owning allocation created by the
+    /// supplied producer. This call transfers it exactly once; no other copy
+    /// may be read or freed afterward. Prefer [`callbacks::OwnedString`] for
+    /// Rust-side ownership and automatic cleanup.
+    ///
+    /// ```compile_fail
+    /// use rpi_plugin_sdk::{callbacks, StbString};
+    /// let raw = StbString::from_string("text".into());
+    /// raw.free_with(Some(callbacks::free_string));
+    /// ```
+    pub unsafe fn free_with(self, free_fn: Option<FreeStringFn>) {
         if let Some(free_fn) = free_fn {
             if !self.is_empty() {
-                free_fn(self);
+                // SAFETY: the caller supplies the producer and unique ownership.
+                unsafe { free_fn(self) };
             }
         }
     }
@@ -279,8 +312,19 @@ pub mod json {
 
     /// Parse a received [`StbString`] back into a `Value`. Does **not** free the
     /// input — the caller still owns it.
-    pub fn from_stable(s: &StbString) -> Value {
-        let text = s.to_string_lossy();
+    ///
+    /// # Safety
+    /// The buffer must satisfy [`StbString::to_string_lossy`]'s validity and
+    /// lifetime requirements for the duration of this call.
+    ///
+    /// ```compile_fail
+    /// use rpi_plugin_sdk::{json, StbString};
+    /// let raw = StbString::empty();
+    /// let value = json::from_stable(&raw);
+    /// ```
+    pub unsafe fn from_stable(s: &StbString) -> Value {
+        // SAFETY: the caller supplies the raw string validity contract.
+        let text = unsafe { s.to_string_lossy() };
         if text.is_empty() {
             return Value::Null;
         }
@@ -307,9 +351,6 @@ pub struct StableToolSchema {
     /// JSON-encoded JSON Schema for the tool's `parameters`.
     pub parameters: StbString,
 }
-
-unsafe impl Send for StableToolSchema {}
-unsafe impl Sync for StableToolSchema {}
 
 // ---------------------------------------------------------------------------
 // Host context injected into plugin tool arguments
@@ -482,7 +523,7 @@ impl StepResult {
 /// invoked after `Done`/`Err`.
 ///
 /// `partial` is a JSON `AgentToolResult`; ownership passes to the callback (the
-/// host frees it via the host's `free_string`).
+/// host frees it through this tool's registered plugin `free_string`).
 pub type ToolPartialCb = extern "C" fn(partial: StbString, user_data: *mut c_void);
 
 /// `execute(tool_call_id, params) -> StepHandle`. Plugin-allocates a drive
@@ -960,8 +1001,15 @@ pub type BeforeAgentStartFn =
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeActionId {
+    /// Send `message` (stored AgentMessage or Pi customType/content/display/
+    /// details) or `text`. Options `triggerTurn` and `deliverAs` can be flat or
+    /// nested under `options`. Default: idle append, active steer. Use explicit
+    /// `triggerTurn: true` to start an idle run. `nextTurn` always defers.
     SendMessage = 0,
     SendUserMessage = 1,
+    /// Append without starting a run. `{"customType": ..., "data": ...}` stores
+    /// extension data; `{"message": ...}` queues context until the active turn
+    /// settles. The returned `entryId` can be reserved before its entry exists.
     AppendEntry = 2,
     SetSessionName = 3,
     GetActiveTools = 4,
@@ -1337,8 +1385,7 @@ pub unsafe fn register_entrypoint(
     // SAFETY: caller guarantees `api` is valid; we check null above.
     // Read the version and size fields first — they're at known offsets
     // regardless of future struct growth.
-    let abi_version = (*api).abi_version;
-    let struct_size = (*api).struct_size;
+    let (abi_version, struct_size) = unsafe { ((*api).abi_version, (*api).struct_size) };
     if abi_version != RPI_PLUGIN_ABI_VERSION_UNIFIED {
         // Mismatch: refuse to register. The host logs "ABI version mismatch"
         // and skips loading this plugin.
@@ -1348,7 +1395,8 @@ pub unsafe fn register_entrypoint(
         // Host predates a field the plugin expects; degrade gracefully.
         return 3;
     }
-    let api = &*api;
+    // SAFETY: the caller keeps the correctly sized vtable live through body.
+    let api = unsafe { &*api };
     // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
     // the process, so convert a panic into a status code the host can report.
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api))) {
@@ -1399,15 +1447,12 @@ mod tests {
         static FREED: std::cell::Cell<usize> = std::cell::Cell::new(0);
     }
 
-    extern "C" fn test_free(s: StbString) {
+    unsafe extern "C" fn test_free(s: StbString) {
         if s.is_empty() || s.ptr.is_null() {
             return;
         }
-        // Reconstruct the boxed slice and drop it.
-        unsafe {
-            let slice = core::slice::from_raw_parts_mut(s.ptr as *mut u8, s.len);
-            let _ = Box::from_raw(slice as *mut [u8]);
-        }
+        // SAFETY: the test transfers a live SDK allocation exactly once.
+        unsafe { callbacks::free_string(s) };
         FREED.with(|freed| freed.set(freed.get() + 1));
     }
 
@@ -1436,15 +1481,35 @@ mod tests {
         let _ = prev;
         let s = StbString::from_string("hello, pi".to_string());
         assert_eq!(s.len, 9);
-        assert_eq!(s.to_string_lossy(), "hello, pi");
-        s.free_with(Some(test_free));
+        // SAFETY: s owns a live allocation, freed below.
+        assert_eq!(unsafe { s.to_string_lossy() }, "hello, pi");
+        // SAFETY: this test transfers its live SDK allocation exactly once.
+        unsafe { s.free_with(Some(test_free)) };
         assert_eq!(freed_count(), 1);
+    }
+
+    #[test]
+    fn lossy_copy_accepts_non_utf8_and_does_not_free_or_modify_the_buffer() {
+        let _ = reset_freed();
+        let s = StbString::from_vec(vec![b'a', 0xff, b'b']);
+        // SAFETY: s owns three initialized, unchanged bytes until free below.
+        let first = unsafe { s.to_string_lossy() };
+        // SAFETY: copying did not consume or free the original allocation.
+        let second = unsafe { s.to_string_lossy() };
+        assert_eq!(first, "a\u{fffd}b");
+        assert_eq!(first, second);
+        assert_eq!(freed_count(), 0);
+        // SAFETY: this test transfers its live SDK allocation exactly once.
+        unsafe { s.free_with(Some(test_free)) };
+        assert_eq!(freed_count(), 1);
+        assert_eq!(first, "a\u{fffd}b");
     }
 
     #[test]
     fn empty_stbstring_free_is_noop() {
         let _ = reset_freed();
-        StbString::empty().free_with(Some(test_free));
+        // SAFETY: this test transfers its live SDK allocation exactly once.
+        unsafe { StbString::empty().free_with(Some(test_free)) };
         assert_eq!(freed_count(), 0);
     }
 
@@ -1453,9 +1518,11 @@ mod tests {
     fn json_round_trip_preserves_structure() {
         let val = serde_json::json!({ "name": "echo", "args": [1, 2, 3], "ok": true });
         let stb = json::to_stable(&val, None);
-        let back = json::from_stable(&stb);
+        // SAFETY: stb owns a live allocation, freed below.
+        let back = unsafe { json::from_stable(&stb) };
         assert_eq!(val, back);
-        stb.free_with(Some(test_free));
+        // SAFETY: this test transfers its live SDK allocation exactly once.
+        unsafe { stb.free_with(Some(test_free)) };
         let _ = reset_freed();
     }
 
@@ -1467,10 +1534,12 @@ mod tests {
         // SAFETY: tag == Done.
         let done = unsafe { sr.done_payload() };
         assert_eq!(
-            done.result.to_string_lossy(),
+            // SAFETY: the initialized Done result is live until test_free below.
+            unsafe { done.result.to_string_lossy() },
             r#"{"content":[{"text":"hi"}]}"#
         );
-        done.result.free_with(Some(test_free));
+        // SAFETY: this test transfers its live SDK allocation exactly once.
+        unsafe { done.result.free_with(Some(test_free)) };
         let _ = reset_freed();
     }
 

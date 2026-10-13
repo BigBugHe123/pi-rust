@@ -239,24 +239,29 @@ fn modal_inputs_keep_registered_plugin_shortcuts_until_closed() {
     use rpi_extensions::{ExtensionRegistry, ExtensionSession, PluginKeepalive};
     use rpi_plugin_sdk::{EventTag, StablePluginEvent, EVENT_HANDLER_CLAIMED};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    static CONTEXTS: rpi_plugin_sdk::handles::ToolHandles<Arc<AtomicUsize>> =
+        rpi_plugin_sdk::handles::ToolHandles::new();
+    struct ContextOwner(usize);
+    impl Drop for ContextOwner {
+        fn drop(&mut self) {
+            drop(CONTEXTS.remove(self.0 as rpi_plugin_sdk::StepHandle));
+        }
+    }
     extern "C" fn claim(_: StablePluginEvent, user_data: *mut std::ffi::c_void) -> i32 {
-        // The counter outlives the session and all synchronous dispatch calls.
-        let calls = unsafe { &*user_data.cast::<AtomicUsize>() };
+        let context = CONTEXTS.get(user_data).expect("live test context");
+        let calls = context.lock().clone();
         calls.fetch_add(1, Ordering::SeqCst);
         EVENT_HANDLER_CLAIMED
     }
-    let calls = AtomicUsize::new(0);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let context = CONTEXTS.insert(calls.clone());
+    let _owner = ContextOwner(context as usize);
     let state = test_tui_state();
     let mut registry = ExtensionRegistry::new();
     for name in ["space", "f8", "escape", "enter"] {
         registry.register_shortcut("test".into(), name.into(), "test".into());
     }
-    registry.register_event_handler(
-        "test".into(),
-        EventTag::Input,
-        claim,
-        (&calls as *const AtomicUsize).cast_mut().cast(),
-    );
+    registry.register_event_handler("test".into(), EventTag::Input, claim, context);
     *state.extension_session.lock().unwrap() = ExtensionSession::from_parts(
         Arc::new(registry.snapshot()),
         PluginKeepalive::empty(),
@@ -1241,6 +1246,42 @@ fn empty_update_report_does_not_add_transcript_content() {
     add_update_notices(&chat, &crate::updates::UpdateReport::default());
 
     assert_eq!(chat.child_count(), 0);
+}
+
+#[test]
+fn package_updates_render_without_an_rpi_update() {
+    let chat = Arc::new(Container::new());
+    let package_notice = crate::updates::UpdateNotice {
+        name: "rpi-im-message".into(),
+        current: "0.1.9".into(),
+        latest: "0.1.10".into(),
+        command: "rpi install rpi-im-message --force".into(),
+    };
+
+    for include_rpi in [false, true] {
+        chat.clear();
+        let mut report = crate::updates::UpdateReport {
+            notices: vec![package_notice.clone()],
+            warnings: Vec::new(),
+        };
+        if include_rpi {
+            report.notices.push(crate::updates::UpdateNotice {
+                name: "rpi".into(),
+                current: "0.3.20".into(),
+                latest: "0.3.21".into(),
+                command: "rpi update".into(),
+            });
+        }
+
+        add_update_notices(&chat, &report);
+
+        assert_eq!(chat.child_count(), 1);
+        let plain = strip_ansi(&chat.render(80).join("\n"));
+        assert!(plain.contains("Package Update Available"), "{plain}");
+        assert!(plain.contains("rpi-im-message 0.1.9 -> 0.1.10"), "{plain}");
+        assert!(plain.contains(&package_notice.command), "{plain}");
+        assert_eq!(plain.contains("rpi update"), include_rpi, "{plain}");
+    }
 }
 
 #[test]

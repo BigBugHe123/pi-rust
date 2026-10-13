@@ -315,3 +315,77 @@ async fn an_undecodable_frame_is_skipped_not_fatal() {
         salvaged[0].content
     );
 }
+
+/// Commit intent is written before the entry. Restart must preserve the stream
+/// on the pre-entry side of that window and retire it on the post-entry side.
+async fn session_with_bound_stream_on_disk(commit_entry: bool) -> Session {
+    let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+    let storage = JsonlSessionStorage::create(fs.clone(), PATH, header(), clock(), ids())
+        .await
+        .unwrap();
+    let storage = Arc::new(storage);
+    for record in crashed_stream() {
+        storage.append_record(record).await.unwrap();
+    }
+    storage
+        .append_record(LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: record_base("stream-commit"),
+            run_id: RUN_ID.into(),
+            stream_index: 0,
+            op: AssistantFrameOp::CommitStream,
+            frame: Some(serde_json::json!({"entryId": "committed-assistant"})),
+        }))
+        .await
+        .unwrap();
+    if commit_entry {
+        let partial = salvage_run_frames(&Session::new(storage.clone(), None), RUN_ID)
+            .await
+            .unwrap()
+            .remove(0);
+        storage
+            .append_entry(
+                rpi_harness::session::types::ProvisionedEntry {
+                    id: "committed-assistant".into(),
+                    kind: rpi_harness::session::types::ProvisionedKind::Message {
+                        message: rpi_agent::AgentMessage::Assistant(Box::new(partial)),
+                        terminate: None,
+                    },
+                },
+                LANE,
+            )
+            .await
+            .unwrap();
+    }
+    let reloaded = JsonlSessionStorage::load(fs, PATH, clock(), ids())
+        .await
+        .unwrap();
+    Session::new(Arc::new(reloaded), None)
+}
+
+#[tokio::test]
+async fn commit_intent_without_an_entry_keeps_progress_after_disk_reload() {
+    let session = session_with_bound_stream_on_disk(false).await;
+    let salvaged = salvage_run_frames(&session, RUN_ID).await.unwrap();
+    assert_eq!(salvaged.len(), 1);
+    assert!(
+        matches!(salvaged[0].content.first(), Some(Content::Text(text)) if text.text == "recovered from disk")
+    );
+}
+
+#[tokio::test]
+async fn committed_entry_without_a_clear_marker_is_not_replayed_after_disk_reload() {
+    let session = session_with_bound_stream_on_disk(true).await;
+    assert!(session
+        .get_entry("committed-assistant")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(salvage_run_frames(&session, RUN_ID)
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(salvage_run_frames(&session, RUN_ID)
+        .await
+        .unwrap()
+        .is_empty());
+}

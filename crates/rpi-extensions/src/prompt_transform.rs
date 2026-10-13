@@ -134,17 +134,18 @@ fn call_one_handler(
     // handler that forgets to write yields an empty parse rather than UB.
     let mut out = StbString::empty();
     let rc = (h.handler)(event_ref, &mut out, h.user_data);
+    // SAFETY: the callback transfers its live output to its registered producer.
+    let out = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(h.plugin_free_string))
+    };
     if rc != 0 {
-        // Defensively free a non-empty `out` (a misbehaving handler that wrote
-        // then returned nonzero would otherwise leak). No-op on empty.
-        out.free_with(Some(h.plugin_free_string));
+        // The owner also reclaims output a handler wrote before returning error.
         return Err(rc);
     }
 
     // Copy the plugin-owned bytes into a safe String, THEN free the plugin
     // allocation — we must not keep a reference past the free.
     let json = out.to_string_lossy();
-    out.free_with(Some(h.plugin_free_string));
 
     Ok(parse_prompt_payload(&json))
 }

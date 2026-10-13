@@ -20,9 +20,10 @@ use rpi_agent::agent_tool::AgentTool;
 use rpi_agent::error::AgentError;
 use rpi_agent::types::{AgentToolResult, TextContentOrImage, ToolExecutionMode, ToolResultPartial};
 use rpi_ai::types::Tool;
+use rpi_plugin_sdk::callbacks::{take_step_result_with, OwnedString, Step};
 use rpi_plugin_sdk::{
-    FreeStringFn, StbString, StbStringRef, StepHandle, StepResultTag, ToolCancelFn, ToolDestroyFn,
-    ToolExecuteFn, ToolPollFn,
+    FreeStringFn, StbString, StbStringRef, StepHandle, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
+    ToolPollFn,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -103,11 +104,9 @@ fn result_to_json(result: &AgentToolResult) -> String {
 }
 
 /// Parse a plugin-produced JSON `AgentToolResult` back into the native struct.
-/// Lenient: missing fields default. The caller frees the input `StbString` via
-/// the plugin's `free_string` (plugin produced it).
-fn stb_to_result(s: &StbString) -> AgentToolResult {
-    let text = s.to_string_lossy();
-    let val: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+/// Lenient: missing fields default. ABI ownership is handled before parsing.
+fn json_to_result(text: &str) -> AgentToolResult {
+    let val: serde_json::Value = serde_json::from_str(text).unwrap_or(serde_json::Value::Null);
     let mut result = AgentToolResult::default();
     if let Some(obj) = val.as_object() {
         if let Some(content) = obj.get("content").and_then(|v| v.as_array()) {
@@ -339,36 +338,33 @@ impl PluginToolAdapter {
     }
 }
 
-/// The partial-callback trampoline passed to `poll`. `user_data` is a
-/// `*const mpsc::UnboundedSender<AgentToolResult>` valid for the drive (the
-/// blocking driver owns the sender in its closure env). The plugin invokes this
-/// synchronously inside `poll()`; it parses the partial, frees the plugin-
-/// produced `StbString` via the host's `free_string`, and pushes the result
-/// through the mpsc. Wrapped in `catch_unwind` so a poisoned sender / panic
-/// cannot unwind across FFI (abort-on-unwind).
+struct PartialCallbackContext {
+    sender: mpsc::UnboundedSender<AgentToolResult>,
+    plugin_free: FreeStringFn,
+}
+
+/// The blocking driver owns the callback context until poll returns. The
+/// plugin invokes this synchronously and transfers a partial to its registered
+/// deallocator. OwnedString also reclaims it if host-side parsing unwinds.
 extern "C" fn partial_cb_trampoline(partial: StbString, user_data: *mut c_void) {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         if user_data.is_null() {
-            // Still must free the partial (plugin produced it; host owns
-            // cleanup when no handler runs — here "no handler" means no sender).
-            host_free_string(partial);
+            // Invalid ABI invocation: no producer is available to free safely.
+            // A normal driver always supplies the context, even if the receiver
+            // has gone away. Never guess that host and plugin allocators match.
+            tracing::error!("plugin partial callback missing its context");
             return;
         }
-        // SAFETY: the blocking driver guarantees `user_data` is a live
-        // `&mpsc::UnboundedSender<AgentToolResult>` for the duration of poll().
-        let sender = unsafe { &*(user_data as *const mpsc::UnboundedSender<AgentToolResult>) };
-        let result = stb_to_result(&partial);
-        // The partial StbString was plugin-produced inside poll(); the host is
-        // the receiver and owns the free (plugin allocated with the global
-        // allocator, which host_free_string reclaims — documented v1 contract).
-        host_free_string(partial);
-        let _ = sender.send(result);
+        // SAFETY: the driver keeps this context live for the synchronous poll.
+        let context = unsafe { &*user_data.cast::<PartialCallbackContext>() };
+        // SAFETY: the plugin transfers a live partial and its registered free fn.
+        let owned = unsafe { OwnedString::from_raw(partial, Some(context.plugin_free)) };
+        let result = json_to_result(&owned.to_string_lossy());
+        let _ = context.sender.send(result);
     }));
     if outcome.is_err() {
-        // A panic inside the *host-side* closure (e.g. a malformed partial that
-        // made `stb_to_result` panic) was caught above. Do NOT abort the
-        // process: log it and move on. The partial StbString may leak on this
-        // rare path, which is preferable to taking the host down.
+        // A panic inside host-side copying or parsing was caught above. Log it
+        // and continue; the adopted partial is reclaimed by Drop.
         tracing::error!("plugin partial callback panicked — dropped (host continues)");
     }
 }
@@ -435,11 +431,14 @@ impl AgentTool for PluginToolAdapter {
 
         // 4. spawn_blocking driver. It runs to completion regardless of
         //    outer-future drop, so we NEVER drop it; on cancel we set the flag
-        //    and keep awaiting done_rx. The sender is captured (Send); the raw
-        //    pointer to it is computed INSIDE the closure (not moved across
-        //    threads — `*mut c_void` is not `Send`).
+        //    and keep awaiting done_rx. The callback context is captured (Send);
+        //    its raw pointer is computed inside the closure, never moved across
+        //    threads.
         let cancel_flag_drive = Arc::clone(&cancel_flag);
-        let sender_for_cb = partial_tx.clone();
+        let callback_context = PartialCallbackContext {
+            sender: partial_tx.clone(),
+            plugin_free,
+        };
         runtime.spawn_blocking(move || {
             // Drive: execute → poll loop → destroy exactly once. Every plugin
             // call is extern "C"; wrap in catch_unwind so a plugin panic cannot
@@ -471,9 +470,9 @@ impl AgentTool for PluginToolAdapter {
                 }
             };
 
-            // The sender pointer, valid for the drive (sender_for_cb lives in
-            // this closure env). Computed here so no raw pointer crosses threads.
-            let sender_ptr = &sender_for_cb as *const _ as *mut c_void;
+            // Compute the opaque context pointer inside the blocking closure;
+            // its sender and producer-side deallocator outlive every poll.
+            let context_ptr = &callback_context as *const _ as *mut c_void;
 
             // poll loop
             let terminal: Result<AgentToolResult, AgentError> = loop {
@@ -483,7 +482,7 @@ impl AgentTool for PluginToolAdapter {
                     break Err(AgentError::Tool("plugin tool cancelled".into()));
                 }
                 let step_result = match catch_unwind(AssertUnwindSafe(|| {
-                    (poll_fn)(step_handle, Some(partial_cb_trampoline), sender_ptr)
+                    (poll_fn)(step_handle, Some(partial_cb_trampoline), context_ptr)
                 })) {
                     Ok(r) => r,
                     Err(_) => {
@@ -493,33 +492,24 @@ impl AgentTool for PluginToolAdapter {
                         )));
                     }
                 };
-                match step_result.tag {
-                    StepResultTag::Pending => {
-                        // SAFETY: tag == Pending.
-                        let progress = unsafe { step_result.pending_payload().progress };
+                // SAFETY: poll transfers its live result to the registered
+                // producer deallocator. The SDK selects the arm and frees once.
+                let step = unsafe { take_step_result_with(step_result, plugin_free) };
+                match step {
+                    Step::Pending(progress) => {
                         if !progress.is_empty() {
                             // The plugin may also have pushed via the partial cb;
                             // both paths land in partial_rx. Forward this one too.
-                            let pr = stb_to_result(&progress);
-                            // progress was plugin-produced inside poll → free via
-                            // the plugin's free_string.
-                            (plugin_free)(progress);
+                            let pr = json_to_result(&progress);
                             let _ = partial_tx.send(pr);
                         }
                         continue;
                     }
-                    StepResultTag::Done => {
-                        // SAFETY: tag == Done.
-                        let done = unsafe { step_result.done_payload().result };
-                        let result = stb_to_result(&done);
-                        (plugin_free)(done);
+                    Step::Done(done) => {
+                        let result = json_to_result(&done);
                         break Ok(result);
                     }
-                    StepResultTag::Err => {
-                        // SAFETY: tag == Err.
-                        let msg = unsafe { step_result.err_payload().message };
-                        let message = msg.to_string_lossy();
-                        (plugin_free)(msg);
+                    Step::Err(message) => {
                         break Err(AgentError::Tool(message));
                     }
                 }
@@ -595,6 +585,87 @@ mod tests {
 
     static DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
     static CANCEL_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static PRODUCER_FREES: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn counted_plugin_free(value: StbString) {
+        if !value.is_empty() {
+            PRODUCER_FREES.fetch_add(1, Ordering::SeqCst);
+        }
+        // SAFETY: the test plugin allocated the transferred payload with SDK.
+        unsafe { rpi_plugin_sdk::callbacks::free_string(value) };
+    }
+
+    extern "C" fn poll_with_callback(
+        handle: StepHandle,
+        callback: Option<ToolPartialCb>,
+        data: *mut c_void,
+    ) -> StepResult {
+        let result = stub_poll(handle, None, std::ptr::null_mut());
+        if result.tag == rpi_plugin_sdk::StepResultTag::Pending {
+            if let Some(callback) = callback {
+                callback(
+                    StbString::from_string(
+                        r#"{"content":[{"type":"text","text":"callback"}]}"#.into(),
+                    ),
+                    data,
+                );
+            }
+        }
+        result
+    }
+
+    #[tokio::test]
+    async fn callback_and_step_payloads_use_the_plugin_deallocator() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_counters();
+        PRODUCER_FREES.store(0, Ordering::SeqCst);
+        let mut handle = stub_handle();
+        handle.poll_fn = poll_with_callback;
+        handle.plugin_free_string = counted_plugin_free;
+        let adapter = PluginToolAdapter::new(
+            Tool {
+                name: "producer-check".into(),
+                description: "test".into(),
+                parameters: rpi_ai::types::Schema::new(serde_json::json!({})),
+                constrained_sampling: None,
+            },
+            handle,
+            PluginKeepalive::empty(),
+        );
+        let seen = Arc::new(AtomicUsize::new(0));
+        let updates = seen.clone();
+        adapter
+            .execute(
+                "call",
+                serde_json::json!({}),
+                CancellationToken::new(),
+                Arc::new(move |_| {
+                    updates.fetch_add(1, Ordering::SeqCst);
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 4); // Two callbacks and two pending results.
+        assert_eq!(PRODUCER_FREES.load(Ordering::SeqCst), 5); // Plus the terminal result.
+        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn closed_partial_receiver_still_reclaims_the_plugin_payload() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        PRODUCER_FREES.store(0, Ordering::SeqCst);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let context = PartialCallbackContext {
+            sender,
+            plugin_free: counted_plugin_free,
+        };
+        partial_cb_trampoline(
+            StbString::from_string("{}".into()),
+            &context as *const _ as *mut c_void,
+        );
+        assert_eq!(PRODUCER_FREES.load(Ordering::SeqCst), 1);
+    }
 
     /// The raw arguments string the most recent `stub_execute` was handed. The
     /// stub used to ignore its `params` entirely, which made it impossible to
@@ -613,23 +684,25 @@ mod tests {
     }
 
     struct DriveState {
-        cancelled: Arc<AtomicBool>,
         polls: usize,
         done_at: usize,
     }
 
+    static TEST_DRIVES: rpi_plugin_sdk::handles::ToolHandles<DriveState> =
+        rpi_plugin_sdk::handles::ToolHandles::new();
+
     extern "C" fn stub_execute(
         _id: StbStringRef,
         params: StbString,
-        _free: Option<FreeStringFn>,
+        free: Option<FreeStringFn>,
     ) -> StepHandle {
-        *LAST_PARAMS.lock().unwrap() = Some(params.to_string_lossy());
-        let state = Box::new(DriveState {
-            cancelled: Arc::new(AtomicBool::new(false)),
+        // SAFETY: execute transfers live parameters with their producer.
+        let owned = unsafe { OwnedString::from_raw(params, free) };
+        *LAST_PARAMS.lock().unwrap() = Some(owned.to_string_lossy());
+        TEST_DRIVES.insert(DriveState {
             polls: 0,
             done_at: 3,
-        });
-        Box::into_raw(state) as StepHandle
+        })
     }
 
     extern "C" fn stub_poll(
@@ -637,11 +710,14 @@ mod tests {
         _cb: Option<ToolPartialCb>,
         _ud: *mut c_void,
     ) -> StepResult {
-        let state = unsafe { &mut *(h as *mut DriveState) };
-        state.polls += 1;
-        if state.cancelled.load(Ordering::SeqCst) {
+        let Some(entry) = TEST_DRIVES.get(h) else {
+            return StepResult::err(StbString::from_string("invalid handle".into()));
+        };
+        if entry.cancelled.load(Ordering::SeqCst) {
             return StepResult::err(StbString::from_string("cancelled".into()));
         }
+        let mut state = entry.lock();
+        state.polls += 1;
         if state.polls >= state.done_at {
             let result_json = StbString::from_string(
                 r#"{"content":[{"type":"text","text":"echo: hello"}]}"#.to_string(),
@@ -656,29 +732,15 @@ mod tests {
 
     extern "C" fn stub_cancel(h: StepHandle) {
         CANCEL_COUNT.fetch_add(1, Ordering::SeqCst);
-        let state = unsafe { &*(h as *const DriveState) };
-        state.cancelled.store(true, Ordering::SeqCst);
+        TEST_DRIVES.cancel(h);
     }
 
     extern "C" fn stub_destroy(h: StepHandle) {
         DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
-        if h.is_null() {
-            return;
-        }
-        unsafe {
-            let _ = Box::from_raw(h as *mut DriveState);
-        }
+        drop(TEST_DRIVES.remove(h));
     }
 
-    extern "C" fn stub_free(s: StbString) {
-        if s.is_empty() || s.ptr.is_null() {
-            return;
-        }
-        unsafe {
-            let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-        }
-    }
+    use rpi_plugin_sdk::callbacks::free_string as stub_free;
 
     fn stub_handle() -> PluginToolHandle {
         PluginToolHandle {
@@ -758,28 +820,26 @@ mod tests {
     async fn adapter_cancel_observed_no_uaf_no_leak() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_counters();
-        struct SlowState {
-            cancelled: Arc<AtomicBool>,
-            polls: usize,
-        }
+        static SLOW_DRIVES: rpi_plugin_sdk::handles::ToolHandles<()> =
+            rpi_plugin_sdk::handles::ToolHandles::new();
         extern "C" fn slow_execute(
             _: StbStringRef,
-            _: StbString,
-            _: Option<FreeStringFn>,
+            params: StbString,
+            free: Option<FreeStringFn>,
         ) -> StepHandle {
-            Box::into_raw(Box::new(SlowState {
-                cancelled: Arc::new(AtomicBool::new(false)),
-                polls: 0,
-            })) as StepHandle
+            // SAFETY: execute transfers parameters and their producer.
+            drop(unsafe { OwnedString::from_raw(params, free) });
+            SLOW_DRIVES.insert(())
         }
         extern "C" fn slow_poll(
             h: StepHandle,
             _: Option<ToolPartialCb>,
             _: *mut c_void,
         ) -> StepResult {
-            let s = unsafe { &mut *(h as *mut SlowState) };
-            s.polls += 1;
-            if s.cancelled.load(Ordering::SeqCst) {
+            let Some(entry) = SLOW_DRIVES.get(h) else {
+                return StepResult::err(StbString::from_string("invalid handle".into()));
+            };
+            if entry.cancelled.load(Ordering::SeqCst) {
                 return StepResult::err(StbString::from_string("cancelled".into()));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
@@ -787,19 +847,11 @@ mod tests {
         }
         extern "C" fn slow_cancel(h: StepHandle) {
             CANCEL_COUNT.fetch_add(1, Ordering::SeqCst);
-            unsafe {
-                (*(h as *mut SlowState))
-                    .cancelled
-                    .store(true, Ordering::SeqCst);
-            }
+            SLOW_DRIVES.cancel(h);
         }
         extern "C" fn slow_destroy(h: StepHandle) {
             DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
-            if !h.is_null() {
-                unsafe {
-                    let _ = Box::from_raw(h as *mut SlowState);
-                }
-            }
+            drop(SLOW_DRIVES.remove(h));
         }
         let tool = Tool {
             name: "slow".to_string(),

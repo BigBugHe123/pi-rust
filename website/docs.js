@@ -13,7 +13,7 @@ function escapeAttribute(value) {
   return escapeHtml(value).replace(/["'`]/g, (character) => ({ '"': '&quot;', "'": '&#39;', '`': '&#96;' })[character]);
 }
 
-const state = { rawData: null, data: null, mode: 'guide', query: '' };
+const state = { rawData: null, data: null, mode: new URLSearchParams(window.location.search).get('mode') === 'sdk' ? 'sdk' : 'guide', query: '' };
 
 function showToast(message) {
   const toast = $('[data-toast]'); toast.textContent = message; toast.classList.add('is-visible');

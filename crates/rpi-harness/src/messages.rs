@@ -24,7 +24,6 @@ use rpi_ai::types::{
     Content, Message, ToolResultMessage, ToolResultRole, UserContent, UserMessage,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 
 /// Wraps `summary` in the compaction-summary text envelope. Mirrors
 /// `COMPACTION_SUMMARY_PREFIX` / `SUFFIX`.
@@ -305,27 +304,58 @@ const RECOVERY_TOOL_RESULT: &str = concat!(
     "The tool was not re-executed during session recovery."
 );
 
-/// Repair assistant tool calls whose result was lost during a crash or partial
-/// session write. This only changes the in-memory provider context: the durable
-/// session remains the user's original history and no tool is executed again.
+/// Repair interrupted or interleaved tool batches in the provider context.
+/// Results are matched only until the next assistant message, so an id reused
+/// in a later turn cannot hide a missing result in this one. The durable history
+/// is unchanged and no tool is executed during this repair.
 pub fn repair_orphaned_tool_calls(
     messages: Vec<AgentMessage>,
 ) -> (Vec<AgentMessage>, ToolCallRepairReport) {
-    let existing_results: HashSet<String> = messages
-        .iter()
-        .filter_map(|message| match message {
-            AgentMessage::ToolResult(result) => Some(result.tool_call_id.clone()),
-            _ => None,
-        })
-        .collect();
+    let mut input = messages.into_iter().peekable();
     let mut repaired = Vec::new();
     let mut report = ToolCallRepairReport::default();
-    let mut pending_calls: Vec<(String, String, i64)> = Vec::new();
-
-    let flush_missing = |repaired: &mut Vec<AgentMessage>,
-                         pending: &mut Vec<(String, String, i64)>,
-                         report: &mut ToolCallRepairReport| {
-        for (tool_call_id, tool_name, timestamp) in pending.drain(..) {
+    while let Some(message) = input.next() {
+        let AgentMessage::Assistant(assistant) = &message else {
+            if let AgentMessage::ToolResult(result) = &message {
+                tracing::warn!(call_id = %result.tool_call_id, "omitting an orphaned tool result from provider context");
+            } else {
+                repaired.push(message);
+            }
+            continue;
+        };
+        let timestamp = assistant.timestamp;
+        let mut pending: Vec<(String, String)> = assistant
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::ToolCall(call) => Some((call.id.clone(), call.name.clone())),
+                _ => None,
+            })
+            .collect();
+        repaired.push(message);
+        let mut interleaved = Vec::new();
+        // Move ownership of the messages; images and large tool outputs are not
+        // cloned just to adjust their position.
+        while input
+            .peek()
+            .is_some_and(|message| !matches!(message, AgentMessage::Assistant(_)))
+        {
+            let message = input.next().expect("peeked message");
+            if let AgentMessage::ToolResult(result) = &message {
+                if let Some(index) = pending
+                    .iter()
+                    .position(|(id, _)| id == &result.tool_call_id)
+                {
+                    pending.remove(index);
+                    repaired.push(message);
+                } else {
+                    tracing::warn!(call_id = %result.tool_call_id, "omitting an unmatched or duplicate tool result from provider context");
+                }
+            } else {
+                interleaved.push(message);
+            }
+        }
+        for (tool_call_id, tool_name) in pending {
             report.repaired_call_ids.push(tool_call_id.clone());
             repaired.push(AgentMessage::ToolResult(Box::new(ToolResultMessage {
                 role: ToolResultRole,
@@ -339,94 +369,9 @@ pub fn repair_orphaned_tool_calls(
                 timestamp,
             })));
         }
-    };
-
-    for message in messages {
-        match &message {
-            AgentMessage::Assistant(assistant) => {
-                let calls = assistant
-                    .content
-                    .iter()
-                    .filter_map(|content| match content {
-                        Content::ToolCall(call) if !existing_results.contains(&call.id) => {
-                            Some((call.id.clone(), call.name.clone(), assistant.timestamp))
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                flush_missing(&mut repaired, &mut pending_calls, &mut report);
-                repaired.push(message);
-                pending_calls = calls;
-            }
-            AgentMessage::ToolResult(result) => {
-                if let Some(index) = pending_calls
-                    .iter()
-                    .position(|(id, _, _)| id == &result.tool_call_id)
-                {
-                    pending_calls.remove(index);
-                }
-                repaired.push(message);
-            }
-            _ => {
-                flush_missing(&mut repaired, &mut pending_calls, &mut report);
-                repaired.push(message);
-            }
-        }
+        repaired.extend(interleaved);
     }
-    flush_missing(&mut repaired, &mut pending_calls, &mut report);
     (repaired, report)
-}
-
-/// Move each assistant message's tool results directly after it, pushing any
-/// message that was interleaved between `tool_calls` and its results to after
-/// the results.
-///
-/// Strict OpenAI-compatible providers require an assistant message carrying
-/// `tool_calls` to be immediately followed by the matching tool messages. A
-/// message appended while a tool batch is still in flight — an extension calling
-/// the `append_entry` runtime action from inside its tool, e.g. `rpi-goal`
-/// injecting the goal state — would otherwise sit between them, and the request
-/// is rejected with HTTP 400 ("An assistant message with 'tool_calls' must be
-/// followed by tool messages…"). This repairs it at the provider boundary, so
-/// no extension has to know about tool-batch timing.
-fn ensure_tool_results_adjacent(messages: Vec<AgentMessage>) -> Vec<AgentMessage> {
-    use std::collections::HashMap;
-
-    let mut result_index: HashMap<&str, usize> = HashMap::new();
-    for (index, message) in messages.iter().enumerate() {
-        if let AgentMessage::ToolResult(result) = message {
-            result_index
-                .entry(result.tool_call_id.as_str())
-                .or_insert(index);
-        }
-    }
-
-    // Results already emitted next to their assistant; the main loop skips them
-    // when it reaches their original position.
-    let mut consumed = vec![false; messages.len()];
-    let mut out = Vec::with_capacity(messages.len());
-    for (index, message) in messages.iter().enumerate() {
-        if consumed[index] {
-            continue;
-        }
-        match message {
-            AgentMessage::Assistant(assistant) => {
-                out.push(message.clone());
-                for content in &assistant.content {
-                    if let Content::ToolCall(call) = content {
-                        if let Some(&result_at) = result_index.get(call.id.as_str()) {
-                            if !consumed[result_at] {
-                                consumed[result_at] = true;
-                                out.push(messages[result_at].clone());
-                            }
-                        }
-                    }
-                }
-            }
-            _ => out.push(message.clone()),
-        }
-    }
-    out
 }
 
 /// The harness converter. It moves tool results next to their assistant and
@@ -434,7 +379,6 @@ fn ensure_tool_results_adjacent(messages: Vec<AgentMessage>) -> Vec<AgentMessage
 /// custom roles as user text and passes through normal user/assistant/tool-result
 /// messages.
 pub fn convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
-    let messages = ensure_tool_results_adjacent(messages);
     let (messages, report) = repair_orphaned_tool_calls(messages);
     if !report.repaired_call_ids.is_empty() {
         tracing::warn!(
@@ -574,6 +518,97 @@ mod tests {
         let (repaired, report) = repair_orphaned_tool_calls(messages.clone());
         assert!(report.is_empty());
         assert_eq!(repaired, messages);
+    }
+
+    #[test]
+    fn repair_keeps_parallel_results_and_missing_results_before_interleaved_context() {
+        let context = AgentMessage::User(UserMessage::new("injected", 0));
+        let (out, report) = repair_orphaned_tool_calls(vec![
+            assistant_with_calls(&[("a", "read"), ("b", "write"), ("c", "bash")]),
+            context.clone(),
+            tool_result("b", "write"),
+            tool_result("a", "read"),
+        ]);
+        assert_eq!(report.repaired_call_ids, vec!["c"]);
+        assert!(
+            matches!(&out[1], AgentMessage::ToolResult(t) if t.tool_call_id == "b" && !t.is_error)
+        );
+        assert!(
+            matches!(&out[2], AgentMessage::ToolResult(t) if t.tool_call_id == "a" && !t.is_error)
+        );
+        assert!(
+            matches!(&out[3], AgentMessage::ToolResult(t) if t.tool_call_id == "c" && t.is_error)
+        );
+        assert_eq!(out[4], context);
+        let (again, report) = repair_orphaned_tool_calls(out.clone());
+        assert_eq!(again, out);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn repair_does_not_steal_a_reused_id_from_a_later_assistant() {
+        let (out, report) = repair_orphaned_tool_calls(vec![
+            assistant_with_calls(&[("same", "read")]),
+            AgentMessage::User(UserMessage::new("next turn", 0)),
+            assistant_with_calls(&[("same", "write")]),
+            tool_result("same", "write"),
+        ]);
+        assert_eq!(report.repaired_call_ids, vec!["same"]);
+        assert!(
+            matches!(&out[1], AgentMessage::ToolResult(t) if t.tool_name == "read" && t.is_error)
+        );
+        assert!(
+            matches!(&out[4], AgentMessage::ToolResult(t) if t.tool_name == "write" && !t.is_error)
+        );
+    }
+
+    #[test]
+    fn repair_preserves_valid_reused_ids_and_omits_duplicate_or_backward_results() {
+        let history = vec![
+            assistant_with_calls(&[("same", "read")]),
+            tool_result("same", "read"),
+            assistant_with_calls(&[("same", "write")]),
+            tool_result("same", "write"),
+        ];
+        let (out, report) = repair_orphaned_tool_calls(history.clone());
+        assert_eq!(out, history);
+        assert!(report.is_empty());
+        let (out, report) = repair_orphaned_tool_calls(vec![
+            tool_result("a", "read"),
+            assistant_with_calls(&[("a", "read")]),
+            tool_result("a", "read"),
+            tool_result("a", "read"),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert!(report.is_empty());
+    }
+
+    #[test]
+    fn repair_moves_image_content_without_copying_its_payload() {
+        let image = rpi_ai::types::ImageContent {
+            kind: rpi_ai::types::ImageContentType,
+            data: "large image".repeat(1024),
+            mime_type: "image/png".into(),
+        };
+        let original_pointer = image.data.as_ptr();
+        let (out, _) = repair_orphaned_tool_calls(vec![
+            assistant_with_calls(&[("a", "read")]),
+            AgentMessage::User(UserMessage::new(
+                UserContent::Blocks(vec![Content::Image(image)]),
+                0,
+            )),
+            tool_result("a", "read"),
+        ]);
+        let AgentMessage::User(user) = &out[2] else {
+            panic!("user")
+        };
+        let UserContent::Blocks(content) = &user.content else {
+            panic!("blocks")
+        };
+        let Content::Image(image) = &content[0] else {
+            panic!("image")
+        };
+        assert_eq!(image.data.as_ptr(), original_pointer);
     }
 
     #[test]

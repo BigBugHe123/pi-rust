@@ -362,12 +362,18 @@ impl UiDialogMailbox {
 /// exhaustive switch that connects the FFI id to the method.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
-    /// `SendMessage` — drive a full agent run from an assistant/user message.
+    /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
+    /// Defaults append while idle and steer while running; explicit `true`
+    /// starts an idle run, `false` only updates context, and `nextTurn` waits
+    /// for a new explicit prompt. Results distinguish appended/queued/run.
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SendUserMessage` — drive a run from a user-text message.
     async fn send_user_message(&self, args: serde_json::Value)
         -> Result<serde_json::Value, String>;
-    /// `AppendEntry` — append a raw entry to the session transcript (no run).
+    /// `AppendEntry` — append without starting a run. `customType`/`data`
+    /// persists extension data only. A `message` is durably queued during an
+    /// operation and committed after its current turn; the returned `entryId`
+    /// is reserved and may not yet resolve to a transcript entry.
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
     /// `SetSessionName` — set the session's display name.
     async fn set_session_name(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
@@ -1051,11 +1057,10 @@ mod tests {
         );
         let vtable = owner.build_vtable();
         let claim = r#"{"ownsStdio":true}"#;
-        unsafe {
-            crate::set_current_api(&owner);
+        {
+            let _registration = crate::enter_current_api(&owner);
+            assert_eq!(vtable.declare.unwrap()(StbStringRef::from_str(claim)), 0);
         }
-        assert_eq!(vtable.declare.unwrap()(StbStringRef::from_str(claim)), 0);
-        crate::clear_current_api();
         let other_vtable = other.build_vtable();
         let finish = StbStringRef::from_str(r#"{"op":"finish","exitCode":7}"#);
         let mut out = StbString::empty();
@@ -1069,7 +1074,8 @@ mod tests {
             ),
             1
         );
-        (other_vtable.free_string)(out);
+        // SAFETY: the action returned a live allocation from this vtable.
+        unsafe { (other_vtable.free_string)(out) };
         assert_eq!(
             (vtable.runtime_action)(
                 RuntimeActionId::StdioLifecycle as u32,
@@ -1079,16 +1085,16 @@ mod tests {
             ),
             0
         );
-        (vtable.free_string)(out);
+        // SAFETY: the action returned a live allocation from this vtable.
+        unsafe { (vtable.free_string)(out) };
         assert_eq!(master.stdio_lifecycle().wait().await, 7);
-        unsafe {
-            crate::set_current_api(&other);
+        {
+            let _registration = crate::enter_current_api(&other);
+            assert_ne!(
+                other_vtable.declare.unwrap()(StbStringRef::from_str(claim)),
+                0
+            );
         }
-        assert_ne!(
-            other_vtable.declare.unwrap()(StbStringRef::from_str(claim)),
-            0
-        );
-        crate::clear_current_api();
         assert!(master
             .stdio_lifecycle()
             .validate()
@@ -1221,10 +1227,13 @@ mod tests {
         assert_eq!(rc, 0, "success return code");
 
         // Read the result JSON back + reclaim the host-owned StbString.
-        let json_text = out.to_string_lossy();
+        // SAFETY: the action wrote a live host-owned output, freed below.
+        let json_text = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        }
+        .to_string_lossy();
         let parsed: serde_json::Value = serde_json::from_str(&json_text).expect("valid json");
         assert_eq!(parsed["prompt"], "hello from host");
-        crate::host_free_string(out);
 
         // The host saw exactly the one action. `host_for_assert` is a clone of
         // the `Arc<MockHost>` kept before it was coerced to the trait object.
@@ -1259,11 +1268,16 @@ mod tests {
         );
         assert_eq!(rc, 0, "success return code");
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(&out.to_string_lossy()).expect("valid json");
+        // SAFETY: the action wrote a live host-owned output, freed below.
+        let parsed: serde_json::Value = serde_json::from_str(
+            &unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy(),
+        )
+        .expect("valid json");
         assert_eq!(parsed["ok"], serde_json::json!(true));
         assert_eq!(parsed["chars"], serde_json::json!(10));
-        crate::host_free_string(out);
 
         // The queued edit is what the host will apply to the prompt editor.
         let edit = mailbox.take_pending().expect("queued edit");
@@ -1323,7 +1337,10 @@ mod tests {
         // The callback ran once; the host's `reload` did NOT.
         assert_eq!(reload_calls.load(Ordering::SeqCst), 1);
         assert!(host_for_assert.saw.lock().unwrap().is_empty());
-        crate::host_free_string(out);
+        // SAFETY: this action returned a live host allocation, not previously freed.
+        drop(unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        });
     }
 
     /// B5d: an invalidated bridge rejects `runtime_action` with a stale-bridge
@@ -1356,12 +1373,16 @@ mod tests {
         );
         // Nonzero (error), and the host method never ran (no dispatch).
         assert_eq!(rc, 1, "stale bridge ⇒ error return code");
-        let json_text = out.to_string_lossy();
+        // SAFETY: the action wrote a live host-owned output, freed below.
+        let json_text = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        }
+        .to_string_lossy();
         assert!(
             json_text.contains("stale"),
             "stale-bridge error payload: {json_text}"
         );
-        crate::host_free_string(out);
+
         assert!(
             host_for_assert.saw.lock().unwrap().is_empty(),
             "host dispatch must NOT run on a stale bridge"
@@ -1388,10 +1409,15 @@ mod tests {
         );
 
         assert_eq!(rc, 2, "unknown action id must be a protocol error");
-        let payload: serde_json::Value =
-            serde_json::from_str(&out.to_string_lossy()).expect("structured error JSON");
+        let payload: serde_json::Value = serde_json::from_str(
+            &unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy(),
+        )
+        .expect("structured error JSON");
         assert_eq!(payload["error"], "unknown runtime action id 4294967294");
-        crate::host_free_string(out);
+
         assert!(
             host_for_assert.saw.lock().unwrap().is_empty(),
             "unknown action id must not reach host dispatch"
@@ -1419,7 +1445,10 @@ mod tests {
             ),
             0
         );
-        crate::host_free_string(v2_out);
+        // SAFETY: this action returned a live host allocation, not previously freed.
+        drop(unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(v2_out, Some(crate::host_free_string))
+        });
 
         assert_eq!(
             *host_for_assert.saw.lock().unwrap(),
@@ -1597,15 +1626,19 @@ mod tests {
             user_data,
         );
         assert_eq!(rc, 1);
-        let payload: serde_json::Value =
-            serde_json::from_str(&out.to_string_lossy()).expect("structured error JSON");
+        let payload: serde_json::Value = serde_json::from_str(
+            &unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            }
+            .to_string_lossy(),
+        )
+        .expect("structured error JSON");
         assert!(
             payload["error"]
                 .as_str()
                 .is_some_and(|error| error.contains("interactive UI")),
             "unexpected payload: {payload}"
         );
-        crate::host_free_string(out);
 
         // A genuinely unknown id is still rejected (no silent acceptance).
         // 23 is one past the highest defined action.
@@ -1614,7 +1647,10 @@ mod tests {
             trampoline_runtime_action(23, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
-        crate::host_free_string(out);
+        // SAFETY: this action returned a live host allocation, not previously freed.
+        drop(unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        });
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1640,7 +1676,10 @@ mod tests {
                 ),
                 0
             );
-            crate::host_free_string(out);
+            // SAFETY: this action returned a live host allocation, not previously freed.
+            drop(unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+            });
         }
         assert_eq!(mailbox.panels().len(), 2);
         drop(a);
@@ -1677,7 +1716,10 @@ mod tests {
         );
         assert_eq!(rc, 0);
         assert_eq!(status.text(), "langfuse ✓ (trace sent)");
-        crate::host_free_string(out);
+        // SAFETY: this action returned a live host allocation, not previously freed.
+        drop(unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        });
 
         // Clearing through the same action empties the line again.
         let mut out = StbString::empty();
@@ -1691,7 +1733,10 @@ mod tests {
             0
         );
         assert_eq!(status.text(), "");
-        crate::host_free_string(out);
+        // SAFETY: this action returned a live host allocation, not previously freed.
+        drop(unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        });
 
         // A missing key is a host-level error (rc=1), not an unknown action.
         let mut out = StbString::empty();
@@ -1699,7 +1744,10 @@ mod tests {
             trampoline_runtime_action(18, StbStringRef::from_str("{}"), &mut out, user_data),
             1
         );
-        crate::host_free_string(out);
+        // SAFETY: this action returned a live host allocation, not previously freed.
+        drop(unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
+        });
     }
 }
 

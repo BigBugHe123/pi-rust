@@ -9,6 +9,8 @@
 //! Telemetry in the TS source is a thin span/attribute layer used opportunistically;
 //! we port only the surface downstream crates actually touch.
 
+#![forbid(unsafe_code)]
+
 pub mod context;
 pub mod noop;
 pub mod production;

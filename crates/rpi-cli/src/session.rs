@@ -2400,16 +2400,18 @@ pub(crate) async fn set_active_session(
     session: Session,
     tool_context: Option<&rpi_extensions::ToolCallContext>,
 ) -> Result<(), String> {
-    if let Ok(metadata) = session.get_metadata().await {
+    let metadata = session.get_metadata().await.ok();
+    harness
+        .set_session(session)
+        .await
+        .map_err(|e| e.to_string())?;
+    if let Some(metadata) = metadata {
         std::env::set_var(rpi_plugin_sdk::SESSION_ID_ENV, &metadata.id);
         if let Some(context) = tool_context {
             context.set_session_id(metadata.id);
         }
     }
-    harness
-        .set_session(session)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(())
 }
 
 /// Fork the harness's current session into a new JSONL session (new id, parent
@@ -3770,8 +3772,17 @@ mod tests {
     async fn reload_shutdown_joins_all_handlers_even_after_veto() {
         use rpi_plugin_sdk::{EventTag, StablePluginEvent};
         use std::sync::atomic::AtomicUsize;
+        static CONTEXTS: rpi_plugin_sdk::handles::ToolHandles<Arc<AtomicUsize>> =
+            rpi_plugin_sdk::handles::ToolHandles::new();
+        struct ContextOwner(usize);
+        impl Drop for ContextOwner {
+            fn drop(&mut self) {
+                drop(CONTEXTS.remove(self.0 as rpi_plugin_sdk::StepHandle));
+            }
+        }
         extern "C" fn stop(_: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
-            let calls = unsafe { &*(data as *const AtomicUsize) };
+            let context = CONTEXTS.get(data).expect("live test context");
+            let calls = context.lock().clone();
             std::thread::sleep(std::time::Duration::from_millis(20));
             if calls.fetch_add(1, Ordering::SeqCst) == 0 {
                 rpi_plugin_sdk::EVENT_HANDLER_ABORT
@@ -3779,15 +3790,12 @@ mod tests {
                 0
             }
         }
-        let calls = AtomicUsize::new(0);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let context = CONTEXTS.insert(calls.clone());
+        let _owner = ContextOwner(context as usize);
         let mut registry = rpi_extensions::ExtensionRegistry::new();
         for name in ["first", "second"] {
-            registry.register_event_handler(
-                name.into(),
-                EventTag::SessionShutdown,
-                stop,
-                &calls as *const _ as *mut std::ffi::c_void,
-            );
+            registry.register_event_handler(name.into(), EventTag::SessionShutdown, stop, context);
         }
         super::shutdown_extensions_for_reload(
             Some(Arc::new(registry.snapshot())),

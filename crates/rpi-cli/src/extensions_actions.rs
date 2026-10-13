@@ -11,8 +11,8 @@
 //! string, the right behavior (a plugin can't re-enter an active run).
 //!
 //! 6 non-lane ops:
-//! - `append_entry`/`set_session_name` → `harness.session().append_message`/
-//!   `set_name`.
+//! - `append_entry` → the harness's boundary-aware message writer, or raw
+//!   extension data on the session; `set_session_name` → `set_name`.
 //! - `get_system_prompt` → `AgentHarness::get_system_prompt` (B5a accessor).
 //! - `new_session`/`fork`/`switch_session` → reuse `crate::session`'s
 //!   create/fork/open helpers + `harness.set_session`.
@@ -43,9 +43,12 @@ use std::sync::{Arc, OnceLock};
 
 use rpi_ai::types::ThinkingLevel;
 use rpi_extensions::RuntimeActionHost;
-use rpi_harness::agent_harness::{AgentHarness, HarnessRunOutcome, NavigationOutcome};
+use rpi_harness::agent_harness::{
+    AgentHarness, HarnessRunOutcome, NavigationOutcome, SendMessageResult,
+};
 use rpi_harness::session::session::Session;
 use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
+use rpi_harness::types::SendMessageOptions;
 use tokio::runtime::Handle;
 
 use crate::session::{default_session_dir, open_session_by_id};
@@ -235,6 +238,94 @@ fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
     }
 }
 
+/// Accept the SDK's flat action args and Pi-style nested options. Reject mixed
+/// forms instead of silently choosing one set of scheduling instructions.
+fn send_message_options(args: &serde_json::Value) -> Result<SendMessageOptions, String> {
+    let flat = args.get("triggerTurn").is_some() || args.get("deliverAs").is_some();
+    let value = if let Some(options) = args.get("options").filter(|value| !value.is_null()) {
+        if !options.is_object() {
+            return Err("send_message options must be an object".into());
+        }
+        if flat {
+            return Err(
+                "put triggerTurn/deliverAs either in options or at the top level, not both".into(),
+            );
+        }
+        options.clone()
+    } else {
+        let mut fields = serde_json::Map::new();
+        for key in ["triggerTurn", "deliverAs"] {
+            if let Some(value) = args.get(key) {
+                fields.insert(key.into(), value.clone());
+            }
+        }
+        serde_json::Value::Object(fields)
+    };
+    serde_json::from_value(value).map_err(|error| format!("invalid send_message options: {error}"))
+}
+
+fn send_message_input(args: &serde_json::Value) -> Result<rpi_agent::AgentMessage, String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    if let Some(message) = args.get("message") {
+        if message.get("kind").is_some() {
+            return serde_json::from_value(message.clone())
+                .map_err(|error| format!("invalid message: {error}"));
+        }
+        // Pi's custom message input does not include the stored AgentMessage
+        // discriminator. Preserve customType/display/details via its constructor.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CustomInput {
+            custom_type: String,
+            #[serde(default)]
+            content: Option<rpi_ai::types::UserContent>,
+            #[serde(default)]
+            display: bool,
+            #[serde(default)]
+            details: Option<serde_json::Value>,
+        }
+        let input: CustomInput = serde_json::from_value(message.clone())
+            .map_err(|error| format!("invalid custom message: {error}"))?;
+        return Ok(rpi_harness::messages::create_custom_message(
+            &input.custom_type,
+            input
+                .content
+                .unwrap_or(rpi_ai::types::UserContent::Blocks(Vec::new())),
+            input.display,
+            input.details,
+            timestamp,
+        ));
+    }
+    let text =
+        arg_str(args, "text").map_err(|_| "missing `message` or `text` field".to_string())?;
+    Ok(rpi_agent::AgentMessage::User(
+        rpi_ai::types::UserMessage::new(text, timestamp),
+    ))
+}
+
+fn send_message_result(result: SendMessageResult) -> serde_json::Value {
+    match result {
+        SendMessageResult::Appended { entry_id } => {
+            serde_json::json!({"status":"appended", "entryId":entry_id})
+        }
+        SendMessageResult::Queued { entry_id, queue } => {
+            if queue == rpi_harness::session::types::QueueKind::Context {
+                return serde_json::json!({"status":"queued", "entryId":entry_id, "queue":"context"});
+            }
+            let delivery = match queue {
+                rpi_harness::session::types::QueueKind::NextRun => "nextTurn",
+                _ => queue.as_str(),
+            };
+            serde_json::json!({"status":"queued", "entryId":entry_id, "deliverAs":delivery})
+        }
+        SendMessageResult::Run(run) => run_outcome_json(run.outcome),
+    }
+}
+
 /// Extract the concatenated text from an assistant message (the `text` blocks).
 fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
     msg.content
@@ -257,26 +348,14 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
-        // `{"message": <AgentMessage json>}` — drive a full run from any message
-        // kind. Falls back to `{"text": "..."}` as a user-text shorthand.
+        let options = send_message_options(&args)?;
+        let message = send_message_input(&args)?;
         let lane = self.harness()?.lane("main");
-        if let Some(text) = arg_str_opt(&args, "text") {
-            let result = lane
-                .prompt_text(&text, Vec::new())
-                .await
-                .map_err(|e| e.to_string())?;
-            return Ok(run_outcome_json(result.outcome));
-        }
-        let msg = args
-            .get("message")
-            .ok_or_else(|| "missing `message` or `text` field".to_string())?;
-        let message: rpi_agent::AgentMessage =
-            serde_json::from_value(msg.clone()).map_err(|e| format!("invalid message: {e}"))?;
         let result = lane
-            .prompt_message(message)
+            .send_message(message, options)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(run_outcome_json(result.outcome))
+        Ok(send_message_result(result))
     }
 
     async fn send_user_message(
@@ -295,7 +374,9 @@ impl RuntimeActionHost for HarnessActionHost {
     async fn append_entry(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         // `{"message": <AgentMessage json>}` appends a message entry; OR
         // `{"customType": "...", "data": {...}}` appends a custom entry. No run
-        // is driven — the entry lands in the transcript only.
+        // is driven. Messages use the harness boundary writer, whose entry id
+        // may be reserved until the current turn settles. Custom data stays out
+        // of model context unless a caller explicitly configures a projector.
         if let Some(custom_type) = arg_str_opt(&args, "customType") {
             let data = args.get("data").cloned();
             let id = self
@@ -313,7 +394,6 @@ impl RuntimeActionHost for HarnessActionHost {
             serde_json::from_value(msg.clone()).map_err(|e| format!("invalid message: {e}"))?;
         let id = self
             .harness()?
-            .session()
             .append_message(message)
             .await
             .map_err(|e| e.to_string())?;
@@ -503,5 +583,85 @@ impl RuntimeActionHost for HarnessActionHost {
         // B5d wires the reload callback at the bridge layer; this host impl is
         // the "not configured" fallback.
         Err("reload not configured (no /reload callback on this bridge)".to_string())
+    }
+}
+
+#[cfg(test)]
+mod send_message_tests {
+    use super::*;
+    use rpi_harness::types::MessageDelivery;
+
+    #[test]
+    fn options_accept_flat_and_nested_forms_with_pi_defaults() {
+        assert_eq!(
+            send_message_options(&serde_json::json!({"text":"context"})).unwrap(),
+            SendMessageOptions::default()
+        );
+        let expected = SendMessageOptions {
+            trigger_turn: Some(false),
+            deliver_as: MessageDelivery::FollowUp,
+        };
+        for args in [
+            serde_json::json!({"text":"context", "triggerTurn":false, "deliverAs":"followUp"}),
+            serde_json::json!({"text":"context", "options":{"triggerTurn":false, "deliverAs":"followUp"}}),
+        ] {
+            assert_eq!(send_message_options(&args).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn options_reject_invalid_or_ambiguous_scheduling_instructions() {
+        for args in [
+            serde_json::json!({"triggerTurn":"false"}),
+            serde_json::json!({"deliverAs":"follow-up"}),
+            serde_json::json!({"options":{"typo":true}}),
+            serde_json::json!({"options":[], "text":"context"}),
+            serde_json::json!({"options":{"triggerTurn":true}, "triggerTurn":false}),
+        ] {
+            assert!(send_message_options(&args).is_err(), "{args}");
+        }
+    }
+
+    #[test]
+    fn pi_custom_input_preserves_content_and_display_metadata() {
+        let message = send_message_input(&serde_json::json!({"message":{
+            "customType":"goal", "content":"goal state", "display":true, "details":{"step":2}
+        }}))
+        .unwrap();
+        let rpi_agent::AgentMessage::Custom(custom) = &message else {
+            panic!("custom")
+        };
+        assert_eq!(
+            custom.content,
+            vec![rpi_ai::types::Content::text("goal state")]
+        );
+        let data = rpi_harness::messages::custom_data(&message).unwrap();
+        assert_eq!(data.custom_type, "goal");
+        assert!(data.display);
+        assert_eq!(data.details, Some(serde_json::json!({"step":2})));
+        // The existing stored AgentMessage input remains supported.
+        let stored = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            send_message_input(&serde_json::json!({"message":stored})).unwrap(),
+            message
+        );
+    }
+
+    #[test]
+    fn missing_custom_content_is_empty_and_queued_results_use_pi_delivery_names() {
+        let message = send_message_input(
+            &serde_json::json!({"message":{"customType":"goal", "content":null}}),
+        )
+        .unwrap();
+        assert!(
+            matches!(message, rpi_agent::AgentMessage::Custom(custom) if custom.content.is_empty())
+        );
+        assert_eq!(
+            send_message_result(SendMessageResult::Queued {
+                entry_id: "reserved".into(),
+                queue: rpi_harness::session::types::QueueKind::NextRun,
+            }),
+            serde_json::json!({"status":"queued", "entryId":"reserved", "deliverAs":"nextTurn"})
+        );
     }
 }

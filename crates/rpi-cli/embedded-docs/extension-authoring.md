@@ -92,6 +92,49 @@ rpi_plugin_sdk::export_plugin!(|api| {
 返回结构化错误，不会进入分发。runtime action 使用 SDK 的 `RuntimeActionId`
 定义（含 `GetCliFlag`、`UiDialog`），不要自行假定数字范围。
 
+### 运行期间追加上下文
+
+`AppendEntry` 的 `{"customType": "...", "data": {...}}` 形式只保存扩展数据；
+默认不进入模型上下文。`{"message": <AgentMessage>}` 形式追加会话消息，但不
+触发新一轮模型回复。运行期间消息先进入持久化队列，等当前轮的全部工具结果
+提交后再写入历史并展示，下一次模型请求才能读取。
+
+返回的 `entryId` 是稳定的保留 ID；排队期间查询该 entry 可能为空。工具内部
+可以等待 `AppendEntry` 返回，它不会等待工具或整个运行结束。取消和会话恢复
+不会丢弃已经接受的排队消息。
+
+### SendMessage 的投递选项
+
+`SendMessage` 接受原有 `{"message": <AgentMessage>}` / `{"text": "..."}`，
+也接受 Pi 的自定义消息形状：`customType`、`content`、`display`、`details`。
+`content` 可以是字符串或文本/图片块数组；缺失或 null 会归一化为空数组。
+
+选项可以放在 `options` 对象中，也可以放在参数顶层；两种形式不要混用：
+
+```json
+{
+  "message": {"customType": "goal-state", "content": "目标状态已更新", "display": true},
+  "options": {"triggerTurn": false}
+}
+```
+
+| 选项 | 行为 |
+| --- | --- |
+| 不传 `triggerTurn` | 空闲时只追加上下文；运行时默认进入 steering 队列 |
+| `triggerTurn: true` | 空闲时发起模型运行；运行时按 `deliverAs` 排队 |
+| `triggerTurn: false` | 只更新上下文，运行时等当前工具批次结束后提交；不主动追加模型回复 |
+| `deliverAs: "steer"` | 默认模式，在当前工具批次结束后注入 |
+| `deliverAs: "followUp"` | 当前任务完成后注入，再继续处理 |
+| `deliverAs: "nextTurn"` | 留到下一次显式发起的运行，在新输入之前加入；优先于 `triggerTurn` |
+
+返回值区分 `status: "appended"`、`status: "queued"` 和原有运行结果状态。
+追加和排队返回稳定的 `entryId`；排队消息提交前查询 entry 可能为空。
+排队结果中的 `deliverAs` 表示投递方式；静默上下文更新返回 `queue: "context"`。
+steering/follow-up 不会重入正在执行的工具，`nextTurn` 也不会被自动恢复运行提前消费。
+
+默认空闲发送现在与 Pi 一致，不再自动请求模型。原来依赖默认发送立即回复的
+调用，应显式传 `triggerTurn: true`。
+
 ## 4. 工具生命周期：execute → poll → cancel → destroy
 
 工具导出四个 `extern "C"` 函数，宿主按固定协议驱动：

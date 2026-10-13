@@ -57,7 +57,7 @@ On **Windows (x64)**, run in PowerShell 5.1 or later:
 Verifies the published SHA-256 checksum and installs to
 `$env:LOCALAPPDATA\Programs\rpi`. Follow the printed instructions to add it to
 PATH, then run `rpi --version`. Append `-DryRun` to preview, or use
-`-Version 0.3.21` and `-Dir 'C:\Tools\rpi'` to select a version and directory.
+`-Version 0.3.22` and `-Dir 'C:\Tools\rpi'` to select a version and directory.
 
 **From crates.io** (requires Rust 1.78+):
 
@@ -319,7 +319,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 
 | | |
 | --- | --- |
-| Current release | **[0.3.21](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
+| Current release | **[0.3.22](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
 | MSRV | 1.78 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
