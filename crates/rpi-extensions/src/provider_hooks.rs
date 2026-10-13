@@ -292,7 +292,7 @@ fn user_content_image_count(content: &UserContent) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rpi_plugin_sdk::{EventTag, StablePluginEvent};
+    use rpi_plugin_sdk::EventTag;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
@@ -300,22 +300,19 @@ mod tests {
     static PROVIDER_LOCK: Mutex<()> = Mutex::new(());
     static CAPTURED: Mutex<Vec<(EventTag, String)>> = Mutex::new(Vec::new());
 
-    extern "C" fn capture_handler(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
-        let payload = unsafe { ev.payload.data.data.to_string_lossy() };
-        CAPTURED.lock().unwrap().push((ev.tag, payload));
+    rpi_plugin_sdk::event_handler! { fn capture_handler(ev, _ud) {
+        let payload = ev.data_text().unwrap_or_default();
+        CAPTURED.lock().unwrap().push((ev.tag(), payload));
         0
-    }
+    } }
 
-    extern "C" fn counting_provider_handler(
-        ev: StablePluginEvent,
-        _ud: *mut std::ffi::c_void,
-    ) -> i32 {
+    rpi_plugin_sdk::event_handler! { fn counting_provider_handler(ev, _ud) {
         // Count every dispatch on the subscribed tags (BeforeProviderRequest +
         // BeforeProviderHeaders). The `model` check validates the request-event
         // payload shape separately — it must NOT gate the count, or the headers
         // event (whose payload is `{"headers":...}` with no `model` key) would
         // be silently dropped and the fan-out count would be wrong.
-        let s = unsafe { ev.payload.data.data.to_string_lossy() };
+        let s = ev.data_text().unwrap_or_default();
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
             // The request event carries `model`; the headers event does not.
             // Both are valid dispatches — count unconditionally, and sanity-check
@@ -326,7 +323,7 @@ mod tests {
             PROVIDER_HITS.fetch_add(1, Ordering::SeqCst);
         }
         0
-    }
+    } }
 
     /// `before_agent_start` fires once per NEW user prompt (not once per
     /// provider call in a run), and the request payload carries the
@@ -499,25 +496,23 @@ mod tests {
 
     /// Handler that returns `<marker>` + whatever prompt it was handed, so a
     /// test can observe the chain by the markers accumulating in order.
-    extern "C" fn append_marker(
-        event_json: rpi_plugin_sdk::StbStringRef,
-        out: *mut rpi_plugin_sdk::StbString,
-        user_data: *mut std::ffi::c_void,
+    fn append_marker(
+        envelope: &str,
+        out: &mut rpi_plugin_sdk::callbacks::Output<'_>,
+        marker: &str,
     ) -> i32 {
-        // SAFETY: host guarantees the ref for this call; the marker arrives as
-        // `user_data` (a `&'static str` the test leaked).
-        let envelope = unsafe { event_json.as_str() };
-        let marker = unsafe { &*(user_data as *const &'static str) };
         let current = serde_json::from_str::<serde_json::Value>(envelope)
             .ok()
             .and_then(|v| v.get("systemPrompt")?.as_str().map(str::to_string))
             .unwrap_or_default();
         let json = serde_json::json!({ "systemPrompt": format!("{current}{marker}") });
-        unsafe {
-            *out = rpi_plugin_sdk::StbString::from_string(json.to_string());
-        }
-        0
+        i32::from(!out.write(json.to_string()))
     }
+
+    rpi_plugin_sdk::string_handler! { fn append_a(input, out, _data) { append_marker(input, out, " A") } }
+    rpi_plugin_sdk::string_handler! { fn append_b(input, out, _data) { append_marker(input, out, " B") } }
+    rpi_plugin_sdk::string_handler! { fn append_after(input, out, _data) { append_marker(input, out, " AFTER") } }
+    rpi_plugin_sdk::string_handler! { fn append_mark(input, out, _data) { append_marker(input, out, " MARK") } }
 
     /// Handler that declines to change anything (empty object ⇒ no-op).
     extern "C" fn declines(
@@ -558,19 +553,16 @@ mod tests {
     /// prompt an earlier one set), and it is what makes "append" composable.
     #[test]
     fn prompt_transformers_chain_in_registration_order() {
-        let a: &'static str = " A";
-        let b: &'static str = " B";
-        let leak = |s: &'static str| Box::leak(Box::new(s)) as *mut &'static str as *mut _;
         let hooks = hooks_with(vec![
             crate::registry::BeforeAgentStartHandler {
-                handler: append_marker,
-                plugin_free_string: noop_free,
-                user_data: leak(a),
+                handler: append_a,
+                plugin_free_string: test_free,
+                user_data: std::ptr::null_mut(),
             },
             crate::registry::BeforeAgentStartHandler {
-                handler: append_marker,
-                plugin_free_string: noop_free,
-                user_data: leak(b),
+                handler: append_b,
+                plugin_free_string: test_free,
+                user_data: std::ptr::null_mut(),
             },
         ]);
 
@@ -602,18 +594,16 @@ mod tests {
     /// the run or discard earlier results).
     #[test]
     fn a_failing_transformer_is_skipped_and_the_chain_continues() {
-        let after: &'static str = " AFTER";
-        let leaked = Box::leak(Box::new(after)) as *mut &'static str as *mut _;
         let hooks = hooks_with(vec![
             crate::registry::BeforeAgentStartHandler {
                 handler: fails,
-                plugin_free_string: noop_free,
+                plugin_free_string: test_free,
                 user_data: std::ptr::null_mut(),
             },
             crate::registry::BeforeAgentStartHandler {
-                handler: append_marker,
-                plugin_free_string: noop_free,
-                user_data: leaked,
+                handler: append_after,
+                plugin_free_string: test_free,
+                user_data: std::ptr::null_mut(),
             },
         ]);
 
@@ -647,7 +637,7 @@ mod tests {
     fn declining_transformers_leave_the_prompt_untouched() {
         let hooks = hooks_with(vec![crate::registry::BeforeAgentStartHandler {
             handler: declines,
-            plugin_free_string: noop_free,
+            plugin_free_string: test_free,
             user_data: std::ptr::null_mut(),
         }]);
         let model = rpi_ai::Model::new(
@@ -685,10 +675,7 @@ mod tests {
         assert!(hooks.transform_context(&model, &ctx).is_none());
     }
 
-    /// Minimal free fn for handlers whose `out` is built by the SDK (they never
-    /// hand back a plugin allocation in these tests, but the registry requires
-    /// the field).
-    extern "C" fn noop_free(_s: rpi_plugin_sdk::StbString) {}
+    use rpi_plugin_sdk::callbacks::free_string as test_free;
 
     /// The `BeforeAgentStart` observer sees the **post-transform** prompt.
     ///
@@ -700,8 +687,6 @@ mod tests {
     /// silently change what every observer reports, with no other test failing.
     #[test]
     fn the_observer_sees_the_prompt_after_the_transform() {
-        let marker: &'static str = " MARK";
-        let leaked = Box::leak(Box::new(marker)) as *mut &'static str as *mut _;
         let _guard = PROVIDER_LOCK.lock().unwrap();
         CAPTURED.lock().unwrap().clear();
 
@@ -712,7 +697,7 @@ mod tests {
             capture_handler,
             std::ptr::null_mut(),
         );
-        registry.register_before_agent_start(append_marker, noop_free, leaked);
+        registry.register_before_agent_start(append_mark, test_free, std::ptr::null_mut());
         let hooks = ExtensionProviderHooks {
             snapshot: Arc::new(registry.snapshot()),
             _keepalive: Arc::new(crate::PluginKeepalive::new(Vec::new(), None)),

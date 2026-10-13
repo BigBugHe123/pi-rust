@@ -38,22 +38,24 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rpi_plugin_sdk::{
-    EventTag, FreeStringFn, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
-    StepResultTag, ToolPartialCb,
+    EventTag, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, StepResultTag,
+    ToolPartialCb,
 };
 // The provider/render fn signatures are referenced transitively by the
 // `register_provider`/`register_markdown_transformer` vtable slots (the host
 // passes our `extern "C" fn`s as `ProviderRequestFn`/`RenderFn`-typed params).
 // Naming the types here keeps the import live and documents the contract.
+use rpi_plugin_sdk::callbacks::free_string as plugin_free_string;
+use rpi_plugin_sdk::handles::ToolHandles;
 #[allow(unused_imports)]
 use rpi_plugin_sdk::{ProviderRequestFn, RenderFn};
 
 // ---------------------------------------------------------------------------
-// The echo tool's per-drive state — what execute() allocates and destroy() frees.
+// The echo tool's per-drive state — owned by the safe opaque-handle registry.
 // ---------------------------------------------------------------------------
 
 /// One echo drive. `polls` counts how many times `poll` was called; we return
-/// `Done` after one poll (echo is a single-shot tool — there's no real async
+/// `Done` after the second poll (echo is a single-shot tool — there's no real async
 /// work to drive). Kept slightly non-trivial so the bridge's poll loop + the
 /// partial-callback path are both touched.
 struct EchoDrive {
@@ -61,30 +63,19 @@ struct EchoDrive {
     polls: usize,
 }
 
+static ECHO_DRIVES: ToolHandles<EchoDrive> = ToolHandles::new();
+
 // ---------------------------------------------------------------------------
 // The echo tool's 4 lifecycle fns (extern "C", no captured state)
 // ---------------------------------------------------------------------------
 
-/// `execute(tool_call_id, params, free_params) -> StepHandle`.
-///
-/// `params` is an owning JSON string the host produced; the plugin frees it via
-/// the host's `free_params`. We parse out the `text` field (missing ⇒ empty),
-/// then allocate the drive state.
-extern "C" fn echo_execute(
-    _tool_call_id: StbStringRef,
-    params: StbString,
-    free_params: Option<FreeStringFn>,
-) -> StepHandle {
-    // Contain panics: unwinding out of this `extern "C"` fn would abort the
-    // whole host process. A null handle is reported by the host as "execute
-    // refused".
-    rpi_plugin_sdk::guard_or(std::ptr::null_mut(), || {
-        // Read + free the input params (host-produced → plugin frees via host fn).
-        let text = {
-            let s = params.to_string_lossy();
-            params.free_with(free_params);
-            s
-        };
+rpi_plugin_sdk::execute_handler! {
+    /// `execute(tool_call_id, params, free_params) -> StepHandle`.
+    ///
+    /// The SDK adopts host-owned parameters and reclaims them through the host's
+    /// `free_params`. Parse `text` (missing ⇒ empty), then allocate drive state.
+    fn echo_execute(_tool_call_id, params) {
+        let text = params.to_string_lossy();
         let parsed: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
         let value = parsed
@@ -92,12 +83,11 @@ extern "C" fn echo_execute(
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let drive = Box::new(EchoDrive {
+        ECHO_DRIVES.insert(EchoDrive {
             text: value,
             polls: 0,
-        });
-        Box::into_raw(drive) as StepHandle
-    })
+        })
+    }
 }
 
 /// `poll(handle, partial_cb, user_data) -> StepResult`. **Non-blocking.**
@@ -116,72 +106,62 @@ extern "C" fn echo_poll(
 ) -> StepResult {
     // Contain panics so a buggy poll reports a tool error instead of aborting
     // the host process.
-    rpi_plugin_sdk::guard_or(
-        StepResult::err(StbString::from_string(
-            r#"{"error":"echo poll panicked"}"#.to_string(),
-        )),
-        || {
-            // SAFETY: the host guarantees `handle` is the `*mut EchoDrive` we produced
-            // in execute(), valid until destroy().
-            let drive = unsafe { &mut *(handle as *mut EchoDrive) };
+    rpi_plugin_sdk::guard(|| {
+        let Some(entry) = ECHO_DRIVES.get(handle) else {
+            return StepResult::err(StbString::from_string(
+                r#"{"error":"invalid or destroyed echo handle"}"#.into(),
+            ));
+        };
+        if entry.cancelled.load(Ordering::Acquire) {
+            return StepResult::err(StbString::from_string(
+                r#"{"error":"echo cancelled"}"#.into(),
+            ));
+        }
+        let text = {
+            let mut drive = entry.lock();
             drive.polls += 1;
-
-            if drive.polls == 1 {
-                // Emit a partial progress result through the callback path.
-                if let Some(cb) = partial_cb {
-                    let progress = StbString::from_string(
-                        r#"{"content":[{"type":"text","text":"..."}]}"#.to_string(),
-                    );
-                    // The host frees the partial's StbString (it is plugin-produced here,
-                    // but the host's partial_cb_trampoline reclaims via host_free_string).
-                    cb(progress, user_data);
-                }
-                // Return Pending with empty inline progress (separate from the callback
-                // partial already sent). Empty StbString → the host skips it.
-                return StepResult::pending(StbString::empty());
+            (drive.polls > 1).then(|| drive.text.clone())
+        };
+        // Do not hold the state lock while calling back into the host.
+        let Some(text) = text else {
+            // Emit a partial progress result through the callback path.
+            if let Some(cb) = partial_cb {
+                let progress = StbString::from_string(
+                    r#"{"content":[{"type":"text","text":"..."}]}"#.to_string(),
+                );
+                // The host frees the partial's StbString (it is plugin-produced here,
+                // and the host reclaims it through our registered plugin_free_string).
+                cb(progress, user_data);
             }
+            // Return Pending with empty inline progress (separate from the callback
+            // partial already sent). Empty StbString → the host skips it.
+            return StepResult::pending(StbString::empty());
+        };
 
-            // Second poll: terminal Done with the echoed text.
-            let body = format!(
-                r#"{{"content":[{{"type":"text","text":"echo: {}"}}]}}"#,
-                escape_json_string(&drive.text)
-            );
-            StepResult::done(StbString::from_string(body))
-        },
-    )
+        // Second poll: terminal Done with the echoed text.
+        let body = format!(
+            r#"{{"content":[{{"type":"text","text":"echo: {}"}}]}}"#,
+            escape_json_string(&text)
+        );
+        StepResult::done(StbString::from_string(body))
+    })
+    .unwrap_or_else(|_| {
+        StepResult::err(StbString::from_string(
+            r#"{"error":"echo poll panicked"}"#.into(),
+        ))
+    })
 }
 
 /// `cancel(handle)`. Idempotent + thread-safe + does NOT free. Echo has nothing
-/// to cancel (it's two instant polls), so this is a no-op; we still must export
-/// it because the host requires all four fns.
-extern "C" fn echo_cancel(_handle: StepHandle) {}
-
-/// `destroy(handle)`. Frees the drive state. Idempotent (null ⇒ no-op). Called
-/// exactly once by the host's blocking driver.
-extern "C" fn echo_destroy(handle: StepHandle) {
-    if handle.is_null() {
-        return;
-    }
-    // SAFETY: handle is the `*mut EchoDrive` from execute(); the host calls
-    // destroy exactly once after the poll loop ends.
-    unsafe {
-        let _ = Box::from_raw(handle as *mut EchoDrive);
-    }
+/// to wait for; the next poll observes its cancellation flag.
+extern "C" fn echo_cancel(handle: StepHandle) {
+    ECHO_DRIVES.cancel(handle);
 }
 
-/// The plugin's own `free_string` for the [`StbString`]s it *produces* (the
-/// terminal `Done` result body, the partial progress). The host calls it to
-/// reclaim those. Idempotent on empty/null.
-extern "C" fn plugin_free_string(s: StbString) {
-    if s.is_empty() || s.ptr.is_null() {
-        return;
-    }
-    // SAFETY: we produced `s` via `StbString::from_string` (a `Box<[u8]>`); the
-    // ptr+len reconstruct the same allocation.
-    unsafe {
-        let slice = std::slice::from_raw_parts(s.ptr as *const u8, s.len);
-        let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
-    }
+/// `destroy(handle)`. Retires the token. Null or repeated calls are no-ops. Called
+/// exactly once by the host's blocking driver.
+extern "C" fn echo_destroy(handle: StepHandle) {
+    drop(ECHO_DRIVES.remove(handle));
 }
 
 // ---------------------------------------------------------------------------
@@ -249,34 +229,26 @@ pub extern "C" fn plugin_stub_discover_hits() -> usize {
 static DISCOVER_SKILL: &[u8] = b"plugin-stub-discovered/SKILL.md";
 static DISCOVER_HITS: AtomicUsize = AtomicUsize::new(0);
 
-/// `resources_discover(cwd, reason, out, user_data) -> i32`.
-///
-/// Receives `cwd` + `reason` (`"startup"` or `"reload"`) as borrowed
-/// [`StbStringRef`]s and writes a JSON `{skillPaths:[...]}` payload into the
-/// `out` [`StbString`] (plugin-owned; the host reclaims it via the
-/// `plugin_free_string` we handed the host at registration). Returns `0`.
-///
-/// The payload carries one skill path — a fixed marker string the host smoke
-/// test asserts appears in `emit_resources_discover`'s merged result. We model
-/// the real contract (a plugin hands back paths it discovered) without the
-/// plugin needing filesystem access at runtime.
-extern "C" fn on_resources_discover(
-    _cwd: rpi_plugin_sdk::StbStringRef,
-    _reason: rpi_plugin_sdk::StbStringRef,
-    out: *mut rpi_plugin_sdk::StbString,
-    _user_data: *mut c_void,
-) -> i32 {
-    rpi_plugin_sdk::guard_or(1, || {
+rpi_plugin_sdk::string_handler! {
+    /// `resources_discover(cwd, reason, out, user_data) -> i32`.
+    ///
+    /// Receives `cwd` + `reason` (`"startup"` or `"reload"`) as borrowed
+    /// [`StbStringRef`]s and writes a JSON `{skillPaths:[...]}` payload into the
+    /// `out` [`StbString`] (plugin-owned; the host reclaims it via the
+    /// `plugin_free_string` we handed the host at registration). Returns `0`.
+    ///
+    /// The payload carries one skill path — a fixed marker string the host smoke
+    /// test asserts appears in `emit_resources_discover`'s merged result. We model
+    /// the real contract (a plugin hands back paths it discovered) without the
+    /// plugin needing filesystem access at runtime.
+    fn on_resources_discover((_cwd, _reason), out, _user_data) {
         DISCOVER_HITS.fetch_add(1, Ordering::SeqCst);
         // Build the JSON payload the host parses. `skillPaths` only (prompt/theme
         // omitted — lenient host treats missing fields as empty).
         let path = std::str::from_utf8(DISCOVER_SKILL).unwrap_or("");
         let json = format!(r#"{{"skillPaths":["{}"]}}"#, path);
-        unsafe {
-            *out = StbString::from_string(json);
-        }
-        0
-    })
+        i32::from(!out.write(json))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -296,35 +268,26 @@ pub extern "C" fn plugin_stub_prompt_transform_hits() -> usize {
     PROMPT_TRANSFORM_HITS.load(Ordering::SeqCst)
 }
 
-/// `before_agent_start(event_json, out, user_data) -> i32`.
-///
-/// Reads `systemPrompt` out of the borrowed event envelope and writes back
-/// `{"systemPrompt": "<marker><original>"}` into the plugin-owned `out` the host
-/// reclaims. This is deliberately an **append** — pi's contract makes the return
-/// value a replacement, so a plugin that wants to add text must read the current
-/// prompt and concatenate it, which is exactly what this does. A test asserts
-/// both that the marker is present and that the original text survived, so a
-/// host that treated the return as a wholesale replacement (dropping the base
-/// prompt) would fail.
-extern "C" fn on_before_agent_start(
-    event_json: rpi_plugin_sdk::StbStringRef,
-    out: *mut rpi_plugin_sdk::StbString,
-    _user_data: *mut c_void,
-) -> i32 {
-    rpi_plugin_sdk::guard_or(1, || {
+rpi_plugin_sdk::string_handler! {
+    /// `before_agent_start(event_json, out, user_data) -> i32`.
+    ///
+    /// Reads `systemPrompt` out of the borrowed event envelope and writes back
+    /// `{"systemPrompt": "<marker><original>"}` into the plugin-owned `out` the host
+    /// reclaims. This is deliberately an **append** — pi's contract makes the return
+    /// value a replacement, so a plugin that wants to add text must read the current
+    /// prompt and concatenate it, which is exactly what this does. A test asserts
+    /// both that the marker is present and that the original text survived, so a
+    /// host that treated the return as a wholesale replacement (dropping the base
+    /// prompt) would fail.
+    fn on_before_agent_start(event_json, out, _user_data) {
         PROMPT_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
-        // SAFETY: the host guarantees the borrowed ref is valid for this call.
-        let envelope = unsafe { event_json.as_str() };
-        let current = serde_json::from_str::<serde_json::Value>(envelope)
+        let current = serde_json::from_str::<serde_json::Value>(event_json)
             .ok()
             .and_then(|v| v.get("systemPrompt")?.as_str().map(str::to_string))
             .unwrap_or_default();
         let json = serde_json::json!({ "systemPrompt": format!("{STUB_PROMPT_MARKER}{current}") });
-        unsafe {
-            *out = StbString::from_string(json.to_string());
-        }
-        0
-    })
+        i32::from(!out.write(json.to_string()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -342,28 +305,21 @@ pub extern "C" fn plugin_stub_provider_request_hits() -> usize {
     PROVIDER_REQUEST_HITS.load(Ordering::SeqCst)
 }
 
-/// The stub's `ProviderRequestFn`: `req_json` is a borrowed request envelope
-/// (`{model, context, options}`); `out` is an owning response we write a full
-/// assistant-message JSON into (the host parses it + reclaims it via our
-/// `plugin_free_string`). v1 one-shot: the stub returns the complete message as
-/// one terminal payload (the host's `PluggableProvider` emits it as a single
-/// `Done` chunk).
-///
-/// We return a canned text message so the round-trip has something concrete to
-/// assert (the model the host routes here is `stub-model` — see the smoke test).
-extern "C" fn on_provider_request(
-    _req_json: StbStringRef,
-    out: *mut StbString,
-    _user_data: *mut c_void,
-) -> i32 {
-    rpi_plugin_sdk::guard_or(1, || {
+rpi_plugin_sdk::string_handler! {
+    /// The stub's `ProviderRequestFn`: `req_json` is a borrowed request envelope
+    /// (`{model, context, options}`); `out` is an owning response we write a full
+    /// assistant-message JSON into (the host parses it + reclaims it via our
+    /// `plugin_free_string`). v1 one-shot: the stub returns the complete message as
+    /// one terminal payload (the host's `PluggableProvider` emits it as a single
+    /// `Done` chunk).
+    ///
+    /// We return a canned text message so the round-trip has something concrete to
+    /// assert (the model the host routes here is `stub-model` — see the smoke test).
+    fn on_provider_request(_req_json, out, _user_data) {
         PROVIDER_REQUEST_HITS.fetch_add(1, Ordering::SeqCst);
         let json = r#"{"role":"assistant","content":[{"type":"text","text":"from-stub-provider"}],"api":"faux","provider":"stub-provider","model":"stub-model","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
-        unsafe {
-            *out = StbString::from_string(json.to_string());
-        }
-        0
-    })
+        i32::from(!out.write(json.to_owned()))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,32 +338,24 @@ pub extern "C" fn plugin_stub_markdown_transform_hits() -> usize {
     MARKDOWN_TRANSFORM_HITS.load(Ordering::SeqCst)
 }
 
-/// The stub's markdown `RenderFn`: `input_json` is a borrowed
-/// `{ "markdown": "..." }`; `out` gets the transformed markdown JSON
-/// `{ "markdown": "<uppercased>" }` (a trivial transform so the round-trip has a
-/// concrete assertion). The host reclaims `out` via our `plugin_free_string`.
-extern "C" fn on_markdown_transform(
-    input_json: StbStringRef,
-    out: *mut StbString,
-    _user_data: *mut c_void,
-) -> i32 {
-    rpi_plugin_sdk::guard_or(1, || {
+rpi_plugin_sdk::string_handler! {
+    /// The stub's markdown `RenderFn`: `input_json` is a borrowed
+    /// `{ "markdown": "..." }`; `out` gets the transformed markdown JSON
+    /// `{ "markdown": "<uppercased>" }` (a trivial transform so the round-trip has a
+    /// concrete assertion). The host reclaims `out` via our `plugin_free_string`.
+    fn on_markdown_transform(input_json, out, _user_data) {
         MARKDOWN_TRANSFORM_HITS.fetch_add(1, Ordering::SeqCst);
         // Parse the input (borrowed — must NOT free). lenient: missing `markdown` ⇒ "".
-        let input = unsafe { input_json.as_str() };
         let parsed: serde_json::Value =
-            serde_json::from_str(input).unwrap_or(serde_json::Value::Null);
+            serde_json::from_str(input_json).unwrap_or(serde_json::Value::Null);
         let md = parsed
             .get("markdown")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_uppercase();
         let json = format!(r#"{{"markdown":"{}"}}"#, escape_json_string(&md));
-        unsafe {
-            *out = StbString::from_string(json);
-        }
-        0
-    })
+        i32::from(!out.write(json))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -574,3 +522,77 @@ const _ASSERT_STEP_TAG_REPR: () = assert!(
         && StepResultTag::Done as u32 == 1
         && StepResultTag::Err as u32 == 2
 );
+
+#[cfg(test)]
+mod echo_lifecycle_tests {
+    use super::*;
+    use rpi_plugin_sdk::callbacks::Step;
+
+    fn execute() -> StepHandle {
+        echo_execute(
+            StbStringRef::from_str("test-call"),
+            StbString::from_string(r#"{"text":"hello"}"#.into()),
+            Some(plugin_free_string),
+        )
+    }
+
+    fn poll(handle: StepHandle) -> Step {
+        // SAFETY: echo_poll transfers a result allocated by this SDK instance.
+        unsafe { rpi_plugin_sdk::take_step_result!(echo_poll(handle, None, std::ptr::null_mut())) }
+    }
+
+    #[test]
+    fn echo_still_reports_pending_then_done() {
+        let handle = execute();
+        assert!(!handle.is_null());
+        assert_eq!(poll(handle), Step::Pending(String::new()));
+        let Step::Done(json) = poll(handle) else {
+            panic!("expected done")
+        };
+        let result: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(result["content"][0]["text"], "echo: hello");
+        echo_destroy(handle);
+    }
+
+    #[test]
+    fn null_invalid_and_retired_handles_are_rejected_without_dereferencing() {
+        let handle = execute();
+        echo_destroy(handle);
+        echo_destroy(handle);
+        echo_destroy(std::ptr::null_mut());
+        for invalid in [std::ptr::null_mut(), usize::MAX as StepHandle, handle] {
+            let Step::Err(json) = poll(invalid) else {
+                panic!("expected invalid handle")
+            };
+            assert!(json.contains("invalid or destroyed"));
+        }
+        let next = execute();
+        assert_ne!(next, handle);
+        echo_destroy(next);
+    }
+
+    #[test]
+    fn cancellation_is_idempotent_and_does_not_free_the_state() {
+        let handle = execute();
+        echo_cancel(handle);
+        echo_cancel(handle);
+        assert!(ECHO_DRIVES.get(handle).is_some());
+        let Step::Err(json) = poll(handle) else {
+            panic!("expected cancellation")
+        };
+        assert!(json.contains("cancelled"));
+        echo_destroy(handle);
+        assert!(ECHO_DRIVES.get(handle).is_none());
+    }
+
+    #[test]
+    fn string_callbacks_report_missing_output_without_writing_through_null() {
+        let input = StbStringRef::from_str("{}");
+        let slot = std::ptr::null_mut();
+        let data = std::ptr::null_mut();
+        assert_eq!(on_resources_discover(input, input, slot, data), 1);
+        assert_eq!(on_before_agent_start(input, slot, data), 1);
+        assert_eq!(on_provider_request(input, slot, data), 1);
+        assert_eq!(on_markdown_transform(input, slot, data), 1);
+    }
+}

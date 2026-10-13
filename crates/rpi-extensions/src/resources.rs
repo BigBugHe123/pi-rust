@@ -120,11 +120,12 @@ fn call_one_handler(
     // rather than UB.
     let mut out = StbString::empty();
     let rc = (h.handler)(cwd_ref, reason_ref, &mut out, h.user_data);
+    // SAFETY: the callback transfers its live output to its registered producer.
+    let out = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(h.plugin_free_string))
+    };
     if rc != 0 {
-        // Handler reported an error and should NOT have written `out`. Defensively
-        // free a non-empty `out` anyway (a misbehaving handler that wrote then
-        // returned nonzero would otherwise leak). `free_with` is a no-op on empty.
-        out.free_with(Some(h.plugin_free_string));
+        // The owner also reclaims output a handler wrote before returning error.
         return Err(rc);
     }
 
@@ -132,7 +133,6 @@ fn call_one_handler(
     // allocation (the plugin owns the bytes; we must not keep a reference past
     // the free). `to_string_lossy` copies without freeing.
     let json = out.to_string_lossy();
-    out.free_with(Some(h.plugin_free_string));
 
     let paths = parse_discover_payload(&json);
     Ok(paths)
@@ -180,116 +180,70 @@ fn parse_discover_payload(json: &str) -> DiscoveredResources {
 mod tests {
     use super::*;
     use crate::registry::ExtensionRegistry;
-    use rpi_plugin_sdk::{ResourcesDiscoverFn, StbString};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use rpi_plugin_sdk::callbacks::free_string as test_free;
+    use rpi_plugin_sdk::ResourcesDiscoverFn;
+    use std::cell::Cell;
+    use std::sync::atomic::Ordering;
 
-    /// Plugin-side `free_string` for the test handlers: reconstructs the
-    /// `Box<[u8]>` from ptr+len and drops it (matches `StbString::from_string`'s
-    /// allocation, same as the real `host_free_string` in lib.rs).
-    extern "C" fn test_free(s: StbString) {
-        if s.len == 0 || s.ptr.is_null() {
-            return;
-        }
-        // SAFETY: `from_string` allocated via `Box::into_raw(Box<[u8]>)`; we
-        // reconstruct the same layout. Mirrors `host_free_string` exactly.
-        unsafe {
-            let slice = core::slice::from_raw_parts_mut(s.ptr as *mut u8, s.len);
-            let _ = Box::from_raw(slice as *mut [u8]);
-        }
+    // Discovery fan-out runs synchronously on the calling thread. Per-thread
+    // counters keep the tests isolated without passing stack pointers via ABI.
+    thread_local! { static CALLS: Cell<usize> = const { Cell::new(0) }; }
+
+    fn bump() {
+        CALLS.with(|count| count.set(count.get() + 1));
     }
 
-    /// Per-test call counter threaded through `user_data` (a `*mut AtomicUsize`).
-    /// This keeps tests isolated (no shared global) so they can run in parallel.
-    fn bump(ud: *mut std::ffi::c_void) {
-        if ud.is_null() {
-            return;
-        }
-        // SAFETY: the test owns the `AtomicUsize` it passed in and it outlives the
-        // call (it's on the test's stack, pinned by the snapshot's copy of the
-        // pointer — the registry copies the raw pointer value, not the pointee).
-        unsafe {
-            (*(ud as *mut AtomicUsize)).fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    /// A handler that returns two skill paths + one prompt path + one theme path.
-    extern "C" fn two_skill_handler(
-        _cwd: StbStringRef,
-        _reason: StbStringRef,
-        out: *mut StbString,
-        ud: *mut std::ffi::c_void,
-    ) -> i32 {
-        bump(ud);
+    rpi_plugin_sdk::string_handler! {
+        /// A handler that returns two skill paths + one prompt path + one theme path.
+        fn two_skill_handler((_cwd, _reason), out, _ud) {
+        bump();
         let json = serde_json::json!({
             "skillPaths": ["/a/SKILL.md", "/b/SKILL.md"],
             "promptPaths": ["/p/greet.md"],
             "themePaths": ["/t/dark.json"],
         })
         .to_string();
-        unsafe {
-            *out = StbString::from_string(json);
-        }
-        0
-    }
+        i32::from(!out.write(json))
+    } }
 
-    /// A handler that returns only skill paths (prompt/theme omitted — lenient).
-    extern "C" fn skill_only_handler(
-        _cwd: StbStringRef,
-        _reason: StbStringRef,
-        out: *mut StbString,
-        ud: *mut std::ffi::c_void,
-    ) -> i32 {
-        bump(ud);
+    rpi_plugin_sdk::string_handler! {
+        /// A handler that returns only skill paths (prompt/theme omitted — lenient).
+        fn skill_only_handler((_cwd, _reason), out, _ud) {
+        bump();
         let json = r#"{"skillPaths":["/c/SKILL.md"]}"#.to_string();
-        unsafe {
-            *out = StbString::from_string(json);
-        }
-        0
-    }
+        i32::from(!out.write(json))
+    } }
 
-    /// A handler that reports an error (nonzero) — must be skipped, fan-out
-    /// continues, and its `out` (untouched/empty) is defensively freed.
-    extern "C" fn error_handler(
-        _cwd: StbStringRef,
-        _reason: StbStringRef,
-        _out: *mut StbString,
-        ud: *mut std::ffi::c_void,
-    ) -> i32 {
-        bump(ud);
+    rpi_plugin_sdk::string_handler! {
+        /// A handler that reports an error (nonzero) — must be skipped, fan-out
+        /// continues, and its `out` (untouched/empty) is defensively freed.
+        fn error_handler((_cwd, _reason), _out, _ud) {
+        bump();
         42
-    }
+    } }
 
-    /// A handler that returns 0 but writes garbage JSON — lenient parse yields
-    /// empty arrays (does NOT poison the merged result), and the allocation is
-    /// still freed.
-    extern "C" fn garbage_handler(
-        _cwd: StbStringRef,
-        _reason: StbStringRef,
-        out: *mut StbString,
-        ud: *mut std::ffi::c_void,
-    ) -> i32 {
-        bump(ud);
-        unsafe {
-            *out = StbString::from_string("not json {{{".to_string());
-        }
-        0
-    }
+    rpi_plugin_sdk::string_handler! {
+        /// A handler that returns 0 but writes garbage JSON — lenient parse yields
+        /// empty arrays (does NOT poison the merged result), and the allocation is
+        /// still freed.
+        fn garbage_handler((_cwd, _reason), out, _ud) {
+        bump();
+        i32::from(!out.write("not json {{{".to_string()))
+    } }
 
-    /// Build a snapshot whose handlers all count into `counter` via `user_data`.
-    fn reg_with(handlers: &[ResourcesDiscoverFn], counter: &AtomicUsize) -> RegistrySnapshot {
-        counter.store(0, Ordering::SeqCst);
+    /// Build a snapshot with an isolated synchronous dispatch counter.
+    fn reg_with(handlers: &[ResourcesDiscoverFn]) -> RegistrySnapshot {
+        CALLS.with(|count| count.set(0));
         let mut reg = ExtensionRegistry::new();
-        let ud = counter as *const AtomicUsize as *mut std::ffi::c_void;
         for h in handlers {
-            reg.register_resources_discover(*h, test_free, ud);
+            reg.register_resources_discover(*h, test_free, std::ptr::null_mut());
         }
         reg.snapshot()
     }
 
     #[test]
     fn no_handlers_returns_empty() {
-        let counter = AtomicUsize::new(0);
-        let snap = reg_with(&[], &counter);
+        let snap = reg_with(&[]);
         let r = emit_resources_discover("/cwd", "startup", &snap);
         assert!(r.skill_paths.is_empty());
         assert!(r.prompt_paths.is_empty());
@@ -298,51 +252,44 @@ mod tests {
 
     #[test]
     fn one_handler_merges_all_three_arrays() {
-        let counter = AtomicUsize::new(0);
-        let snap = reg_with(&[two_skill_handler], &counter);
+        let snap = reg_with(&[two_skill_handler]);
         let r = emit_resources_discover("/cwd", "startup", &snap);
         assert_eq!(r.skill_paths, ["/a/SKILL.md", "/b/SKILL.md"]);
         assert_eq!(r.prompt_paths, ["/p/greet.md"]);
         assert_eq!(r.theme_paths, ["/t/dark.json"]);
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert_eq!(CALLS.with(Cell::get), 1);
     }
 
     #[test]
     fn multiple_handlers_concatenate_in_registration_order() {
-        let counter = AtomicUsize::new(0);
-        let snap = reg_with(&[two_skill_handler, skill_only_handler], &counter);
+        let snap = reg_with(&[two_skill_handler, skill_only_handler]);
         let r = emit_resources_discover("/cwd", "reload", &snap);
         assert_eq!(r.skill_paths, ["/a/SKILL.md", "/b/SKILL.md", "/c/SKILL.md"]);
         // The second handler returned no prompt/theme → only the first's.
         assert_eq!(r.prompt_paths, ["/p/greet.md"]);
         assert_eq!(r.theme_paths, ["/t/dark.json"]);
-        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert_eq!(CALLS.with(Cell::get), 2);
     }
 
     #[test]
     fn error_handler_skipped_fan_out_continues() {
-        let counter = AtomicUsize::new(0);
-        let snap = reg_with(
-            &[error_handler, two_skill_handler, garbage_handler],
-            &counter,
-        );
+        let snap = reg_with(&[error_handler, two_skill_handler, garbage_handler]);
         let r = emit_resources_discover("/cwd", "startup", &snap);
         // error_handler skipped; two_skill_handler contributed;
         // garbage_handler produced empty (lenient). All three ran.
-        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(CALLS.with(Cell::get), 3);
         assert_eq!(r.skill_paths, ["/a/SKILL.md", "/b/SKILL.md"]);
         assert_eq!(r.prompt_paths, ["/p/greet.md"]);
     }
 
     #[test]
     fn stale_registry_returns_empty() {
-        let counter = AtomicUsize::new(0);
-        let snap = reg_with(&[two_skill_handler], &counter);
+        let snap = reg_with(&[two_skill_handler]);
         snap.active_flag().store(false, Ordering::SeqCst);
         let r = emit_resources_discover("/cwd", "startup", &snap);
         assert!(r.skill_paths.is_empty());
         assert_eq!(
-            counter.load(Ordering::SeqCst),
+            CALLS.with(Cell::get),
             0,
             "stale registry must not invoke handlers"
         );

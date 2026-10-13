@@ -378,8 +378,11 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         renderer.user_data,
     );
     assert_eq!(rc, 0, "render_fn should succeed");
-    let transformed = out.to_string_lossy();
-    out.free_with(Some(renderer.plugin_free_string));
+    // SAFETY: the ABI callback returned a live output, copied before producer-side cleanup.
+    let transformed = unsafe {
+        rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(renderer.plugin_free_string))
+    }
+    .to_string_lossy();
     assert!(
         transformed.contains(r#""markdown":"HELLO WORLD""#),
         "stub uppercases markdown: got {transformed}"

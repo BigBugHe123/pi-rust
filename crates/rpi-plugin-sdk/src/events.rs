@@ -41,7 +41,7 @@ impl<'a> EventView<'a> {
             return None;
         }
         // SAFETY: from_raw's invariant and the tag check select the live arm.
-        Some(unsafe { self.raw.payload.message.message }.to_string_lossy())
+        Some(unsafe { self.raw.payload.message.message.to_string_lossy() })
     }
 
     pub fn data_text(&self) -> Option<String> {
@@ -70,7 +70,7 @@ impl<'a> EventView<'a> {
             return None;
         }
         // SAFETY: from_raw's invariant and the tag check select the live arm.
-        Some(unsafe { self.raw.payload.data.data }.to_string_lossy())
+        Some(unsafe { self.raw.payload.data.data.to_string_lossy() })
     }
 
     pub fn tool_call(&self) -> Option<ToolCall> {
@@ -82,10 +82,13 @@ impl<'a> EventView<'a> {
         }
         // SAFETY: from_raw's invariant and the tag check select the live arm.
         let payload = unsafe { self.raw.payload.tool_call };
-        Some(ToolCall {
-            tool_call_id: payload.tool_call_id.to_string_lossy(),
-            tool_name: payload.tool_name.to_string_lossy(),
-            params: payload.params.to_string_lossy(),
+        // SAFETY: from_raw guarantees the selected payload buffers remain live.
+        Some(unsafe {
+            ToolCall {
+                tool_call_id: payload.tool_call_id.to_string_lossy(),
+                tool_name: payload.tool_name.to_string_lossy(),
+                params: payload.params.to_string_lossy(),
+            }
         })
     }
 
@@ -98,11 +101,14 @@ impl<'a> EventView<'a> {
         }
         // SAFETY: from_raw's invariant and the tag check select the live arm.
         let payload = unsafe { self.raw.payload.tool_result };
-        Some(ToolResult {
-            tool_call_id: payload.tool_call_id.to_string_lossy(),
-            tool_name: payload.tool_name.to_string_lossy(),
-            result: payload.result.to_string_lossy(),
-            is_error: payload.is_error != 0,
+        // SAFETY: from_raw guarantees the selected payload buffers remain live.
+        Some(unsafe {
+            ToolResult {
+                tool_call_id: payload.tool_call_id.to_string_lossy(),
+                tool_name: payload.tool_name.to_string_lossy(),
+                result: payload.result.to_string_lossy(),
+                is_error: payload.is_error != 0,
+            }
         })
     }
 }

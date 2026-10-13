@@ -18,9 +18,7 @@ use thiserror::Error;
 use rpi_plugin_sdk::{RpiPluginRegisterUnified, RPI_PLUGIN_ABI_VERSION_UNIFIED};
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
-use crate::{
-    clear_current_api, set_current_api, ActionBridge, HostApi, NullDiagnostics, PluginDiagnostics,
-};
+use crate::{enter_current_api, ActionBridge, HostApi, NullDiagnostics, PluginDiagnostics};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -161,13 +159,12 @@ pub fn load_one(
         ),
         None => HostApi::new(plugin_name, registry, Arc::clone(&diagnostics)),
     };
-    // 4. Set the thread-local current api so the register trampolines can reach
-    //    the registry. Register is synchronous + single-threaded per plugin.
-    // SAFETY: `host_api` is alive for the duration of the register call (held on
-    // this stack); we clear_current_api immediately after.
-    unsafe { set_current_api(&host_api) };
-    let rc = call_register(register, &host_api);
-    clear_current_api();
+    // 4. Own the thread-local api during registration and restore the enclosing
+    //    context afterward, even if registration fails or reenters the loader.
+    let rc = {
+        let _registration = enter_current_api(&host_api);
+        call_register(register, &host_api)
+    };
 
     if rc != 0 {
         if let Some(bridge) = &host_api.action_bridge {
@@ -549,21 +546,8 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
-    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
-
-    static UNIFIED_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static UNIFIED_SEEN_VERSION: AtomicUsize = AtomicUsize::new(0);
-    static UNIFIED_RETURN: AtomicI32 = AtomicI32::new(0);
-
-    extern "C" fn test_register_unified(api: *const rpi_plugin_sdk::PluginApi) -> i32 {
-        if api.is_null() {
-            return -99;
-        }
-        UNIFIED_CALLS.fetch_add(1, Ordering::SeqCst);
-        UNIFIED_SEEN_VERSION.store(unsafe { (*api).abi_version as usize }, Ordering::SeqCst);
-        UNIFIED_RETURN.load(Ordering::SeqCst)
-    }
 
     #[derive(Default)]
     struct CapturingDiag {
@@ -576,14 +560,6 @@ mod tests {
         fn unsupported(&self, msg: &str) {
             self.warn(msg);
         }
-    }
-
-    fn test_host_api() -> Arc<HostApi> {
-        HostApi::new(
-            "test-plugin",
-            ExtensionRegistry::new(),
-            Arc::new(CapturingDiag::default()),
-        )
     }
 
     struct CdylibFixture {

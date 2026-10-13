@@ -6,6 +6,8 @@
 //! (`session::state`, `session::reducer`, `session::jsonl`, `compaction`,
 //! `messages`, `events`, `skills`, `agent_harness`) are added as M5 progresses.
 
+#![forbid(unsafe_code)]
+
 pub mod agent_harness;
 pub mod cache_stats;
 pub mod compaction;

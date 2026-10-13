@@ -10,6 +10,8 @@
 //!
 //! Every module's doc comment names the TS file it mirrors.
 
+#![forbid(unsafe_code)]
+
 pub mod constrained;
 pub mod error;
 pub mod event_stream;

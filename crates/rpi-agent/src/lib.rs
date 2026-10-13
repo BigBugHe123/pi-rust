@@ -10,6 +10,8 @@
 //! (end in completion order, tool-result `MessageEnd` in source/ordinal order),
 //! truncate-fail, and late-update suppression — live in [`agent_loop`].
 
+#![forbid(unsafe_code)]
+
 pub mod abort;
 pub mod agent;
 pub mod agent_loop;

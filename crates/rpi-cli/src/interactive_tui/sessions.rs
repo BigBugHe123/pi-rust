@@ -482,12 +482,18 @@ pub(super) fn invoke_extension_renderer(
                 &mut out as *mut rpi_plugin_sdk::StbString,
                 renderer.user_data,
             );
+            // SAFETY: the callback transfers a live output to its producer.
+            let out = unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(renderer.plugin_free_string),
+                )
+            };
             let text = if rc == 0 {
                 Some(out.to_string_lossy())
             } else {
                 None
             };
-            out.free_with(Some(renderer.plugin_free_string));
             text
         }))
         .ok()

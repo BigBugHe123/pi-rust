@@ -239,24 +239,29 @@ fn modal_inputs_keep_registered_plugin_shortcuts_until_closed() {
     use rpi_extensions::{ExtensionRegistry, ExtensionSession, PluginKeepalive};
     use rpi_plugin_sdk::{EventTag, StablePluginEvent, EVENT_HANDLER_CLAIMED};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    static CONTEXTS: rpi_plugin_sdk::handles::ToolHandles<Arc<AtomicUsize>> =
+        rpi_plugin_sdk::handles::ToolHandles::new();
+    struct ContextOwner(usize);
+    impl Drop for ContextOwner {
+        fn drop(&mut self) {
+            drop(CONTEXTS.remove(self.0 as rpi_plugin_sdk::StepHandle));
+        }
+    }
     extern "C" fn claim(_: StablePluginEvent, user_data: *mut std::ffi::c_void) -> i32 {
-        // The counter outlives the session and all synchronous dispatch calls.
-        let calls = unsafe { &*user_data.cast::<AtomicUsize>() };
+        let context = CONTEXTS.get(user_data).expect("live test context");
+        let calls = context.lock().clone();
         calls.fetch_add(1, Ordering::SeqCst);
         EVENT_HANDLER_CLAIMED
     }
-    let calls = AtomicUsize::new(0);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let context = CONTEXTS.insert(calls.clone());
+    let _owner = ContextOwner(context as usize);
     let state = test_tui_state();
     let mut registry = ExtensionRegistry::new();
     for name in ["space", "f8", "escape", "enter"] {
         registry.register_shortcut("test".into(), name.into(), "test".into());
     }
-    registry.register_event_handler(
-        "test".into(),
-        EventTag::Input,
-        claim,
-        (&calls as *const AtomicUsize).cast_mut().cast(),
-    );
+    registry.register_event_handler("test".into(), EventTag::Input, claim, context);
     *state.extension_session.lock().unwrap() = ExtensionSession::from_parts(
         Arc::new(registry.snapshot()),
         PluginKeepalive::empty(),

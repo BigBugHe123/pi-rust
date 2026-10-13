@@ -9,6 +9,8 @@
 //! pi-harness → pi-cli`. `pi-tools` depends on `pi-agent` (for the `AgentTool`
 //! trait) and `pi-ai` (for `Tool`/content types).
 
+#![forbid(unsafe_code)]
+
 pub mod env;
 pub mod error;
 pub mod file_mutation_queue;

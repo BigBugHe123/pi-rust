@@ -185,16 +185,21 @@ fn transform_markdown_chain(
                 &mut out as *mut rpi_plugin_sdk::StbString,
                 renderer.user_data,
             );
+            // SAFETY: the callback transfers a live output to its producer.
+            let out = unsafe {
+                rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                    out,
+                    Some(renderer.plugin_free_string),
+                )
+            };
             let text = if rc == 0 {
                 let s = out.to_string_lossy();
                 Some(s)
             } else {
                 None
             };
-            // Reclaim the plugin-owned `out` regardless of rc (rc!=0 may still
-            // have written an error JSON the plugin allocated). `free_with` is
-            // idempotent on an empty `StbString`.
-            out.free_with(Some(renderer.plugin_free_string));
+            // The owner reclaims output regardless of rc, including an error
+            // response a plugin wrote before returning nonzero.
             text
         }));
         let out_text = match outcome {

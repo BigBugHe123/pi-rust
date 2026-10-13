@@ -954,11 +954,9 @@ fn free_dispatched_event(event: &StablePluginEvent) {
 }
 
 // SAFETY note on the `unsafe { host_free_string(...) }` calls above:
-// `host_free_string` is itself a safe `extern "C" fn` (it reconstructs a
-// `Box<[u8]>` from ptr+len and drops it, idempotent on null/empty). The
-// `unsafe` block is required only because reading the union payload is
-// `unsafe` (the compiler can't verify tag/variant match) — which we guarantee
-// by matching on `event.tag` first. So the union read is sound.
+// Each arm selects the initialized union payload and transfers its live
+// host-produced allocation to host_free_string exactly once. Both the union
+// access and the deallocator's ownership contract require this boundary.
 
 #[cfg(test)]
 mod tests {
@@ -1417,10 +1415,15 @@ mod tests {
         release: std::sync::atomic::AtomicBool,
     }
 
-    extern "C" fn waiting_approval(event: StablePluginEvent, data: *mut std::ffi::c_void) -> i32 {
-        // The test owns this context until the worker reports completion.
-        let state = unsafe { Arc::from_raw(data as *const WaitingApproval) };
-        let call_id = unsafe { event.payload.tool_call.tool_call_id.to_string_lossy() };
+    static APPROVAL_CONTEXTS: rpi_plugin_sdk::handles::ToolHandles<Arc<WaitingApproval>> =
+        rpi_plugin_sdk::handles::ToolHandles::new();
+
+    rpi_plugin_sdk::event_handler! { fn waiting_approval(event, data) {
+        let Some(context) = APPROVAL_CONTEXTS.get(data) else {
+            return rpi_plugin_sdk::EVENT_HANDLER_ERROR;
+        };
+        let state = context.lock().clone();
+        let call_id = event.tool_call().expect("tool call event").tool_call_id;
         state
             .ui
             .handle(serde_json::json!({
@@ -1445,7 +1448,7 @@ mod tests {
         }
         state.finished.notify_one();
         rpi_plugin_sdk::EVENT_HANDLER_ABORT
-    }
+    } }
 
     async fn check_interrupted_approval(cancel: bool) {
         let ui = crate::UiDialogMailbox::new();
@@ -1461,19 +1464,21 @@ mod tests {
             release: std::sync::atomic::AtomicBool::new(false),
         });
         // Release on failed assertions too, so the blocking runtime can exit.
-        struct ReleaseWorker(Arc<WaitingApproval>);
+        struct ReleaseWorker(Arc<WaitingApproval>, usize);
         impl Drop for ReleaseWorker {
             fn drop(&mut self) {
                 self.0.release.store(true, Ordering::SeqCst);
+                drop(APPROVAL_CONTEXTS.remove(self.1 as rpi_plugin_sdk::StepHandle));
             }
         }
-        let _release = ReleaseWorker(state.clone());
+        let context = APPROVAL_CONTEXTS.insert(state.clone());
+        let _release = ReleaseWorker(state.clone(), context as usize);
         let mut reg = crate::ExtensionRegistry::new();
         reg.register_event_handler(
             "waiting-gate".into(),
             EventTag::ToolCall,
             waiting_approval,
-            Arc::into_raw(state.clone()) as *mut std::ffi::c_void,
+            context,
         );
         let keepalive = crate::PluginKeepalive::empty();
         let weak = Arc::downgrade(&keepalive);
@@ -1680,17 +1685,17 @@ mod tests {
     /// `CLAIM_ROUTING` is global because an `extern "C" fn` cannot capture.
     static CLAIM_ROUTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-    extern "C" fn claiming_handler(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+    rpi_plugin_sdk::event_handler! { fn claiming_handler(ev, _ud) {
         // The payload must be readable as a data event (this is also what
         // exercises the `Input` free path not leaking/aliasing).
-        let seen = unsafe { ev.payload.data.data.to_string_lossy() };
+        let seen = ev.data_text().expect("input data event");
         assert!(seen.contains("space"), "payload not delivered: {seen}");
         if CLAIM_ROUTING.load(Ordering::SeqCst) {
             rpi_plugin_sdk::EVENT_HANDLER_CLAIMED
         } else {
             rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
         }
-    }
+    } }
 
     fn input_snapshot(with_handler: bool) -> Arc<crate::registry::RegistrySnapshot> {
         let mut reg = crate::registry::ExtensionRegistry::new();
@@ -1766,18 +1771,18 @@ mod tests {
         );
     }
 
-    /// Handler that records it saw a well-formed editor-change payload. The
-    /// flag is global because an `extern "C" fn` cannot capture.
+    // Handler that records it saw a well-formed editor-change payload. The
+    // flag is global because an `extern "C" fn` cannot capture.
     static EDITOR_CHANGE_SEEN: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    extern "C" fn editor_change_handler(ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+    rpi_plugin_sdk::event_handler! { fn editor_change_handler(ev, _ud) {
         // Reading the data payload here also exercises the `EditorChange` free
         // path (a wrong arm in `free_dispatched_event` would corrupt/leak).
-        let seen = unsafe { ev.payload.data.data.to_string_lossy() };
+        let seen = ev.data_text().expect("editor change data event");
         if seen.contains("chars") && seen.contains("empty") {
             EDITOR_CHANGE_SEEN.store(true, Ordering::SeqCst);
         }
         rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
-    }
+    } }
 }
