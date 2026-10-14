@@ -155,7 +155,7 @@ fn valid_segment(value: &str) -> bool {
 
 /// Accept an explicit owner/repo override or repository metadata URLs,
 /// including Cargo's common .git / git+https forms and GitHub tree subpaths.
-fn canonical_repository(value: &str) -> Result<String, String> {
+pub(crate) fn canonical_repository(value: &str) -> Result<String, String> {
     let value = value.trim().strip_prefix("git+").unwrap_or(value.trim());
     let value = if value.contains("://") {
         value.to_string()
@@ -226,7 +226,10 @@ fn select_version(versions: &[RegistryVersion], requested: Option<&str>) -> Resu
         .ok_or_else(|| "no non-yanked stable version is available".into())
 }
 
-async fn body_limited(mut response: reqwest::Response, limit: u64) -> Result<Vec<u8>, String> {
+pub(crate) async fn body_limited(
+    mut response: reqwest::Response,
+    limit: u64,
+) -> Result<Vec<u8>, String> {
     if response.content_length().is_some_and(|n| n > limit) {
         return Err("download exceeds size limit".into());
     }
@@ -301,11 +304,11 @@ async fn resolve_package(
     })
 }
 
-fn hash(bytes: &[u8]) -> String {
+pub(crate) fn hash(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn check_hash(bytes: &[u8], expected: &str) -> Result<(), String> {
+pub(crate) fn check_hash(bytes: &[u8], expected: &str) -> Result<(), String> {
     if expected.len() != 64
         || !expected
             .bytes()
@@ -393,7 +396,16 @@ fn validate_manifest<'a>(
             return Err("invalid SHA-256 in manifest".into());
         }
     }
-    let url = reqwest::Url::parse(&distribution.url).map_err(|_| "invalid archive URL")?;
+    validate_release_asset_url(&distribution.url, &package.repository, &manifest.tag)?;
+    Ok(distribution)
+}
+
+pub(crate) fn validate_release_asset_url(
+    value: &str,
+    repository: &str,
+    tag: &str,
+) -> Result<(), String> {
+    let url = reqwest::Url::parse(value).map_err(|_| "invalid archive URL")?;
     let segments: Vec<String> = url
         .path_segments()
         .ok_or("archive URL has no path")?
@@ -414,11 +426,11 @@ fn validate_manifest<'a>(
         || segments.len() != 6
         || segments[2] != "releases"
         || segments[3] != "download"
-        || segments[4] != format!("{}-v{}", package.name, package.version)
+        || segments[4] != tag
         || canonical_repository(&format!(
             "https://github.com/{}/{}",
             segments[0], segments[1]
-        ))? != package.repository
+        ))? != repository
         || segments[5].is_empty()
         || matches!(segments[5].as_str(), "." | "..")
         || !segments[5]
@@ -429,7 +441,7 @@ fn validate_manifest<'a>(
             "archive URL must belong to the same GitHub repository and package Release".into(),
         );
     }
-    Ok(distribution)
+    Ok(())
 }
 
 async fn fetch_manifest(
@@ -643,7 +655,11 @@ fn read_library(reader: impl Read) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn extract_library(archive: &[u8], format: &str, library: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn extract_library(
+    archive: &[u8],
+    format: &str,
+    library: &str,
+) -> Result<Vec<u8>, String> {
     let mut found = None;
     let mut total = 0u64;
     match format {
@@ -714,6 +730,14 @@ fn extract_library(archive: &[u8], format: &str, library: &str) -> Result<Vec<u8
 
 /// Verify the native object format/architecture without executing downloaded code.
 fn validate_library_target(bytes: &[u8], target: &str) -> Result<(), String> {
+    validate_native_target(bytes, target, true)
+}
+
+pub(crate) fn validate_executable_target(bytes: &[u8], target: &str) -> Result<(), String> {
+    validate_native_target(bytes, target, false)
+}
+
+fn validate_native_target(bytes: &[u8], target: &str, library: bool) -> Result<(), String> {
     let u16_at = |n: usize| {
         bytes
             .get(n..n.checked_add(2)?)
@@ -730,11 +754,17 @@ fn validate_library_target(bytes: &[u8], target: &str) -> Result<(), String> {
             bytes.starts_with(b"MZ")
                 && bytes.get(offset..offset.saturating_add(4)) == Some(b"PE\0\0".as_slice())
                 && u16_at(offset.saturating_add(4)) == Some(0x8664)
-                && u16_at(offset.saturating_add(22)).is_some_and(|flags| flags & 0x2000 != 0)
+                && u16_at(offset.saturating_add(22)).is_some_and(|flags| {
+                    if library {
+                        flags & 0x2000 != 0
+                    } else {
+                        flags & 0x2000 == 0 && flags & 2 != 0
+                    }
+                })
         }
         "x86_64-unknown-linux-gnu" | "aarch64-unknown-linux-gnu" => {
             bytes.starts_with(b"\x7fELF\x02\x01")
-                && u16_at(16) == Some(3)
+                && u16_at(16).is_some_and(|kind| kind == 3 || (!library && kind == 2))
                 && u16_at(18)
                     == Some(if target.starts_with("aarch64") {
                         183
@@ -744,7 +774,7 @@ fn validate_library_target(bytes: &[u8], target: &str) -> Result<(), String> {
         }
         "x86_64-apple-darwin" | "aarch64-apple-darwin" => {
             u32_at(0) == Some(0xfeedfacf)
-                && u32_at(12) == Some(6)
+                && u32_at(12) == Some(if library { 6 } else { 2 })
                 && u32_at(4)
                     == Some(if target.starts_with("aarch64") {
                         0x0100000c
@@ -756,7 +786,12 @@ fn validate_library_target(bytes: &[u8], target: &str) -> Result<(), String> {
     };
     if !valid {
         return Err(format!(
-            "declared library is not a shared library for {target}"
+            "declared artifact is not a compatible native {} for {target}",
+            if library {
+                "shared library"
+            } else {
+                "executable"
+            }
         ));
     }
     Ok(())

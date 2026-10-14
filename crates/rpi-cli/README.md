@@ -138,3 +138,7 @@ and [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE).
 
 This crate is part of a Rust port of the MIT-licensed TypeScript `pi` SDK
 (© Mario Zechner).
+
+### CLI self-update
+
+`rpi update` downloads the matching GitHub prebuilt CLI using the versioned `rpi-release.json` distribution protocol. It verifies target, archive size, both SHA-256 hashes, and the executable version before using the existing atomic replacement and Windows staging helper. Version discovery uses crates.io. Only `rpi update --build` selects local Cargo compilation; missing manifests and failed checks preserve the installed executable. `--force` reinstalls and `--offline` reports cached information without downloads or builds.

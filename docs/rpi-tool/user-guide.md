@@ -196,6 +196,18 @@ rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 ```
 
+### CLI 自更新
+
+`rpi update` 默认从 GitHub Release 下载预编译的 CLI，不需要本地 Rust/Cargo。
+版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
+压缩包/可执行文件的 SHA-256。校验目标平台、完整性和实际版本后，原子替换当前 CLI。
+Windows 会暂存更新，等待当前进程退出后完成替换。
+
+`rpi update --force` 重新安装已解析的版本；`rpi update --build` 显式使用 Cargo 源码编译。
+缺少 manifest、下载失败或校验不通过都会报错并保留原版本，不会自动转为编译。
+`--offline` 仅报告缓存的版本信息，不下载也不编译。旧 Release 没有 manifest 时，
+可等待协议资产补齐，或显式使用 `rpi update --build`。
+
 ### TUI 历史消息滚动
 
 交互式 TUI 默认使用 alternate screen，并由应用自己管理 transcript 滚动。可以使用 `PageUp` / `PageDown`、`Home` / `End`，或鼠标和触控板滚轮浏览历史消息。

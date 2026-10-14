@@ -58,6 +58,11 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: Install manifest tooling
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
@@ -127,6 +132,16 @@ jobs:
           echo "asset=${asset}" >> "${GITHUB_OUTPUT}"
           echo "checksum=${asset}.sha256" >> "${GITHUB_OUTPUT}"
 
+      - name: Describe verified prebuilt distribution
+        shell: bash
+        run: |
+          python scripts/prebuilt-release.py describe \
+            --archive "${{ steps.stage.outputs.asset }}" \
+            --target "${{ matrix.target }}" \
+            --version "${{ steps.version.outputs.version }}" \
+            --commit "$(git rev-parse HEAD)" \
+            --output "${{ steps.stage.outputs.asset }}.prebuilt.json"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
@@ -134,6 +149,7 @@ jobs:
           path: |
             ${{ steps.stage.outputs.asset }}
             ${{ steps.stage.outputs.checksum }}
+            ${{ steps.stage.outputs.asset }}.prebuilt.json
           if-no-files-found: error
 
   release:
@@ -153,8 +169,20 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Install manifest tooling
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: List artifacts
         run: ls -la dist
+
+      - name: Verify all targets and assemble CLI manifest
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          python scripts/prebuilt-release.py assemble --directory dist \
+            --tag "${TAG}" --commit "$(git rev-parse HEAD)" --output rpi-release.json
 
       - name: Publish to GitHub Release
         env:
@@ -162,10 +190,18 @@ jobs:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip dist/*.sha256)
           if gh release view "${TAG}" >/dev/null 2>&1; then
-            gh release upload "${TAG}" dist/* --clobber
+            # Discovery must not advertise archives while they are being replaced.
+            if gh release view "${TAG}" --json assets --jq '.assets[].name' | grep -qx rpi-release.json; then
+              gh release delete-asset "${TAG}" rpi-release.json --yes
+            fi
+            gh release upload "${TAG}" "${assets[@]}" --clobber
           else
-            gh release create "${TAG}" dist/* \
+            gh release create "${TAG}" "${assets[@]}" \
               --title "rpi ${TAG}" \
               --generate-notes
           fi
+          # Upload last: a manifest means all five verified archives are ready.
+          gh release upload "${TAG}" rpi-release.json --clobber

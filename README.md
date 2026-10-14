@@ -351,6 +351,26 @@ through [SECURITY.md](SECURITY.md), not a public issue.
 
 The whole test suite runs offline: `cargo test --workspace --locked`.
 
+## Support / 赞赏支持
+
+If rpi helps you, consider buying the author a coffee. Tips and donations support continued development and maintenance. Thank you!
+
+如果 rpi 帮到了你，欢迎请作者喝杯咖啡，赞赏或捐助支持持续开发与维护。感谢每一份支持！
+
+**微信支付 / WeChat Pay**
+
+<a href="docs/images/weixinsk.png"><img src="docs/images/weixinsk.png" width="100" alt="WeChat Pay donation QR code"></a>
+
+**支付宝 / Alipay**
+
+<a href="docs/images/alipay.jpg"><img src="docs/images/alipay.jpg" width="100" alt="Alipay donation QR code"></a>
+
+**Binance Pay**
+
+<a href="docs/images/bian.png"><img src="docs/images/bian.png" width="100" alt="Binance Pay donation QR code"></a>
+
+扫码或点击图片查看原图；手机上可保存图片后，在对应 App 中识别。 / Scan the code or click to view the original. On mobile, save the image and scan it from the matching app’s photo library.
+
 ## Community
 
 Questions, ideas and early builds are welcome in either group:
@@ -358,7 +378,7 @@ Questions, ideas and early builds are welcome in either group:
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="docs/images/weixin.jpg" width="230" alt="WeChat group QR code"><br>
+      <img src="docs/images/weixin.png" width="230" alt="WeChat group QR code"><br>
       <sub><b>WeChat</b> — <a href="https://weixin.qq.com/g/AQYAAD8z3FmKPk143hi_HUVOtGvNqlHWMtVZu1VGGB_46JKoNpyhJvS7kDwQwUTr">微信交流群</a></sub>
     </td>
     <td align="center" width="50%">

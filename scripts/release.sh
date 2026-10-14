@@ -185,8 +185,8 @@ phase_push() {
 }
 
 phase_wait() {
-  note "wait for the release binaries (release-binaries.yml)"
-  local needed=()
+  note "wait for the release binaries and verified manifest (release-binaries.yml)"
+  local needed=("rpi-release.json")
   local entry target ext
   for entry in "${ASSET_TARGETS[@]}"; do
     target="${entry%%:*}"
@@ -194,7 +194,7 @@ phase_wait() {
     needed+=("rpi-$release_tag-$target.$ext" "rpi-$release_tag-$target.$ext.sha256")
   done
   if [[ "$DRY_RUN" == "1" ]]; then
-    echo "  \$ poll: gh release view $release_tag --json assets until all archives + .sha256 exist"
+    echo "  \$ poll: gh release view $release_tag --json assets until all archives + .sha256 + rpi-release.json exist"
     return
   fi
   local attempt
