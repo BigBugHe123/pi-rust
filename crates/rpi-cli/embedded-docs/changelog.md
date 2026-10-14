@@ -11,6 +11,29 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.3.24] - 2026-10-15
+
+### Added
+
+- Install prebuilt native extensions through the versioned `rpi-extension.json`
+  protocol. Resolve repositories from crates.io metadata or `--github`, use
+  package-specific release tags, and verify archive size, SHA-256, SDK ABI and
+  the exact native platform before installing.
+- Update the CLI from verified GitHub release binaries using `rpi-release.json`.
+  Keep Cargo compilation explicit with `--build`, and preserve the existing
+  executable or installed extension when validation or replacement fails.
+- Add a dedicated author sponsorship page with WeChat Pay, Alipay and Binance
+  Pay QR codes, plus a separate sponsorship button in the website header.
+
+### Changed
+
+- Publish the CLI distribution manifest only after all five platform archives
+  and their checksums are available. Retain repository provenance when updating
+  extensions installed from a custom GitHub repository.
+- Keep language selection across dynamically rendered documentation links,
+  guide navigation, reloads and blog navigation. Remove untranslated UI text
+  and keep README donation codes in a three-column Markdown table.
+
 ## [0.3.23] - 2026-10-13
 
 ### Changed
