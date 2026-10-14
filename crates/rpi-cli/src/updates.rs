@@ -170,15 +170,26 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
     // path stays independent of any Pi package resource discovery.
     let native_checks = crate::install::installed_native_packages()
         .into_iter()
-        .filter(|package| package.source.is_none())
+        .filter(|package| package.source.is_none() || package.prebuilt.is_some())
         .map(|package| {
             let client = client.clone();
             async move {
                 let latest = match client.as_ref() {
+                    Some(client) if package.prebuilt.is_some() => {
+                        match crate::prebuilt_extensions::latest_compatible_version(
+                            client, &package,
+                        )
+                        .await
+                        {
+                            Ok(Some(version)) => RegistryLookup::Found(version),
+                            Ok(None) => RegistryLookup::Missing,
+                            Err(_) => RegistryLookup::TransientFailure,
+                        }
+                    }
                     Some(client) => fetch_crates_latest(client, &package.name).await,
                     None => RegistryLookup::TransientFailure,
                 };
-                (package.name, latest)
+                (native_cache_key(&package), latest)
             }
         });
     let rpi_check = async {
@@ -344,6 +355,23 @@ fn lookup_with_cache_fallback(
         RegistryLookup::TransientFailure => (None, false),
     }
 }
+fn native_cache_key(package: &crate::install::InstalledNativePackage) -> String {
+    match &package.prebuilt {
+        Some(source) => format!(
+            "prebuilt:{}:{}#{}:{}",
+            if source.custom_repository {
+                "github"
+            } else {
+                "crates"
+            },
+            source.repository,
+            package.name,
+            source.target
+        ),
+        None => package.name.clone(),
+    }
+}
+
 fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
     let mut notices = Vec::new();
     if let Some(latest) = cache.rpi_latest.as_deref() {
@@ -357,10 +385,10 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
         }
     }
     for package in crate::install::installed_native_packages() {
-        if package.source.is_some() {
+        if package.source.is_some() && package.prebuilt.is_none() {
             continue;
         }
-        let Some(latest) = cache.native_packages.get(&package.name) else {
+        let Some(latest) = cache.native_packages.get(&native_cache_key(&package)) else {
             continue;
         };
         if is_newer(&package.version, latest) {
@@ -368,7 +396,18 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
                 name: package.name.clone(),
                 current: package.version,
                 latest: latest.clone(),
-                command: format!("rpi install {} --force", package.name),
+                command: if let Some(source) =
+                    package.prebuilt.as_ref().filter(|p| p.custom_repository)
+                {
+                    format!(
+                        "rpi install {} --github {} --force",
+                        package.name, source.repository
+                    )
+                } else if package.prebuilt.is_some() {
+                    format!("rpi install {} --force", package.name)
+                } else {
+                    format!("rpi install {} --build --force", package.name)
+                },
             });
         }
     }
@@ -2354,6 +2393,52 @@ fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prebuilt_update_notices_preserve_repository_and_separate_source_caches() {
+        let _guard = crate::config::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = tempfile::tempdir().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, agent.path());
+        let record: crate::install::InstalledNativePackage = serde_json::from_value(serde_json::json!({
+            "name":"demo", "version":"1.0.0", "source":"prebuilt:https://github.com/owner/repo", "artifacts":["custom.dll"],
+            "prebuilt":{"repository":"https://github.com/owner/repo","target":"x86_64-pc-windows-msvc",
+                "manifest_sha256":"a".repeat(64),"source_commit":"b".repeat(40),"sdk_version":"0.3.23","plugin_abi":4,
+                "archive_sha256":"c".repeat(64),"library_sha256":"d".repeat(64),"custom_repository":true}
+        })).unwrap();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[record.clone()]).unwrap(),
+        )
+        .unwrap();
+        let mut cache = super::UpdateCache::default();
+        cache.native_packages.insert("demo".into(), "99.0.0".into()); // old Cargo source cannot supply a prebuilt update
+        assert!(super::report_from_cache(&cache).notices.is_empty());
+        cache
+            .native_packages
+            .insert(super::native_cache_key(&record), "2.0.0".into());
+        let report = super::report_from_cache(&cache);
+        assert_eq!(report.notices.len(), 1);
+        assert_eq!(report.notices[0].latest, "2.0.0");
+        assert_eq!(
+            report.notices[0].command,
+            "rpi install demo --github https://github.com/owner/repo --force"
+        );
+        let mut other = record.clone();
+        other.prebuilt.as_mut().unwrap().repository = "https://github.com/another/repo".into();
+        assert_ne!(
+            super::native_cache_key(&record),
+            super::native_cache_key(&other)
+        );
+        other = record.clone();
+        other.prebuilt.as_mut().unwrap().custom_repository = false;
+        assert_ne!(
+            super::native_cache_key(&record),
+            super::native_cache_key(&other)
+        );
+    }
+
     /// Fixtures may live under an ambient TEMP that is itself a junction
     /// (e.g. `D:\Temp` on some Windows hosts). Ancestor links are resolved by
     /// the path validation rather than refused, so a plain `tempdir()` is a

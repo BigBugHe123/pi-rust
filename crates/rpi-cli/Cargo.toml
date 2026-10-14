@@ -42,6 +42,11 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 reqwest = { workspace = true }
+sha2 = "0.10"
+percent-encoding = "2"
+flate2 = "1"
+tar = "0.4"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
 dirs = { workspace = true }
 rpassword = { workspace = true }
 tempfile = { workspace = true }
