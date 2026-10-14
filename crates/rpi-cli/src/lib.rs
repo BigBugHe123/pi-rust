@@ -51,6 +51,8 @@ pub mod llama_command;
 pub mod model_registry;
 pub mod modes;
 pub mod packages;
+pub mod prebuilt_extensions;
+mod prebuilt_release;
 pub mod provider;
 pub mod remote;
 pub mod resource_dirs;

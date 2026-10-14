@@ -197,6 +197,18 @@ rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 rpi package link|list|unlink # 管理项目本地 Rust 扩展包
 ```
 
+### CLI 自更新
+
+`rpi update` 默认从 GitHub Release 下载预编译的 CLI，不需要本地 Rust/Cargo。
+版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
+压缩包/可执行文件的 SHA-256。校验目标平台、完整性和实际版本后，原子替换当前 CLI。
+Windows 会暂存更新，等待当前进程退出后完成替换。
+
+`rpi update --force` 重新安装已解析的版本；`rpi update --build` 显式使用 Cargo 源码编译。
+缺少 manifest、下载失败或校验不通过都会报错并保留原版本，不会自动转为编译。
+`--offline` 仅报告缓存的版本信息，不下载也不编译。旧 Release 没有 manifest 时，
+可等待协议资产补齐，或显式使用 `rpi update --build`。
+
 ### 启动资源清单
 
 启动 TUI 时，`Context` 会列出实际加载成功的系统提示词和项目指令文件路径，
@@ -318,13 +330,33 @@ cargo build -p plugin-stub
 rpi --extensions-dir target/debug -p 'echo "hi"'
 ```
 
-从 crates.io 安装：
+安装预编译扩展（默认，不需要 Rust/Cargo）：
 
 ```bash
-rpi install rpi-extension-example
-rpi install rpi-extension-example --version 0.1.0
-rpi install rpi-extension-example --force
+rpi install rpi-todo
+rpi install rpi-todo --version 0.2.0
+rpi install rpi-todo --force
 ```
+
+安装器从 crates.io 选择最新未撤回的稳定版本，并用包的 `repository` 元数据找到 GitHub 仓库，再读取 `<包名>-v<版本>` Release 中的 `rpi-extension.json`。它按精确目标三元组匹配预编译文件，校验压缩包大小和 SHA-256、解压后的库文件 SHA-256、平台架构及声明的 SDK ABI。库文件名以 manifest 的 `library.path` 为准。同一仓库里的扩展可以独立版本发布。
+
+指定自定义 GitHub 仓库（也接受完整 HTTPS 仓库 URL）：
+
+```bash
+rpi install my-extension --github owner/repo --version 1.2.3
+rpi install my-extension --github https://github.com/owner/repo
+```
+
+自定义仓库也须发布同一分发协议。显式仓库不依赖 crates.io；省略版本时，只在该仓库的 `<包名>-v<版本>` 标签中选择最新稳定版本。不会使用仓库的全局 latest Release。后续 `--force` 重装和启动更新检查会保留来源，并核对新版本的 manifest 是否适配当前平台。
+
+发布者必须先上传所声明平台的压缩包，最后上传 manifest。manifest 尚未发布、目标平台缺失或校验不通过时安装失败，不会自动编译或选择其他版本。需要源码编译时显式使用：
+
+```bash
+rpi install rpi-todo --build
+rpi install rpi-todo --build --version 0.2.0 --force
+```
+
+预编译安装记录包括版本、仓库、目标平台、源码提交、SDK ABI 和校验值；安装与卸载使用同一事务机制。加载时仍会验证实际插件入口与 API 结构大小。系统原生运行库依赖仍由操作系统提供。
 
 本地开发：
 

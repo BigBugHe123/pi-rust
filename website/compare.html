@@ -31,7 +31,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./styles.css?v=20261014-qr-crop" />
     <script defer src="https://stat.laofu.online/script.js" data-website-id="ed386bec-9be6-486a-b184-d72a437dd346" data-performance="true"></script>
     <script defer src="https://stat.laofu.online/recorder.js" data-website-id="ed386bec-9be6-486a-b184-d72a437dd346"></script>
   </head>
@@ -40,7 +40,7 @@
       <header class="topbar" data-sticky-header>
         <a class="brand" href="./index.html#top" aria-label="rpi home"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span></a>
         <nav class="desktop-nav" aria-label="主导航"><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">扩展</a><a class="is-current" href="./compare.html" data-i18n="nav.compare">对比</a><a href="https://blog.laofu.online/" target="_blank" rel="noreferrer" data-i18n="nav.blog">博客</a></nav>
-        <div class="topbar-actions"><button class="language-switcher" type="button" data-language-toggle>EN</button><a class="button button-small button-star" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer"><svg class="star-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 2.8 5.7 6.3.9-4.6 4.5 1.1 6.3-5.6-3-5.6 3 1.1-6.3L3 9.6l6.2-.9Z"/></svg><span data-i18n="action.star">Star 支持</span></a><a class="button button-small desktop-only" href="./index.html#get-started" data-i18n="nav.start">开始使用 <span aria-hidden="true">→</span></a><button class="menu-toggle" type="button" aria-label="打开导航" data-i18n-attr="aria-label|nav.open" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
+        <div class="topbar-actions"><button class="language-switcher" type="button" data-language-toggle>EN</button><a class="button button-small button-star" aria-label="Star 支持" data-i18n-attr="aria-label|action.star" href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer"><svg class="star-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 2.8 5.7 6.3.9-4.6 4.5 1.1 6.3-5.6-3-5.6 3 1.1-6.3L3 9.6l6.2-.9Z"/></svg><span data-i18n="action.star">Star 支持</span></a><a class="button button-small desktop-only" href="./index.html#get-started" data-i18n="nav.start">开始使用 <span aria-hidden="true">→</span></a><a class="button button-small button-sponsor" href="./support.html" target="_blank" rel="noopener noreferrer" data-i18n="support.author">赞助作者</a><button class="menu-toggle" type="button" aria-label="打开导航" data-i18n-attr="aria-label|nav.open" aria-expanded="false" data-menu-toggle><span></span><span></span></button></div>
       </header>
       <div class="mobile-menu" data-mobile-menu><a href="./index.html#top" data-i18n="nav.home">首页</a><a href="./docs.html" data-i18n="nav.documentation">文档</a><a href="./packages.html" data-i18n="nav.packages">扩展</a><a class="is-current" href="./compare.html" data-i18n="nav.compare">对比</a><a href="https://blog.laofu.online/" target="_blank" rel="noreferrer" data-i18n="nav.blog">博客</a></div>
 
@@ -57,12 +57,6 @@
           <h2 id="pi-performance-title" data-i18n="compare.performance.title">与原生 pi，同机实测。</h2>
           <p class="performance-intro" data-i18n="compare.performance.intro">Rust 原生的运行时开销有多小？对同一台机器上的 rpi 和原生 TypeScript pi，比较进程启动、内存与安装体积。</p>
           <p class="performance-versions" data-i18n="compare.performance.versions">测试日期 2026-09-30 · rpi 0.3.6 / pi 0.87.1</p>
-          <p class="performance-environment" data-i18n="compare.performance.environment">Windows 11 x86_64 · Rust release 构建 · Node v25.9.0 · 离线、空配置、无额外扩展</p>
-          <div class="performance-charts">
-            <figure class="performance-card"><figcaption><span data-i18n="compare.performance.cold">冷启动</span><strong data-i18n="compare.performance.coldGain">快 10.7×</strong></figcaption><div class="performance-series"><div class="performance-value"><span>rpi</span><strong>17.7 ms</strong></div><div class="performance-track" aria-hidden="true"><span class="performance-bar is-rpi" style="width:9.34%"></span></div></div><div class="performance-series"><div class="performance-value"><span data-i18n="compare.performance.nativePi">原生 pi</span><strong>189.5 ms</strong></div><div class="performance-track" aria-hidden="true"><span class="performance-bar is-pi" style="width:100%"></span></div></div></figure>
-            <figure class="performance-card"><figcaption><span data-i18n="compare.performance.memory">启动后内存</span><strong data-i18n="compare.performance.memoryGain">约 1/7.6 内存</strong></figcaption><div class="performance-series"><div class="performance-value"><span>rpi</span><strong>12.0 MiB</strong></div><div class="performance-track" aria-hidden="true"><span class="performance-bar is-rpi" style="width:13.11%"></span></div></div><div class="performance-series"><div class="performance-value"><span data-i18n="compare.performance.nativePi">原生 pi</span><strong>91.5 MiB</strong></div><div class="performance-track" aria-hidden="true"><span class="performance-bar is-pi" style="width:100%"></span></div></div></figure>
-            <figure class="performance-card"><figcaption><span data-i18n="compare.performance.install">安装体积（不含 Node）</span><strong data-i18n="compare.performance.installGain">约 1/18 体积</strong></figcaption><div class="performance-series"><div class="performance-value"><span>rpi</span><strong>21.8 MiB</strong></div><div class="performance-track" aria-hidden="true"><span class="performance-bar is-rpi" style="width:5.66%"></span></div></div><div class="performance-series"><div class="performance-value"><span data-i18n="compare.performance.nativePi">原生 pi</span><strong>~385 MiB</strong></div><div class="performance-track" aria-hidden="true"><span class="performance-bar is-pi" style="width:100%"></span></div></div></figure>
-          </div>
           <div class="compare-table-wrap performance-table-wrap" tabindex="0" role="region" aria-label="rpi 与原生 TypeScript pi 性能数据" data-i18n-attr="aria-label|compare.performance.tableLabel">
             <table class="compare-table performance-table">
               <caption data-i18n="compare.performance.tableCaption">同机基准结果；数值越小，运行时开销越低。</caption>
@@ -77,7 +71,6 @@
             </table>
           </div>
           <p class="performance-scope" data-i18n="compare.performance.scope">这里测量进程启动、就绪时内存与安装体积，不包含模型推理、工具循环吞吐或终端渲染性能。</p>
-          <details class="performance-method"><summary data-i18n="compare.performance.methodTitle">测试方法与测量范围</summary><p data-i18n="compare.performance.methodSetup">两者在同一台机器上运行，使用独立空配置目录、离线模式与相同的 JSONL get_state 就绪响应。冷启动从进程创建前开始计时，到收到就绪响应为止。</p><p data-i18n="compare.performance.methodRuns">启动时间先预热 3 次，再测量 11 次，取中位数；内存单独测量，避免采样干扰启动耗时。</p><p data-i18n="compare.performance.methodDisk">rpi 的 21.8 MiB 是独立二进制。pi 应用的 npm 安装目录约 385 MiB，加上约 91 MiB 的 Node 运行时后约 476 MiB。</p></details>
           <div class="performance-sources"><a href="https://github.com/bigfish1913/pi-rust/blob/main/docs/performance/benchmark-vs-pi.md" target="_blank" rel="noreferrer" data-i18n="compare.performance.rawData">完整方法与原始数据 ↗</a><a href="https://github.com/bigfish1913/pi-rust/blob/main/scripts/bench-vs-pi.mjs" target="_blank" rel="noreferrer" data-i18n="compare.performance.script">查看基准脚本 ↗</a></div>
         </section>
 
@@ -178,9 +171,9 @@
           </div>
         </section>
       </main>
-      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html" data-i18n="footer.home">首页</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><span>MIT License</span></div></footer>
+      <footer class="footer"><div class="footer-brand"><span class="brand-mark"><span></span><span></span><span></span></span><span>rpi</span><span class="footer-tagline">Rust Agent Toolkit</span></div><div class="footer-links"><a href="./index.html" data-i18n="footer.home">首页</a><a href="https://github.com/bigfish1913/pi-rust" target="_blank" rel="noreferrer">GitHub ↗</a><a href="./support.html" target="_blank" rel="noopener noreferrer" data-i18n="support.author">赞助作者</a><span>MIT License</span></div></footer>
       <div class="toast" role="status" aria-live="polite" data-toast></div>
     </div>
-    <script src="./compare.js" type="module"></script>
+    <script src="./compare.js?v=20261014-language-fix" type="module"></script>
   </body>
 </html>

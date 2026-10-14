@@ -1,4 +1,4 @@
-import { initI18n, getLocale, onLocaleChange } from './i18n.js';
+import { initI18n, getLocale, onLocaleChange, t } from './i18n.js?v=20261014-language-fix';
 
 const $ = (sel, scope = document) => scope.querySelector(sel);
 const $$ = (sel, scope = document) => [...scope.querySelectorAll(sel)];
@@ -10,6 +10,7 @@ const GUIDES = [
 ];
 
 let currentGuide = null;
+let guideLoadId = 0;
 const htmlCache = {};
 
 function bindMenu() {
@@ -56,36 +57,42 @@ function updateTocHighlight() {
 }
 
 async function loadGuide(guideId) {
+  const loadId = ++guideLoadId;
   const guide = GUIDES.find((item) => item.id === guideId) || GUIDES[0];
   currentGuide = guide;
   const locale = getLocale();
   const file = typeof guide.file === 'string' ? guide.file : (guide.file[locale] || guide.file.zh);
   const title = guide.title[locale] || guide.title.zh;
-  $('[data-guide-title]').textContent = title;
+  $$('[data-guide-title]').forEach((element) => { element.textContent = title; });
   document.title = `${title} · rpi`;
 
   const selector = $('[data-guide-selector]');
   selector.innerHTML = GUIDES.map((item) => `<button type="button" data-guide-id="${item.id}" class="${item.id === guide.id ? 'is-active' : ''}">${item.title[locale] || item.title.zh}</button>`).join('');
   $$('[data-guide-id]', selector).forEach((button) => button.addEventListener('click', () => {
-    history.replaceState(null, '', `?doc=${button.dataset.guideId}`);
+    const url = new URL(window.location.href);
+    url.searchParams.set('doc', button.dataset.guideId);
+    url.hash = '';
+    history.replaceState(null, '', `${url.pathname}${url.search}`);
     loadGuide(button.dataset.guideId);
   }));
 
   const body = $('[data-guide-body]');
-  body.innerHTML = '<div class="guide-loading">加载中...</div>';
+  body.innerHTML = `<div class="guide-loading">${t('guide.loading')}</div>`;
   try {
     if (!htmlCache[file]) {
       const response = await fetch(file);
       if (!response.ok) throw new Error(`Failed to load ${file}: ${response.status}`);
       htmlCache[file] = await response.text();
     }
+    if (loadId !== guideLoadId) return;
     body.innerHTML = htmlCache[file];
     renderToc();
     window.scrollTo({ top: 0, behavior: 'smooth' });
     updateTocHighlight();
   } catch (error) {
+    if (loadId !== guideLoadId) return;
     console.error(error);
-    body.innerHTML = '<div class="guide-error">加载失败，请稍后重试。</div>';
+    body.innerHTML = `<div class="guide-error">${t('guide.error')}</div>`;
   }
 }
 
@@ -104,5 +111,5 @@ async function init() {
 
 init().catch((error) => {
   console.error('Guide init failed:', error);
-  $('[data-guide-body]').innerHTML = '<div class="guide-error">加载失败。</div>';
+  $('[data-guide-body]').innerHTML = `<div class="guide-error">${t('guide.error')}</div>`;
 });

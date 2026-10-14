@@ -82,14 +82,15 @@ endpoint overrides also honour `ANTHROPIC_BASE_URL` and `ANTHROPIC_AUTH_TOKEN`.
 ## Plugins
 
 ```bash
-rpi install rpi-extension-example              # from crates.io
-rpi install rpi-extension-example --version 0.1.0
+rpi install rpi-todo                           # prebuilt: repository discovered via crates.io
+rpi install rpi-todo --version 0.2.0
+rpi install my-extension --github owner/repo --version 1.2.3
+rpi install rpi-todo --build                    # explicitly compile source
 rpi install my-extension --path ../my-extension --force   # local
 rpi dev                                        # build + watch a local extension
 ```
 
-`rpi install` builds the crate in release mode with Cargo and copies the
-resulting `.dll` / `.so` / `.dylib` into `~/.rpi/agent/extensions`.
+`rpi install` defaults to the versioned `rpi-extension.json` prebuilt protocol: it resolves a non-yanked stable package version and repository through crates.io, loads the `<package>-v<version>` Release manifest, and verifies the archive and declared library before transactionally installing it into `~/.rpi/agent/extensions`. Explicit `--github owner/repo` installs use package-specific tags and also support unpublished extensions. Both repository forms consume the same protocol; they never infer library filenames or use repository-wide latest bundles. Missing prebuilt releases fail with an actionable error; `--build` and `--path` explicitly select Cargo compilation. Installed provenance preserves the source for update discovery, reinstalls and uninstall. Actual plugin ABI/API-size validation still happens when loading the library.
 
 ## Remote mode
 
@@ -137,3 +138,7 @@ and [NOTICE](https://github.com/bigfish1913/pi-rust/blob/main/NOTICE).
 
 This crate is part of a Rust port of the MIT-licensed TypeScript `pi` SDK
 (© Mario Zechner).
+
+### CLI self-update
+
+`rpi update` downloads the matching GitHub prebuilt CLI using the versioned `rpi-release.json` distribution protocol. It verifies target, archive size, both SHA-256 hashes, and the executable version before using the existing atomic replacement and Windows staging helper. Version discovery uses crates.io. Only `rpi update --build` selects local Cargo compilation; missing manifests and failed checks preserve the installed executable. `--force` reinstalls and `--offline` reports cached information without downloads or builds.

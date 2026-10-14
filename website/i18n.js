@@ -3,6 +3,7 @@ const FALLBACK_LOCALE = 'zh';
 const listeners = new Set();
 let dictionary = null;
 let locale = detectLocale();
+let linkObserver = null;
 
 function detectLocale() {
   const queryLocale = new URLSearchParams(window.location.search).get('lang');
@@ -106,11 +107,18 @@ function syncLocaleLinks() {
 
 export async function initI18n() {
   if (!dictionary) {
-    const response = await fetch('./data/locales.json');
+    const response = await fetch('./data/locales.json?v=20261014-language-fix');
     dictionary = await response.json();
   }
+  persistLocale(locale);
   applyUi();
   syncLocaleLinks();
+  if (!linkObserver) {
+    // Rendered docs, catalog cards and blog links arrive after initialization.
+    // Watch inserted nodes so these links carry the selected language too.
+    linkObserver = new MutationObserver(syncLocaleLinks);
+    linkObserver.observe(document.body, { childList: true, subtree: true });
+  }
   document.querySelectorAll('[data-language-toggle]').forEach((button) => {
     if (button.dataset.i18nBound) return;
     button.dataset.i18nBound = 'true';

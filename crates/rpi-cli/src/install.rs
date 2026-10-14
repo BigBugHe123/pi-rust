@@ -1,8 +1,9 @@
-//! `rpi install` — install a Rust `cdylib` extension from crates.io.
+//! `rpi install` — install a prebuilt or explicitly built Rust `cdylib` extension.
 //!
 //! Cargo's `cargo install` command is intended for binaries and does not copy
 //! dynamic-library targets. rpi extensions are cdylibs loaded by
-//! `rpi-extensions`, so this command creates a tiny temporary Cargo workspace,
+//! `rpi-extensions`. The default async path uses the prebuilt distribution
+//! protocol; the explicit source backend creates a tiny temporary Cargo workspace,
 //! resolves the requested crate through Cargo, builds the dependency in
 //! release mode, and copies its cdylib into the same global directory scanned
 //! during normal startup.
@@ -21,15 +22,19 @@ const CDYLIB_EXTENSION_HINT: &str = "hint: the crate must declare `crate-type = 
 
 /// A Rust-native extension installed through `rpi install`.
 ///
-/// `source` is absent for crates.io packages and contains the local source
-/// path for `--path` installs. Local development crates are intentionally not
-/// eligible for automatic registry updates.
+/// `source` is absent for Cargo registry builds, contains the local source
+/// path for `--path`, or marks prebuilt packages so older hosts do not rebuild
+/// them. `prebuilt` stores distribution provenance. Local development crates
+/// are intentionally not eligible for automatic registry updates.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstalledNativePackage {
     pub name: String,
     pub version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Exact prebuilt distribution provenance. Missing in older Cargo/local records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prebuilt: Option<crate::prebuilt_extensions::PrebuiltRecord>,
     /// Dynamic-library file names copied into the extension store. Older
     /// metadata files omit this field; uninstall falls back to crate-name
     /// matching for those records.
@@ -103,6 +108,57 @@ struct InstallOptions {
     path: Option<PathBuf>,
     locked: bool,
     force: bool,
+    build: bool,
+    repository: Option<String>,
+}
+
+/// Default to the versioned prebuilt distribution protocol. Cargo builds are
+/// explicit (--build or --path) and run off the async worker.
+pub async fn run_async(args: &[String]) -> i32 {
+    if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
+        print_help();
+        return 0;
+    }
+    let options = match parse_args(args) {
+        Ok(options) => options,
+        Err(error) => {
+            eprintln!("error: {error}");
+            print_help();
+            return 2;
+        }
+    };
+    if let Err(error) = installed_native_packages_strict() {
+        eprintln!("error: cannot safely install while native package metadata is invalid: {error}");
+        return 1;
+    }
+    if options.build || options.path.is_some() {
+        let args = args.to_vec();
+        return match tokio::task::spawn_blocking(move || run(&args)).await {
+            Ok(code) => code,
+            Err(error) => {
+                eprintln!("error: extension build failed: {error}");
+                1
+            }
+        };
+    }
+    if crate::args::offline_env_enabled() {
+        eprintln!("error: prebuilt installation requires network access; use --build for an explicit Cargo build");
+        return 1;
+    }
+    match crate::prebuilt_extensions::install(
+        &options.package,
+        options.version.as_deref(),
+        options.repository.as_deref(),
+        options.force,
+    )
+    .await
+    {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +202,12 @@ pub fn run(args: &[String]) -> i32 {
     if let Err(error) = read_native_package_registry() {
         eprintln!("error: cannot safely install while native package metadata is invalid: {error}");
         return 1;
+    }
+    if !options.build && options.path.is_none() {
+        eprintln!(
+            "error: prebuilt installs use the async dispatcher; Cargo compilation requires --build"
+        );
+        return 2;
     }
 
     let temp = match tempfile::tempdir() {
@@ -244,6 +306,7 @@ pub fn run(args: &[String]) -> i32 {
             .path
             .as_ref()
             .map(|path| path.to_string_lossy().into_owned()),
+        prebuilt: None,
         artifacts: Vec::new(),
     };
     let installed = match install_native_package_at(
@@ -496,7 +559,7 @@ struct NativeBackup {
     backup: PathBuf,
 }
 
-fn install_native_package_at(
+pub(crate) fn install_native_package_at(
     destination: &Path,
     metadata_path: &Path,
     record: InstalledNativePackage,
@@ -936,12 +999,20 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
     let mut path = None;
     let mut locked = false;
     let mut force = false;
+    let mut build = false;
+    let mut repository = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--help" | "-h" => return Err(help_requested().to_string()),
+            "--offline" => {} // app normalizes this flag before dispatch
             "--locked" => locked = true,
             "--force" | "-f" => force = true,
+            "--build" => build = true,
+            "--github" => {
+                i += 1;
+                repository = Some(value(args, i, "--github")?);
+            }
             "--version" | "-V" => {
                 i += 1;
                 version = Some(value(args, i, "--version")?);
@@ -964,6 +1035,12 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
     if path.is_some() && version.is_some() {
         return Err("--path and --version cannot be used together".to_string());
     }
+    if repository.is_some() && (build || path.is_some()) {
+        return Err("--github cannot be combined with --build or --path".into());
+    }
+    if locked && !build && path.is_none() {
+        return Err("--locked requires --build or --path".into());
+    }
     let package = match package {
         Some(package) => package,
         None => {
@@ -982,6 +1059,8 @@ fn parse_args(args: &[String]) -> Result<InstallOptions, String> {
         path,
         locked,
         force,
+        build,
+        repository,
     })
 }
 
@@ -1048,9 +1127,7 @@ fn help_requested() -> &'static str {
 }
 
 pub fn print_help() {
-    println!(
-        "Usage: rpi install [<crate>] [options]\n\nInstall an rpi Rust cdylib extension from crates.io or a local Cargo crate.\n\nOptions:\n  --version <version>  Install a specific crates.io version\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged\n  --force, -f          Replace an existing installed extension\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-extension-example\n  rpi install rpi-extension-example --version 0.1.0\n  rpi install --path . --force\n  rpi install my-extension --path ../my-rpi-extension --force"
-    );
+    println!("Usage: rpi install [<crate>] [options]\n\nInstall a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Replace an existing installed extension\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
 }
 
 fn print_uninstall_help() {
@@ -1114,6 +1191,9 @@ fn cargo_command(
     if options.locked {
         command.arg("--locked");
     }
+    if crate::args::offline_env_enabled() {
+        command.arg("--offline");
+    }
     let status = command
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1137,6 +1217,9 @@ fn cargo_metadata(manifest: &Path, options: &InstallOptions) -> Result<CargoMeta
         .arg(manifest);
     if options.locked {
         command.arg("--locked");
+    }
+    if crate::args::offline_env_enabled() {
+        command.arg("--offline");
     }
     let output = command
         .output()
@@ -1211,6 +1294,7 @@ mod tests {
             name: name.to_string(),
             version: "1.2.3".to_string(),
             source: None,
+            prebuilt: None,
             artifacts: vec![format!("{name}.dll")],
         }
     }
@@ -1256,6 +1340,85 @@ mod tests {
         assert_eq!(parsed.package, "my-extension");
         assert_eq!(parsed.version.as_deref(), Some("1.2.3"));
         assert!(parsed.force);
+    }
+
+    #[test]
+    fn github_override_and_source_build_are_explicit_options() {
+        let custom = parse_args(&args(&[
+            "my-extension",
+            "--github",
+            "publisher/monorepo",
+            "--version",
+            "1.2.3",
+        ]))
+        .unwrap();
+        assert_eq!(custom.repository.as_deref(), Some("publisher/monorepo"));
+        assert_eq!(custom.version.as_deref(), Some("1.2.3"));
+        assert!(!custom.build);
+        let custom_url = parse_args(&args(&[
+            "my-extension",
+            "--github",
+            "https://github.com/publisher/monorepo",
+        ]))
+        .unwrap();
+        assert!(custom_url.repository.is_some());
+        assert!(
+            parse_args(&args(&["my-extension", "--build", "--locked"]))
+                .unwrap()
+                .build
+        );
+        assert!(parse_args(&args(&["my-extension", "--offline"])).is_ok());
+        assert!(parse_args(&args(&[
+            "my-extension",
+            "--github",
+            "owner/repo",
+            "--build"
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&[
+            "my-extension",
+            "--github",
+            "owner/repo",
+            "--path",
+            "."
+        ]))
+        .is_err());
+        assert!(parse_args(&args(&["my-extension", "--locked"])).is_err());
+    }
+
+    #[test]
+    fn synchronous_source_backend_cannot_silently_compile_a_prebuilt_request() {
+        let _agent = TempAgent::new();
+        assert_eq!(run(&args(&["demo"])), 2);
+        assert_eq!(
+            run(&args(&[
+                "demo",
+                "--github",
+                "publisher/repo",
+                "--version",
+                "1.2.3"
+            ])),
+            2
+        );
+    }
+
+    #[test]
+    fn uninstall_prebuilt_package_uses_its_recorded_library_name() {
+        let agent = TempAgent::new();
+        let directory = agent.temp.path().join("extensions");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("different_library.dll"), b"prebuilt library").unwrap();
+        let record: InstalledNativePackage = serde_json::from_value(serde_json::json!({
+            "name":"demo", "version":"1.2.3", "source":"prebuilt:https://github.com/owner/repo",
+            "artifacts":["different_library.dll"],
+            "prebuilt":{"repository":"https://github.com/owner/repo", "target":"x86_64-pc-windows-msvc",
+                "manifest_sha256":"a".repeat(64),"source_commit":"b".repeat(40),"sdk_version":"0.3.23","plugin_abi":4,
+                "archive_sha256":"c".repeat(64),"library_sha256":"d".repeat(64),"custom_repository":true}
+        })).unwrap();
+        write_native_packages_at(&agent.metadata_path(), &[record]).unwrap();
+        assert_eq!(uninstall(&args(&["demo"])), 0);
+        assert!(!directory.join("different_library.dll").exists());
+        assert!(installed_native_packages_strict().unwrap().is_empty());
     }
 
     #[test]
@@ -1307,6 +1470,7 @@ mod tests {
                 name: "demo".to_string(),
                 version: "1.2.3".to_string(),
                 source: None,
+                prebuilt: None,
                 artifacts: Vec::new(),
             }])
         );
@@ -1357,6 +1521,7 @@ mod tests {
             name: "demo".into(),
             version: "1.0.0".into(),
             source: None,
+            prebuilt: None,
             artifacts: vec!["old.dll".into(), "same.dll".into()],
         };
         write_native_packages_at(&metadata_path, &[old]).unwrap();
@@ -1370,6 +1535,7 @@ mod tests {
                 name: "demo".into(),
                 version: "2.0.0".into(),
                 source: None,
+                prebuilt: None,
                 artifacts: Vec::new(),
             },
             &[build.join("new.dll"), build.join("same.dll")],
@@ -1414,6 +1580,7 @@ mod tests {
             name: "demo".into(),
             version: "1.0.0".into(),
             source: None,
+            prebuilt: None,
             artifacts: vec!["old.dll".into(), "same.dll".into()],
         };
         write_native_packages_at(&metadata_path, &[old]).unwrap();
@@ -1428,6 +1595,7 @@ mod tests {
                 name: "demo".into(),
                 version: "2.0.0".into(),
                 source: None,
+                prebuilt: None,
                 artifacts: Vec::new(),
             },
             &[build.join("new.dll"), build.join("same.dll")],
@@ -1543,6 +1711,7 @@ mod tests {
                 name: "demo".into(),
                 version: "1.2.3".into(),
                 source: None,
+                prebuilt: None,
                 artifacts: vec!["recorded.dll".into()],
             }],
         )

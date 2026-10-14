@@ -158,7 +158,8 @@ rpi auth login|check|logout
 rpi events path|tail
 rpi install <crate>
 rpi uninstall <crate>
-rpi update
+rpi update                 # download a verified GitHub prebuilt CLI
+rpi update --build         # explicitly compile with Cargo
 rpi dev [options]
 rpi dev-local [options]
 rpi package link|list|unlink
@@ -361,3 +362,7 @@ When a release changes user-visible behavior, update the release notes, README, 
 - Architecture: `docs/architecture/overview.md`
 
 When the online site and an installed binary differ, use the documentation shipped with the matching Git tag and release. The CLI's `docs` tool can query the local documentation snapshot without depending on the website.
+
+### CLI self-update distribution
+
+`rpi update` resolves the released version through crates.io and downloads the matching GitHub `rpi-release.json` distribution. It verifies the exact target, archive size, archive and executable SHA-256, and the executable’s version before transactional replacement. Windows applies the staged update after the running process exits. Missing manifests and failed downloads/checks do not silently invoke Cargo; use `--build` explicitly. `--force` reinstalls the resolved version and `--offline` only reports cached information. See [the CLI distribution protocol](../distribution/prebuilt-cli.md).

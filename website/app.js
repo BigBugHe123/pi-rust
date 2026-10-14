@@ -1,4 +1,4 @@
-import { getLocale, initI18n, localizeData, onLocaleChange, t } from './i18n.js';
+import { getLocale, initI18n, localizeData, onLocaleChange, t } from './i18n.js?v=20261014-language-fix';
 
 const state = { rawData: null, data: null, activeExample: 0 };
 const $ = (selector, scope = document) => scope.querySelector(selector);

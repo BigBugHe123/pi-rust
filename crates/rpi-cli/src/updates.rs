@@ -170,15 +170,26 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
     // path stays independent of any Pi package resource discovery.
     let native_checks = crate::install::installed_native_packages()
         .into_iter()
-        .filter(|package| package.source.is_none())
+        .filter(|package| package.source.is_none() || package.prebuilt.is_some())
         .map(|package| {
             let client = client.clone();
             async move {
                 let latest = match client.as_ref() {
+                    Some(client) if package.prebuilt.is_some() => {
+                        match crate::prebuilt_extensions::latest_compatible_version(
+                            client, &package,
+                        )
+                        .await
+                        {
+                            Ok(Some(version)) => RegistryLookup::Found(version),
+                            Ok(None) => RegistryLookup::Missing,
+                            Err(_) => RegistryLookup::TransientFailure,
+                        }
+                    }
                     Some(client) => fetch_crates_latest(client, &package.name).await,
                     None => RegistryLookup::TransientFailure,
                 };
-                (package.name, latest)
+                (native_cache_key(&package), latest)
             }
         });
     let rpi_check = async {
@@ -344,6 +355,23 @@ fn lookup_with_cache_fallback(
         RegistryLookup::TransientFailure => (None, false),
     }
 }
+fn native_cache_key(package: &crate::install::InstalledNativePackage) -> String {
+    match &package.prebuilt {
+        Some(source) => format!(
+            "prebuilt:{}:{}#{}:{}",
+            if source.custom_repository {
+                "github"
+            } else {
+                "crates"
+            },
+            source.repository,
+            package.name,
+            source.target
+        ),
+        None => package.name.clone(),
+    }
+}
+
 fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
     let mut notices = Vec::new();
     if let Some(latest) = cache.rpi_latest.as_deref() {
@@ -357,10 +385,10 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
         }
     }
     for package in crate::install::installed_native_packages() {
-        if package.source.is_some() {
+        if package.source.is_some() && package.prebuilt.is_none() {
             continue;
         }
-        let Some(latest) = cache.native_packages.get(&package.name) else {
+        let Some(latest) = cache.native_packages.get(&native_cache_key(&package)) else {
             continue;
         };
         if is_newer(&package.version, latest) {
@@ -368,7 +396,18 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
                 name: package.name.clone(),
                 current: package.version,
                 latest: latest.clone(),
-                command: format!("rpi install {} --force", package.name),
+                command: if let Some(source) =
+                    package.prebuilt.as_ref().filter(|p| p.custom_repository)
+                {
+                    format!(
+                        "rpi install {} --github {} --force",
+                        package.name, source.repository
+                    )
+                } else if package.prebuilt.is_some() {
+                    format!("rpi install {} --force", package.name)
+                } else {
+                    format!("rpi install {} --build --force", package.name)
+                },
             });
         }
     }
@@ -474,7 +513,7 @@ pub fn print_startup_notices(report: &UpdateReport) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelfUpdateArgs {
     Help,
-    Run { force: bool },
+    Run { force: bool, build: bool },
     Usage,
 }
 
@@ -482,21 +521,24 @@ enum SelfUpdateArgs {
 /// stripped.
 fn parse_self_update_args(args: &[String]) -> SelfUpdateArgs {
     let mut force = false;
+    let mut build = false;
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => return SelfUpdateArgs::Help,
             "--force" | "-f" => force = true,
+            "--build" => build = true,
             _ => return SelfUpdateArgs::Usage,
         }
     }
-    SelfUpdateArgs::Run { force }
+    SelfUpdateArgs::Run { force, build }
 }
 
 fn print_self_update_help() {
     println!(
-        "Usage: rpi update [--force] [--offline]\n\n\
-         Update the rpi CLI from crates.io.\n\n\
+        "Usage: rpi update [--force] [--offline] [--build]\n\n\
+         Update the rpi CLI using verified GitHub prebuilt releases.\n\n\
          Options:\n  \
+         --build    explicitly compile with Cargo instead of downloading a prebuilt binary\n  \
          --force    reinstall even when this rpi is already the latest release\n  \
          --offline  do not touch the network; report the last known answer only"
     );
@@ -519,9 +561,13 @@ async fn lookup_latest_rpi() -> Option<(String, bool)> {
         .ok()
         .map(|dir| dir.join(CACHE_FILE));
     let cached = cache_path.as_deref().and_then(read_cache);
-    let result = match startup_http_client() {
-        Some(client) => fetch_rpi_latest(&client).await,
-        None => RegistryLookup::TransientFailure,
+    let result = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(format!("rpi/{}", crate::VERSION))
+        .build()
+    {
+        Ok(client) => fetch_rpi_latest(&client).await,
+        Err(_) => RegistryLookup::TransientFailure,
     };
     // Only a live registry answer counts as verified; a value that came back
     // from the cache means the request failed and the version is up to six
@@ -535,8 +581,7 @@ async fn lookup_latest_rpi() -> Option<(String, bool)> {
     latest.map(|latest| (latest, verified))
 }
 
-/// `rpi update` is synchronous — the `cargo install` it guards blocks the same
-/// way — so the one registry request it makes runs on its own thread and
+/// `rpi update` is synchronous, so its registry lookup runs on its own thread and
 /// current-thread runtime. That also keeps it safe to call from inside a Tokio
 /// runtime, which is where the CLI enters it.
 fn lookup_latest_rpi_blocking() -> Option<(String, bool)> {
@@ -618,20 +663,19 @@ fn reclaim_self_update_artifacts() {
     }
 }
 
-/// Update the installed rpi CLI through its documented crates.io install path.
-/// Windows stages first because a running executable cannot replace itself;
-/// other platforms retain Cargo's direct replacement behavior.
+/// Download a verified CLI release by default; --build explicitly selects Cargo.
+/// Both paths use the same staging validation and transactional replacement.
 pub fn run_self_update(args: &[String]) -> i32 {
     let offline = crate::args::normalize_offline_mode(args);
     let args = crate::args::without_offline_flag(args);
-    let force = match parse_self_update_args(&args) {
+    let (force, build) = match parse_self_update_args(&args) {
         SelfUpdateArgs::Help => {
             print_self_update_help();
             return 0;
         }
-        SelfUpdateArgs::Run { force } => force,
+        SelfUpdateArgs::Run { force, build } => (force, build),
         SelfUpdateArgs::Usage => {
-            eprintln!("error: `rpi update` accepts only `--force` and `--offline`");
+            eprintln!("error: `rpi update` accepts only `--force`, `--offline` and `--build`");
             return 2;
         }
     };
@@ -663,10 +707,15 @@ pub fn run_self_update(args: &[String]) -> i32 {
     // `cargo install` and schedules a binary replacement for the version that
     // is already installed — which is exactly what makes a working update look
     // broken. `--force` keeps an explicit reinstall available.
+    let release = if !build || !force {
+        lookup_latest_rpi_blocking()
+    } else {
+        None
+    };
     if !force {
         reclaim_self_update_artifacts();
         let staged = pending_staged_version();
-        let (latest, verified) = match lookup_latest_rpi_blocking() {
+        let (latest, verified) = match release.clone() {
             Some(found) => found,
             None if staged.is_some() => {
                 println!(
@@ -677,7 +726,7 @@ pub fn run_self_update(args: &[String]) -> i32 {
             None => {
                 println!(
                     "could not reach crates.io to check the latest release\n\
-                     Run `rpi update --force` to install the newest version anyway."
+                     Retry later, or use `rpi update --build --force` for an explicit Cargo build."
                 );
                 return 1;
             }
@@ -714,14 +763,19 @@ pub fn run_self_update(args: &[String]) -> i32 {
         }
     }
 
+    if !build && release.is_none() {
+        eprintln!("error: could not resolve the release version; retry later or select --build explicitly");
+        return 1;
+    }
+    let version = release.as_ref().map(|(version, _)| version.as_str());
     let code = {
         #[cfg(windows)]
         {
-            run_windows_self_update()
+            run_windows_self_update(build, version)
         }
         #[cfg(not(windows))]
         {
-            run_direct_self_update()
+            run_direct_self_update(build, version)
         }
     };
     if code == 0 {
@@ -786,6 +840,52 @@ fn cargo_install_command(
     // adds a path that will not exist a second later. Errors still print.
     command.args(["rpi-cli", "--locked", "--force", "--quiet"]);
     Ok(command)
+}
+
+/// Both distribution paths feed the same validated staging/atomic replacement.
+/// Cargo is only reached when the user explicitly selects --build.
+fn prepare_self_update(staging: &Path, build: bool, version: Option<&str>) -> Result<(), String> {
+    if build {
+        let command_dir = create_self_update_command_dir()?;
+        let status = cargo_install_command(Some(staging), command_dir.path())?
+            .status()
+            .map_err(|e| format!("could not run Cargo: {e}"))?;
+        return if status.success() {
+            Ok(())
+        } else {
+            Err(format!("cargo install exited with {status}"))
+        };
+    }
+    let version = version
+        .ok_or("no verified release version is available")?
+        .to_string();
+    let staging = staging.to_path_buf();
+    std::thread::Builder::new()
+        .name("rpi-prebuilt-update".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| e.to_string())?;
+            runtime.block_on(crate::prebuilt_release::download_to(&version, &staging))
+        })
+        .map_err(|e| e.to_string())?
+        .join()
+        .map_err(|_| "prebuilt update worker failed".to_string())?
+}
+
+pub(crate) fn validate_downloaded_rpi(
+    path: &Path,
+    staging: &Path,
+    expected: &str,
+) -> Result<(), String> {
+    let found = validate_rpi_executable_version(path, staging, crate::VERSION, "downloaded rpi")?;
+    if found.to_string() != expected {
+        return Err(format!(
+            "downloaded rpi version {found} does not match manifest {expected}"
+        ));
+    }
+    Ok(())
 }
 
 /// Cargo discovers `.cargo/config.toml` from its working directory upward.
@@ -948,7 +1048,7 @@ struct DirectUpdatePlan {
 }
 
 #[cfg(not(windows))]
-fn run_direct_self_update() -> i32 {
+fn run_direct_self_update(build: bool, version: Option<&str>) -> i32 {
     let staging = match create_self_update_staging_directory() {
         Ok(directory) => directory,
         Err(error) => {
@@ -956,31 +1056,9 @@ fn run_direct_self_update() -> i32 {
             return 1;
         }
     };
-    let command_dir = match create_self_update_command_dir() {
-        Ok(directory) => directory,
-        Err(error) => {
-            eprintln!("error: could not create an isolated self-update directory: {error}");
-            return 1;
-        }
-    };
-    let mut command = match cargo_install_command(Some(staging.path()), command_dir.path()) {
-        Ok(command) => command,
-        Err(error) => {
-            eprintln!("error: invalid isolated self-update directory: {error}");
-            return 1;
-        }
-    };
-    let status = command.status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            eprintln!("error: cargo install exited with {status}");
-            return 1;
-        }
-        Err(error) => {
-            eprintln!("error: could not run cargo (install Rust/Cargo first): {error}");
-            return 1;
-        }
+    if let Err(error) = prepare_self_update(staging.path(), build, version) {
+        eprintln!("error: {error}");
+        return 1;
     }
 
     let current_exe = match std::env::current_exe() {
@@ -1468,7 +1546,7 @@ exit 0
 "#;
 
 #[cfg(windows)]
-fn run_windows_self_update() -> i32 {
+fn run_windows_self_update(build: bool, version: Option<&str>) -> i32 {
     let staging = match create_windows_update_staging() {
         Ok(staging) => staging,
         Err(error) => {
@@ -1502,39 +1580,10 @@ fn run_windows_self_update() -> i32 {
         }
     };
 
-    let command_dir = match create_self_update_command_dir() {
-        Ok(directory) => directory,
-        Err(error) => {
-            let message = format!("could not create an isolated Cargo directory: {error}");
-            let _ = write_windows_update_status(&status_file, "failed", &message);
-            eprintln!("error: {message}");
-            return 1;
-        }
-    };
-    let mut cargo = match cargo_install_command(Some(&staging_dir), command_dir.path()) {
-        Ok(command) => command,
-        Err(error) => {
-            let message = format!("invalid isolated Cargo directory: {error}");
-            let _ = write_windows_update_status(&status_file, "failed", &message);
-            eprintln!("error: {message}");
-            return 1;
-        }
-    };
-    let status = cargo.status();
-    match status {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            let message = format!("cargo install exited with {status}");
-            let _ = write_windows_update_status(&status_file, "failed", &message);
-            eprintln!("error: {message}");
-            return 1;
-        }
-        Err(error) => {
-            let message = format!("could not run cargo (install Rust/Cargo first): {error}");
-            let _ = write_windows_update_status(&status_file, "failed", &message);
-            eprintln!("error: {message}");
-            return 1;
-        }
+    if let Err(error) = prepare_self_update(&staging_dir, build, version) {
+        let _ = write_windows_update_status(&status_file, "failed", &error);
+        eprintln!("error: {error}");
+        return 1;
     }
 
     let plan = match build_windows_update_plan(&staging_dir, &current_exe, &status_file) {
@@ -2354,6 +2403,52 @@ fn write_windows_update_status(path: &Path, state: &str, message: &str) -> Resul
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prebuilt_update_notices_preserve_repository_and_separate_source_caches() {
+        let _guard = crate::config::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = tempfile::tempdir().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, agent.path());
+        let record: crate::install::InstalledNativePackage = serde_json::from_value(serde_json::json!({
+            "name":"demo", "version":"1.0.0", "source":"prebuilt:https://github.com/owner/repo", "artifacts":["custom.dll"],
+            "prebuilt":{"repository":"https://github.com/owner/repo","target":"x86_64-pc-windows-msvc",
+                "manifest_sha256":"a".repeat(64),"source_commit":"b".repeat(40),"sdk_version":"0.3.23","plugin_abi":4,
+                "archive_sha256":"c".repeat(64),"library_sha256":"d".repeat(64),"custom_repository":true}
+        })).unwrap();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[record.clone()]).unwrap(),
+        )
+        .unwrap();
+        let mut cache = super::UpdateCache::default();
+        cache.native_packages.insert("demo".into(), "99.0.0".into()); // old Cargo source cannot supply a prebuilt update
+        assert!(super::report_from_cache(&cache).notices.is_empty());
+        cache
+            .native_packages
+            .insert(super::native_cache_key(&record), "2.0.0".into());
+        let report = super::report_from_cache(&cache);
+        assert_eq!(report.notices.len(), 1);
+        assert_eq!(report.notices[0].latest, "2.0.0");
+        assert_eq!(
+            report.notices[0].command,
+            "rpi install demo --github https://github.com/owner/repo --force"
+        );
+        let mut other = record.clone();
+        other.prebuilt.as_mut().unwrap().repository = "https://github.com/another/repo".into();
+        assert_ne!(
+            super::native_cache_key(&record),
+            super::native_cache_key(&other)
+        );
+        other = record.clone();
+        other.prebuilt.as_mut().unwrap().custom_repository = false;
+        assert_ne!(
+            super::native_cache_key(&record),
+            super::native_cache_key(&other)
+        );
+    }
+
     /// Fixtures may live under an ambient TEMP that is itself a junction
     /// (e.g. `D:\Temp` on some Windows hosts). Ancestor links are resolved by
     /// the path validation rather than refused, so a plain `tempdir()` is a
@@ -2631,13 +2726,26 @@ mod tests {
     fn self_update_arguments_are_parsed_explicitly() {
         let args = |list: &[&str]| list.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         assert_eq!(
+            super::parse_self_update_args(&args(&["--build", "--force"])),
+            super::SelfUpdateArgs::Run {
+                force: true,
+                build: true
+            }
+        );
+        assert_eq!(
             super::parse_self_update_args(&args(&[])),
-            super::SelfUpdateArgs::Run { force: false }
+            super::SelfUpdateArgs::Run {
+                force: false,
+                build: false
+            }
         );
         for flag in ["--force", "-f"] {
             assert_eq!(
                 super::parse_self_update_args(&args(&[flag])),
-                super::SelfUpdateArgs::Run { force: true }
+                super::SelfUpdateArgs::Run {
+                    force: true,
+                    build: false
+                }
             );
         }
         for flag in ["--help", "-h"] {
@@ -2656,6 +2764,14 @@ mod tests {
             super::parse_self_update_args(&args(&["--nope"])),
             super::SelfUpdateArgs::Usage
         );
+    }
+
+    #[test]
+    fn default_self_update_requires_a_release_and_never_falls_back_to_cargo() {
+        let staging = tempfile::tempdir().unwrap();
+        let error = super::prepare_self_update(staging.path(), false, None).unwrap_err();
+        assert!(error.contains("no verified release version"));
+        assert_eq!(std::fs::read_dir(staging.path()).unwrap().count(), 0);
     }
 
     #[test]

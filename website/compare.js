@@ -1,4 +1,4 @@
-import { initI18n } from './i18n.js';
+import { initI18n } from './i18n.js?v=20261014-language-fix';
 
 const $ = (selector, scope = document) => scope.querySelector(selector);
 const $$ = (selector, scope = document) => [...scope.querySelectorAll(selector)];

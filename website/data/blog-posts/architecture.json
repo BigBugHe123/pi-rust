@@ -8,7 +8,7 @@
   },
   "summary": {
     "zh": "rpi 采用严格的单向依赖分层架构，从底层的 rpi-telemetry 到顶层的 rpi-cli，每一层都有明确的边界和职责。本文深入解析这种设计如何保持核心库轻盈，同时让扩展有明确的落点。",
-    "en": "rpi adopts a strict unidirectional layered architecture, from the底层 rpi-telemetry to the top-level rpi-cli, with each layer having clear boundaries and responsibilities. This article dives into how this design keeps the core library lightweight while giving extensions a clear place to land."
+    "en": "rpi adopts a strict unidirectional layered architecture, from the foundational rpi-telemetry to the top-level rpi-cli, with each layer having clear boundaries and responsibilities. This article dives into how this design keeps the core library lightweight while giving extensions a clear place to land."
   },
   "body": {
     "zh": [

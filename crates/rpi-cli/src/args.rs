@@ -650,7 +650,7 @@ pub fn print_help() {
                                 (see `rpi auth --help`)
   events path|tail               Inspect the extension event journal (needs
                                 RPI_EVENT_LOG=1; see `rpi events --help`)
-  install <crate>                Build and install a Rust cdylib extension
+  install <crate>                Install a prebuilt Rust extension (--build for source)
                                 (see `rpi install --help`)
   uninstall <crate>              Remove an installed Rust cdylib extension
   package link|list|update|unlink Manage project-local Rust extension packages

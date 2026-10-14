@@ -9,7 +9,7 @@
 
 | 项目 | Rust 原生扩展 |
 | --- | --- |
-| 安装 | `rpi install crate-name`（crates.io 或 `--path`） |
+| 安装 | `rpi install crate-name`（预编译协议）；`--build` / `--path`（源码） |
 | 入口 | `rpi_plugin_register` C ABI 符号 |
 | 开发反馈 | `rpi dev` watch + 热重载；`rpi dev-local` 隔离调试 |
 | 静态资源 | `resources_discover` 或随项目放入 `.rpi` |
@@ -367,7 +367,7 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
   `rpi_plugin_register`。
 - 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
-- `rpi install <crate> --force` 的干净安装路径通过。
+- `rpi install <crate> --build --force` 的干净安装路径通过。
 - Linux/macOS/Windows 构建由 CI 验证，README 标明支持矩阵。
 
 ## 10. 模型执行规则
@@ -378,5 +378,5 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 2. 阅读当前仓库现有 manifest、SDK 版本和相邻扩展约定，不猜 API。
 3. 优先复制 `examples/plugin-stub` 的最小骨架。
 4. 实现领域逻辑与边界测试，再连接 loader/ABI。
-5. 使用 `rpi dev --no-watch` 与 `rpi install <crate> --force` 做真实 smoke test。
+5. 使用 `rpi dev --no-watch` 与 `rpi install <crate> --build --force` 做真实 smoke test。
 6. 不声称未验证的 Pi capability 已完全兼容；明确记录降级行为。

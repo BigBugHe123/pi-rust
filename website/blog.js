@@ -1,4 +1,4 @@
-import { initI18n, t, getLocale, onLocaleChange } from './i18n.js';
+import { initI18n, t, getLocale, onLocaleChange } from './i18n.js?v=20261014-language-fix';
 
 const $ = (sel, scope = document) => scope.querySelector(sel);
 const $$ = (sel, scope = document) => [...scope.querySelectorAll(sel)];
@@ -200,7 +200,7 @@ function hidePostDetail() {
   list.style.display = '';
   
   // 清除 URL hash
-  history.pushState(null, '', window.location.pathname);
+  history.pushState(null, '', `${window.location.pathname}${window.location.search}`);
 }
 
 async function loadPosts() {
@@ -225,7 +225,7 @@ async function loadPosts() {
   
   for (const file of postFiles) {
     try {
-      const response = await fetch(`./data/blog-posts/${file}`);
+      const response = await fetch(`./data/blog-posts/${file}?v=20261014-language-fix`);
       const post = await response.json();
       posts.push(post);
     } catch (err) {
