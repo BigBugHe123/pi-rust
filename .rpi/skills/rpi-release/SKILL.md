@@ -7,6 +7,14 @@ description: 发布 rpi Rust workspace 的版本，包含预检、版本递增�
 
 ## 目标
 
+日常发布使用 Release PR：普通 PR（包括 fork PR）不修改版本号；合并 main 并通过 CI 后，
+release-plz 自动准备统一版本和 CHANGELOG。维护者合并 Release PR 后，CI 自动发布九个
+crate、五个平台二进制、Homebrew/Scoop，并向 Microsoft winget 提交 PR。
+实现入口为 `.github/workflows/release.yml`，配置及凭据见 `docs/maintaining/releasing.md`。
+不要把普通 PR 的合并当作直接发布许可，也不要在 fork/PR 事件中使用发布密钥。
+
+以下 Task 命令保留为手动发布与失败恢复工具；不要与正在进行的自动发布重复执行。
+
 本项目的标准发布入口是根目录的 `Taskfile.yml`：
 
 ```bash

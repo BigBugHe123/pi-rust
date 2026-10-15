@@ -1,6 +1,70 @@
 # Releasing rpi
 
-One command cuts a release and ships it to every channel:
+## Normal releases: merge the Release PR
+
+Contributors, including fork contributors, submit code and tests without changing
+versions. After an ordinary PR lands on `main` and all CI checks pass,
+`release-plz` creates or updates a draft Release PR. It prepares the version and
+root changelog, synchronizes the embedded documentation, validates the nine
+crates, and marks the PR ready. The shared workspace version and `rpi` version
+group keep the nine core crates together; examples are excluded.
+
+Merge that Release PR when ready to ship. After its main-branch CI passes:
+
+1. The existing release helper publishes the nine crates in dependency order.
+2. Automation creates `vX.Y.Z` at the tested main commit. Existing tags are never
+   moved; retrying the same release commit is supported.
+3. A reusable workflow builds all five platforms, verifies the archives, uploads
+   their checksums and publishes `rpi-release.json` last.
+4. Homebrew and Scoop are updated independently; a new-version PR is submitted
+   to `microsoft/winget-pkgs`. Microsoft review/CLA completion remains external.
+
+No release runs in fork repositories or on PR events. Publication additionally
+requires a merged PR from an upstream `release-plz-*` branch whose merge commit
+matches the tested main commit. A fork branch with that name does not qualify.
+Do not use `pull_request_target` to execute contribution code with release secrets.
+
+### One-time setup
+
+The repository already uses `CARGO_REGISTRY_TOKEN` for crates.io. Add one secret,
+`RELEASE_AUTOMATION_TOKEN`, for preparing PRs and writing the external channels.
+Use a maintainer or dedicated bot **classic PAT with `public_repo`**, with access
+to these public repositories:
+
+- `bigfish1913/pi-rust`: create/update Release PRs. Using a user token also lets
+  those PRs and the documentation follow-up commit trigger their normal CI.
+- `bigfish1913/homebrew-tap` and `bigfish1913/scoop-bucket`: update channel files.
+- The token owner's fork of `microsoft/winget-pkgs`: create/sync the fork, push
+  manifest branches, and submit upstream PRs. The upstream repository belongs to
+  Microsoft; an own-repositories-only fine-grained token is not a replacement
+  for this public contribution permission. See [GitHub's token limitations](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens#fine-grained-personal-access-tokens-limitations).
+
+Set it in repository Settings → Secrets and variables → Actions, or locally with
+`gh secret set RELEASE_AUTOMATION_TOKEN --repo bigfish1913/pi-rust` (interactive
+input). Never put the token in a commit or PR description. The publishing jobs
+use the built-in `GITHUB_TOKEN` for this repository and the Cargo secret only in
+the crates publishing step. The automation token is only supplied to the steps
+that prepare PRs or write channels.
+
+The binaries workflow is called directly after tag creation: a tag created with
+the built-in `GITHUB_TOKEN` does not start another push-triggered workflow.
+
+### Recovery and release records
+
+- Re-run failed jobs on the Release PR's original main CI run. Existing crates
+  are skipped by the release helper; an existing tag must match the same commit.
+- For a channel failure, run **Release install channels** from Actions on `main`
+  with the published tag. It verifies all five archives before regenerating
+  manifests. Existing winget PRs/files are reused; closed submissions require
+  maintainer inspection. Tap updates refuse to downgrade a newer version.
+- Each run saves `channel-manifests-vX.Y.Z` as an artifact. The checked-in
+  `packaging/` files are the baseline; generated manifests carry the actual
+  published version/checksums. No bot commits directly to protected `main`.
+- Website deployment remains the separate `task rpi-deploy` operation.
+
+## Manual release and recovery tools
+
+The existing local entry point remains available:
 
 ```bash
 task publish                 # auto-increments the version (patch)
@@ -71,7 +135,8 @@ below are available through `task publish` too.
 | `--skip a,b` | skip these phases |
 | `--date YYYY-MM-DD` | changelog/`ReleaseDate` date (default: today, UTC) |
 
-Recovery is just a re-run from the failed phase — every phase is idempotent:
+Resume from the failed phase without repeating the version bump or creating an
+existing tag again:
 
 ```bash
 # CI needed longer than the poll window:

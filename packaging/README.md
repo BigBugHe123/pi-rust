@@ -23,6 +23,14 @@ has open, which is traffic the website cannot reach.
 
 ## Cutting a release
 
+Normal releases are prepared by `release-plz` after ordinary PRs merge. Merge the
+bot's Release PR to publish crates, binaries, Homebrew, Scoop and the Microsoft
+winget submission automatically. CI records the generated manifests as an
+artifact; checked-in manifests are the baseline. See the setup and retry details
+in [`docs/maintaining/releasing.md`](../docs/maintaining/releasing.md).
+
+For manual releases/recovery, the local entry point remains:
+
 The whole pipeline — bump, tag, wait for the release binaries, refresh every
 manifest below, push the taps, open the winget PR, publish to crates.io, deploy
 the site — is one command; see [`docs/maintaining/releasing.md`](../docs/maintaining/releasing.md):

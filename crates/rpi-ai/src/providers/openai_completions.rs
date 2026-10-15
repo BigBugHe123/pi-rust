@@ -387,8 +387,8 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
         body.insert("temperature".into(), Value::from(temperature));
     }
     if model.reasoning && supports_reasoning_effort(model) {
-        if let Some(effort) = reasoning_effort(opts.reasoning_level()) {
-            body.insert("reasoning_effort".into(), Value::String(effort.into()));
+        if let Some(effort) = reasoning_effort(model, opts.reasoning_level()) {
+            body.insert("reasoning_effort".into(), Value::String(effort));
         }
     }
     if !ctx.tools.is_empty() {
@@ -559,13 +559,18 @@ fn max_tokens_field(model: &Model) -> &'static str {
     }
 }
 
-fn reasoning_effort(level: ThinkingLevel) -> Option<&'static str> {
+fn reasoning_effort(model: &Model, level: ThinkingLevel) -> Option<String> {
+    if let Some(map) = &model.thinking_level_map {
+        if let Some(mapped) = map.get(&level) {
+            return mapped.clone();
+        }
+    }
     match level {
         ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
+        ThinkingLevel::Minimal => Some("minimal".into()),
+        ThinkingLevel::Low => Some("low".into()),
+        ThinkingLevel::Medium => Some("medium".into()),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high".into()),
     }
 }
 
@@ -1333,14 +1338,19 @@ mod tests {
             parameters: json!({ "type": "object" }).into(),
             constrained_sampling: None,
         });
+        let mut model = model();
+        model.thinking_level_map = Some(BTreeMap::from([(
+            ThinkingLevel::Xhigh,
+            Some("xhigh".into()),
+        )]));
         let mut opts = SimpleStreamOptions::default();
-        opts.reasoning = Some(ThinkingLevel::High);
-        let body = build_request(&model(), &context, &opts);
+        opts.reasoning = Some(ThinkingLevel::Xhigh);
+        let body = build_request(&model, &context, &opts);
         assert_eq!(body["model"], "gpt-test");
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
-        assert_eq!(body["reasoning_effort"], "high");
+        assert_eq!(body["reasoning_effort"], "xhigh");
         assert_eq!(body["max_completion_tokens"], 1024);
         assert_eq!(body["stream_options"]["include_usage"], true);
     }

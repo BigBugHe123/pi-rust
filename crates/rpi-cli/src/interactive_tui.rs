@@ -1915,17 +1915,8 @@ pub async fn interactive_tui(
                             &tui_for_key,
                         );
                     }
-                } else if let Some(extension_editor) = state_for_key
-                    .active_extension_editor
-                    .lock()
-                    .unwrap()
-                    .clone()
-                {
-                    extension_editor.handle_key(key);
-                } else if let Some(extension_input) =
-                    state_for_key.active_extension_input.lock().unwrap().clone()
-                {
-                    extension_input.handle_key(key);
+                } else {
+                    handle_extension_dialog_key(&state_for_key, key);
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;

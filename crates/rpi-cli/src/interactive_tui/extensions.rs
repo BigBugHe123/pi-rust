@@ -481,6 +481,19 @@ pub(super) fn open_extension_editor(
     ctx.tui.request_render(false);
 }
 
+/// Submit callbacks close or replace the dialog, so release both state locks
+/// before entering a widget. An `if let` scrutinee keeps its temporary guard
+/// alive through the callback and deadlocks when it clears the same slot.
+pub(super) fn handle_extension_dialog_key(state: &TuiState, key: KeyEvent) {
+    let extension_editor = state.active_extension_editor.lock().unwrap().clone();
+    let extension_input = state.active_extension_input.lock().unwrap().clone();
+    if let Some(editor) = extension_editor {
+        editor.handle_key(key);
+    } else if let Some(input) = extension_input {
+        input.handle_key(key);
+    }
+}
+
 pub(super) fn close_extension_editor(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,

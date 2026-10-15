@@ -1,6 +1,8 @@
 <!--
 Thanks for the PR. Keep the description focused on what changed and how you know
 it works. Delete any section that does not apply.
+Do not bump crate versions for a feature/fix PR; the automated Release PR manages
+the shared workspace version and release changelog.
 -->
 
 ## Summary

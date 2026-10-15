@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat};
+use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat, ThinkingLevelMap};
 
 /// The config directory name under the home dir.
 pub const CONFIG_DIR_NAME: &str = ".rpi";
@@ -386,6 +386,8 @@ pub struct ModelDefinition {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -908,6 +910,7 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
             base_url,
         );
         m.reasoning = def.reasoning.unwrap_or(false);
+        m.thinking_level_map = def.thinking_level_map.clone();
         m.context_window = def.context_window.unwrap_or(0);
         m.max_tokens = def.max_tokens.unwrap_or(0);
         m.input = parse_input_modalities(def.input.as_deref());
@@ -1281,6 +1284,7 @@ mod tests {
                 name: None,
                 base_url: None,
                 reasoning: None,
+                thinking_level_map: None,
                 context_window: None,
                 max_tokens: None,
                 input: None,
@@ -1358,6 +1362,7 @@ mod tests {
                         "models": [{
                             "id": "qwen3.7-plus",
                             "maxTokens": 131072,
+                            "thinkingLevelMap": { "xhigh": "xhigh", "max": "max" },
                             "compat": { "requiresThinkingAsText": true }
                         }]
                     }
@@ -1366,6 +1371,14 @@ mod tests {
         )
         .unwrap();
         let models = provider_to_models("qwen", &config.providers["qwen"]).unwrap();
+        assert_eq!(
+            models[0]
+                .thinking_level_map
+                .as_ref()
+                .unwrap()
+                .get(&rpi_ai::ThinkingLevel::Xhigh),
+            Some(&Some("xhigh".into()))
+        );
         match models[0].compat.as_ref().expect("compat must survive") {
             StreamingProtocolCompat::OpenaiCompletions(compat) => {
                 assert_eq!(compat.requires_thinking_as_text, Some(true));
@@ -1408,6 +1421,7 @@ mod tests {
                 name: None,
                 base_url: None,
                 reasoning: None,
+                thinking_level_map: None,
                 context_window: None,
                 max_tokens: None,
                 input: None,

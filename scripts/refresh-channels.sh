@@ -19,6 +19,7 @@
 set -euo pipefail
 
 VERSION="${1:?usage: refresh-channels.sh X.Y.Z}"
+[[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'invalid version' >&2; exit 1; }
 REPO="bigfish1913/pi-rust"
 TAG="v$VERSION"
 
@@ -29,7 +30,7 @@ cd "$(git rev-parse --show-toplevel)"
 
 OLD=$(grep -m1 -oE '"version": "[0-9.]+"' packaging/scoop/rpi.json | grep -oE '[0-9.]+')
 [[ -n "$OLD" ]] || die "could not read the current version from packaging/scoop/rpi.json"
-[[ "$OLD" != "$VERSION" ]] || { note "manifests already at $VERSION"; exit 0; }
+# Do not skip a same-version rebuild: CI retries must regenerate the checksums.
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
@@ -49,7 +50,7 @@ sha() {
     printf '%s\n' "$digest"
     return 0
   fi
-  note "  digest unavailable for $asset; falling back to the .sha256 sidecar"
+  note "  digest unavailable for $asset; falling back to the .sha256 sidecar" >&2
   gh release download "$TAG" -R "$REPO" -p "$asset.sha256" -D "$tmp" >/dev/null \
     || die "could not fetch $asset.sha256"
   local file="$tmp/$asset.sha256"

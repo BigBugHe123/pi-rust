@@ -1118,6 +1118,7 @@ pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String
             },
             base_url: None,
             reasoning: None,
+            thinking_level_map: None,
             context_window: None,
             max_tokens: None,
             input: None,
