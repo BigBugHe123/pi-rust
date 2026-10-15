@@ -33,6 +33,8 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- Wait for buffered file appends to complete before returning, so immediate
+  reads and metadata queries always observe the appended bytes.
 - Release extension dialog state locks before submit callbacks, preventing
   free-form answers and editor submissions from deadlocking the TUI.
 - Restore enhanced keyboard input on compatible macOS terminals so Shift+Enter

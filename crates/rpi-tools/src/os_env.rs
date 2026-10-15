@@ -503,7 +503,15 @@ impl FileSystem for OsExecutionEnv {
             .open(&abs)
             .await
         {
-            Ok(mut f) => f.write_all(content.as_bytes()).await,
+            Ok(mut f) => {
+                // Tokio may acknowledge a buffered write before the blocking
+                // filesystem operation completes. Await it before returning so
+                // an immediate read/metadata call observes the appended bytes.
+                match f.write_all(content.as_bytes()).await {
+                    Ok(()) => f.flush().await,
+                    Err(error) => Err(error),
+                }
+            }
             Err(e) => return Err(io_to_file_error(e, Some(&abs.to_string_lossy()))),
         };
         res.map_err(|e| io_to_file_error(e, Some(&abs.to_string_lossy())))

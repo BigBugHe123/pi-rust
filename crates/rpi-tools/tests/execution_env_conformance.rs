@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use rpi_tools::{
-    ExecutionEnv, ExecutionErrorCode, FileContent, FileKind, InMemoryExecutionEnv, OsExecutionEnv,
-    Shell, ShellExecOptions,
+    ExecutionEnv, ExecutionErrorCode, FileContent, FileKind, FileSystem, InMemoryExecutionEnv,
+    OsExecutionEnv, Shell, ShellExecOptions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -122,4 +122,19 @@ async fn os_cancel_interrupts_even_when_timeout_is_set() {
         started.elapsed() < std::time::Duration::from_millis(1500),
         "cancellation waited for the configured timeout"
     );
+}
+
+#[tokio::test]
+async fn os_append_returns_only_after_new_bytes_are_visible() {
+    let tmp = tempfile::tempdir().unwrap();
+    let env = OsExecutionEnv::with_cwd(tmp.path().to_path_buf());
+    let path = tmp.path().join("appended.txt");
+    for length in 1..=256 {
+        env.append_file("appended.txt", FileContent::Text("x".into()), None)
+            .await
+            .unwrap();
+        // A synchronous read must see the append immediately after it returns;
+        // another async filesystem operation could accidentally hide buffering.
+        assert_eq!(std::fs::read(&path).unwrap(), vec![b'x'; length]);
+    }
 }
