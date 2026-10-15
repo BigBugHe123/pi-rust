@@ -14,7 +14,7 @@ is a template with placeholders.
 | `cargo binstall rpi-cli` | [`crates/rpi-cli/Cargo.toml`](../crates/rpi-cli/Cargo.toml) | **configured** | none — takes effect with the next published crate version |
 | Homebrew | [`bigfish1913/homebrew-tap`](https://github.com/bigfish1913/homebrew-tap) | **live** | none — `brew tap bigfish1913/tap && brew install rpi` |
 | Scoop | [`bigfish1913/scoop-bucket`](https://github.com/bigfish1913/scoop-bucket) | **live** | none — `scoop bucket add bigfish1913 <bucket url>` |
-| winget | [open at `microsoft/winget-pkgs#441442`](https://github.com/microsoft/winget-pkgs/pull/441442) | **submitted** | review by the winget team; `winget install bigfish1913.rpi` does not work until it merges |
+| winget | [0.4.0 PR #453448](https://github.com/microsoft/winget-pkgs/pull/453448) | **submitted** | Microsoft review is pending; this submission does not mean 0.4.0 is available through winget yet |
 
 The files in this directory are the source of truth for the two taps; the tap
 repos are copies. Homebrew-in-`homebrew-core` and `winget` carry the real
@@ -51,12 +51,12 @@ The table below records the original four targets. The workflow also builds
 Intel macOS as `rpi-v<version>-x86_64-apple-darwin.tar.gz`, with a matching
 `.sha256`; this asset is available in releases whose tag includes that target.
 
-| Target | Asset | sha256 (v0.3.23) |
+| Target | Asset | sha256 (v0.4.0) |
 | --- | --- | --- |
-| `x86_64-unknown-linux-gnu` | `rpi-v0.3.23-x86_64-unknown-linux-gnu.tar.gz` | `44c4137cadf9c2e3fcd5f3affbc590029574d648b00f07e299d4324834296575` |
-| `aarch64-unknown-linux-gnu` | `rpi-v0.3.23-aarch64-unknown-linux-gnu.tar.gz` | `4c10967d91c46d2bb8d3de81f5d37288e3a1099a66e1dafec8c24a00be4c6e57` |
-| `aarch64-apple-darwin` | `rpi-v0.3.23-aarch64-apple-darwin.tar.gz` | `e64cbd4fe5bfde6450b87fee96f8018dc7eada786cce2a6e66408860cf826523` |
-| `x86_64-pc-windows-msvc` | `rpi-v0.3.23-x86_64-pc-windows-msvc.zip` | `5d2a454652793f0489cbc52b45014f7598e7918dc20f72c53677e7a67b781605` |
+| `x86_64-unknown-linux-gnu` | `rpi-v0.4.0-x86_64-unknown-linux-gnu.tar.gz` | `793c5041c80ff76fbb920b69596ef6022c2a745ec7fe7137e42909f16eab04c7` |
+| `aarch64-unknown-linux-gnu` | `rpi-v0.4.0-aarch64-unknown-linux-gnu.tar.gz` | `eba149d0c60056ee5a2f5619284b210729790d0e6befc41ec0a149662cf7af5b` |
+| `aarch64-apple-darwin` | `rpi-v0.4.0-aarch64-apple-darwin.tar.gz` | `b46ef466108156a6d5dbdb63f00b6d269e5feac37722452334c5ef10de6e57be` |
+| `x86_64-pc-windows-msvc` | `rpi-v0.4.0-x86_64-pc-windows-msvc.zip` | `d8c0069d260a923d354c22ecbdf084c0bd6ed9249bb958e59792e1761e4ab0ce` |
 
 Two consequences worth knowing:
 
@@ -73,7 +73,7 @@ Two consequences worth knowing:
 networks (this machine included), so use `gh`, which goes through the API:
 
 ```bash
-TAG=v0.3.23                      # the tag being packaged
+TAG=v0.4.0                      # the tag being packaged
 gh release download "$TAG" --pattern "*.sha256" --dir /tmp/rpi-sha --clobber
 cat /tmp/rpi-sha/*.sha256
 ```

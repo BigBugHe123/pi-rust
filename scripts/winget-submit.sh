@@ -30,8 +30,12 @@ if gh api "repos/microsoft/winget-pkgs/contents/$dir" >/dev/null 2>&1; then
   note "bigfish1913.rpi $VERSION is already in Microsoft winget"
   exit 0
 fi
-existing=$(gh pr list --repo microsoft/winget-pkgs --head "$me:$branch" \
-  --state all --json url,state --jq '.[0] // empty')
+# `gh pr list --head` accepts a bare branch, not owner:branch. Filter the
+# repository owner explicitly so another fork's same-named branch cannot match.
+submissions=$(gh pr list --repo microsoft/winget-pkgs --head "$branch" \
+  --state all --json url,state,headRepositoryOwner)
+existing=$(jq -c --arg owner "$me" \
+  'map(select(.headRepositoryOwner.login == $owner)) | .[0] // empty' <<<"$submissions")
 if [[ -n "$existing" ]]; then
   state=$(jq -r .state <<<"$existing")
   if [[ "$state" == MERGED ]]; then

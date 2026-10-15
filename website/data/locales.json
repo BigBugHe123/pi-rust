@@ -524,10 +524,10 @@
       ],
       "releases": [
         {
-          "version": "0.3.23",
+          "version": "0.4.0",
           "status": "current",
-          "title": "Safer plugin memory ownership",
-          "description": "Producer-side string cleanup, safe tool handles and explicit Rust safety contracts preserve the native C ABI."
+          "title": "Model pricing, terminal fixes and automatic releases",
+          "description": "Configure model rates and thinking levels, fix extension dialogs, code wrapping and file appends, and publish every install channel through a Release PR."
         },
         {
           "version": "next",
