@@ -42,10 +42,11 @@ elif args[0] == 'api':
         raise AssertionError(path)
 elif args[:2] == ['pr', 'list']:
     if mode in ('new', 'merged'):
-        print('')
+        print('[]')
     else:
-        print(json.dumps({'url': 'https://github.com/microsoft/winget-pkgs/pull/123',
-                          'state': 'CLOSED' if mode == 'closed' else 'OPEN'}))
+        print(json.dumps([{'url': 'https://github.com/microsoft/winget-pkgs/pull/123',
+                           'headRepositoryOwner': {'login': 'another-user' if mode == 'foreign' else 'test-user'},
+                           'state': 'CLOSED' if mode == 'closed' else 'OPEN'}]))
 elif args[:2] == ['pr', 'create']:
     print('https://github.com/microsoft/winget-pkgs/pull/456')
 elif args[:2] == ['repo', 'sync']:
@@ -85,6 +86,8 @@ class ChannelScriptTests(unittest.TestCase):
         self.assertEqual(len(uploads), 3)
         self.assertTrue(all("sha=existing-file-sha" in call for call in uploads))
         self.assertFalse(any(call[:2] == ["pr", "create"] for call in calls))
+        lookup = next(call for call in calls if call[:2] == ["pr", "list"])
+        self.assertEqual(lookup[lookup.index("--head") + 1], "rpi-" + self.version())
         self.assertIn("Updated existing PR", result.stdout)
 
     def test_new_winget_submission_syncs_fork_before_creating_branch(self):
@@ -93,6 +96,11 @@ class ChannelScriptTests(unittest.TestCase):
         sync = next(i for i, call in enumerate(calls) if call[:2] == ["repo", "sync"])
         branch = next(i for i, call in enumerate(calls) if "POST" in call)
         self.assertLess(sync, branch)
+        self.assertEqual(sum(call[:2] == ["pr", "create"] for call in calls), 1)
+
+    def test_another_forks_same_named_branch_is_not_reused(self):
+        result, calls = self.execute("winget-submit.sh", "foreign", self.version())
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(sum(call[:2] == ["pr", "create"] for call in calls), 1)
 
     def test_merged_submission_is_skipped_and_closed_submission_requires_inspection(self):

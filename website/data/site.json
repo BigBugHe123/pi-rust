@@ -98,10 +98,10 @@
   ],
   "releases": [
     {
-      "version": "0.3.23",
+      "version": "0.4.0",
       "status": "current",
-      "title": "更安全的插件内存管理",
-      "description": "插件字符串按分配方释放，工具状态使用安全句柄；原始 ABI 接口明确安全契约，同时保留现有 C ABI。"
+      "title": "模型定价、终端体验与自动发布",
+      "description": "支持自定义模型价格和思考级别映射，修复扩展问答、长代码显示与文件追加，并通过 Release PR 自动发布各渠道。"
     },
     {
       "version": "next",
