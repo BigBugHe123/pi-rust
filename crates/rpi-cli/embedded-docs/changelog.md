@@ -13,6 +13,10 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- Preserve whether model pricing was explicitly configured and expose it to
+  extensions, so an unpriced model can be distinguished from explicit zero rates.
+- Honor per-model `cost` rates and pricing tiers from `models.json`, so request
+  usage, footer totals and extensions receive configured USD costs.
 - Restore the enhanced keyboard protocol on macOS for terminals that keep IME
   composition working, so `Shift+Enter` inserts a newline again instead of
   submitting in iTerm2 and other macOS emulators. Only terminals whose CJK input
