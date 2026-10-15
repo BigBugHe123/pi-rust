@@ -1121,6 +1121,7 @@ pub(super) fn save_provider_from_form(form: &ProviderFormState) -> Result<String
             thinking_level_map: None,
             context_window: None,
             max_tokens: None,
+            cost: None,
             input: None,
             headers: None,
             compat: None,

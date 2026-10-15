@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat, ThinkingLevelMap};
+use rpi_ai::{Api, InputModality, Model, ModelCost, StreamingProtocolCompat, ThinkingLevelMap};
 
 /// The config directory name under the home dir.
 pub const CONFIG_DIR_NAME: &str = ".rpi";
@@ -392,6 +392,9 @@ pub struct ModelDefinition {
     pub context_window: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// USD per million tokens, including optional long-context pricing tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost: Option<ModelCost>,
     /// Free-form modality strings ("text"/"image"); unknown values fall back
     /// to text-only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -913,6 +916,9 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         m.thinking_level_map = def.thinking_level_map.clone();
         m.context_window = def.context_window.unwrap_or(0);
         m.max_tokens = def.max_tokens.unwrap_or(0);
+        if let Some(cost) = &def.cost {
+            m.cost = cost.clone();
+        }
         m.input = parse_input_modalities(def.input.as_deref());
         // Merge: model-level headers, then provider-level headers (provider wins
         // on conflict — it's the more specific-to-this-endpoint declaration).
@@ -1287,6 +1293,7 @@ mod tests {
                 thinking_level_map: None,
                 context_window: None,
                 max_tokens: None,
+                cost: None,
                 input: None,
                 headers: None,
                 compat: None,
@@ -1334,6 +1341,7 @@ mod tests {
         assert_eq!(models[0].api, Api::OpenaiCompletions);
         assert_eq!(models[0].provider, "oai");
         assert_eq!(models[0].max_tokens, 4096);
+        assert_eq!(models[0].cost, ModelCost::default());
         assert_eq!(
             models[0]
                 .headers
@@ -1341,6 +1349,66 @@ mod tests {
                 .and_then(|headers| headers.get("authorization"))
                 .map(String::as_str),
             Some("Bearer secret")
+        );
+    }
+
+    #[test]
+    fn models_json_pricing_reaches_providers_and_survives_serialization() {
+        let mut config = parse_models_json(
+            r#"{
+                "providers": {
+                    "pricing-fixture": {
+                        "api": "anthropic-messages",
+                        "models": [{
+                            "id": "priced-model",
+                            "cost": {
+                                "input": 2, "output": 8, "cacheRead": 0.2, "cacheWrite": 2.5,
+                                "tiers": [{
+                                    "inputTokensAbove": 1000000,
+                                    "input": 4, "output": 16, "cacheRead": 0.4, "cacheWrite": 5
+                                }]
+                            }
+                        }]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let expected = config.providers["pricing-fixture"].models[0]
+            .cost
+            .clone()
+            .unwrap();
+        for api in [
+            "anthropic-messages",
+            "openai-completions",
+            "openai-responses",
+        ] {
+            let cfg = config.providers.get_mut("pricing-fixture").unwrap();
+            cfg.api = Some(api.into());
+            let models = provider_to_models("pricing-fixture", cfg).unwrap();
+            assert_eq!(models[0].cost, expected);
+            let mut usage = rpi_ai::Usage::zero();
+            usage.input = 100_000;
+            usage.output = 250_000;
+            usage.cache_read = 300_000;
+            usage.cache_write = 400_000;
+            let cost = rpi_ai::providers::anthropic::cost::calculate_cost(&models[0].cost, &usage);
+            assert!((cost.total - 3.26).abs() < 1e-10, "base pricing for {api}");
+            usage.input = 1_000_001;
+            usage.output = 1_000_000;
+            usage.cache_read = 0;
+            usage.cache_write = 0;
+            let cost = rpi_ai::providers::anthropic::cost::calculate_cost(&models[0].cost, &usage);
+            assert!(
+                (cost.total - 20.000004).abs() < 1e-10,
+                "tiered pricing for {api}"
+            );
+        }
+        let saved = serde_json::to_string(&config).unwrap();
+        let reloaded = parse_models_json(&saved).unwrap();
+        assert_eq!(
+            reloaded.providers["pricing-fixture"].models[0].cost,
+            Some(expected)
         );
     }
 
@@ -1424,6 +1492,7 @@ mod tests {
                 thinking_level_map: None,
                 context_window: None,
                 max_tokens: None,
+                cost: None,
                 input: None,
                 headers: None,
                 compat: None,

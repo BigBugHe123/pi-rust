@@ -124,6 +124,25 @@ rpi auth logout
 }
 ```
 
+模型条目还可以配置 `cost`，单价单位为 **美元 / 百万 token**，例如：
+
+```json
+{
+  "id": "custom-model",
+  "cost": {
+    "input": 2,
+    "output": 8,
+    "cacheRead": 0.2,
+    "cacheWrite": 2.5
+  }
+}
+```
+
+以上为示例价格。宿主按每次实际用量计算 `usage.cost`，供页脚和统计插件累计展示费用。
+可选的 `cost.tiers` 数组用于阶梯定价，每项包含相同的四个价格字段和 `inputTokensAbove`；
+当输入与缓存 token 总数超过阈值时，使用已超过的最高阈值对应的价格。
+未配置 `cost` 的自定义模型默认使用零单价。修改配置后重启 rpi 生效。
+
 选择模型：
 
 ```bash
