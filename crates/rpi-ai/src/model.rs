@@ -182,6 +182,9 @@ pub struct Model {
     pub thinking_level_map: Option<ThinkingLevelMap>,
     pub input: Vec<InputModality>,
     pub cost: ModelCost,
+    /// Whether pricing was explicitly supplied, including intentionally free models.
+    #[serde(default)]
+    pub cost_configured: bool,
     pub context_window: u64,
     pub max_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,12 +214,18 @@ impl Model {
             thinking_level_map: None,
             input: vec![InputModality::Text],
             cost: ModelCost::default(),
+            cost_configured: false,
             context_window: 0,
             max_tokens: 0,
             sampling_params: None,
             headers: None,
             compat: None,
         }
+    }
+
+    /// Explicit zero rates and built-in nonzero rates both count as known pricing.
+    pub fn has_pricing(&self) -> bool {
+        self.cost_configured || self.cost != ModelCost::default()
     }
 
     /// Returns the supported thinking levels for this model. Mirrors

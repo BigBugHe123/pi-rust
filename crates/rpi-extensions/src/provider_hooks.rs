@@ -166,6 +166,7 @@ impl ProviderHooks for ExtensionProviderHooks {
             "provider": model.provider,
             "baseUrl": model.base_url,
             "reasoning": model.reasoning,
+            "pricingAvailable": model.has_pricing(),
             "apiKey": opts.api_key,
             "timeoutMs": opts.timeout.map(|d| d.as_millis() as u64),
             "headers": opts.headers,
@@ -415,6 +416,20 @@ mod tests {
             "request payload must forward messages: {}",
             requests[0].1
         );
+        let request: serde_json::Value = serde_json::from_str(&requests[0].1).unwrap();
+        assert_eq!(request["pricingAvailable"], false);
+        let mut model = model;
+        model.cost_configured = true;
+        hooks.before_request(&model, &ctx, &opts);
+        let explicit_zero: serde_json::Value =
+            serde_json::from_str(&CAPTURED.lock().unwrap().last().unwrap().1).unwrap();
+        assert_eq!(explicit_zero["pricingAvailable"], true);
+        model.cost_configured = false;
+        model.cost.rates.input = 1.0;
+        hooks.before_request(&model, &ctx, &opts);
+        let built_in: serde_json::Value =
+            serde_json::from_str(&CAPTURED.lock().unwrap().last().unwrap().1).unwrap();
+        assert_eq!(built_in["pricingAvailable"], true);
     }
 
     /// `dispatch_data_event` fans the JSON to the tag's handlers, and the

@@ -918,6 +918,7 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         m.max_tokens = def.max_tokens.unwrap_or(0);
         if let Some(cost) = &def.cost {
             m.cost = cost.clone();
+            m.cost_configured = true;
         }
         m.input = parse_input_modalities(def.input.as_deref());
         // Merge: model-level headers, then provider-level headers (provider wins
@@ -1342,6 +1343,7 @@ mod tests {
         assert_eq!(models[0].provider, "oai");
         assert_eq!(models[0].max_tokens, 4096);
         assert_eq!(models[0].cost, ModelCost::default());
+        assert!(!models[0].has_pricing());
         assert_eq!(
             models[0]
                 .headers
@@ -1387,6 +1389,7 @@ mod tests {
             cfg.api = Some(api.into());
             let models = provider_to_models("pricing-fixture", cfg).unwrap();
             assert_eq!(models[0].cost, expected);
+            assert!(models[0].has_pricing());
             let mut usage = rpi_ai::Usage::zero();
             usage.input = 100_000;
             usage.output = 250_000;
@@ -1409,6 +1412,14 @@ mod tests {
         assert_eq!(
             reloaded.providers["pricing-fixture"].models[0].cost,
             Some(expected)
+        );
+        let cfg = config.providers.get_mut("pricing-fixture").unwrap();
+        cfg.models[0].cost = Some(ModelCost::default());
+        let free = provider_to_models("pricing-fixture", cfg).unwrap();
+        assert_eq!(free[0].cost, ModelCost::default());
+        assert!(
+            free[0].has_pricing(),
+            "explicit zero prices are still configured"
         );
     }
 
