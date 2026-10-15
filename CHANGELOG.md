@@ -11,6 +11,24 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.4.0](https://github.com/bigfish1913/pi-rust/compare/v0.3.24...v0.4.0) - 2026-10-15
+
+### Added
+
+- *(pricing)* track explicit cost configuration
+- *(config)* honor per-model cost rates from models.json
+- *(release)* add release-plz automation workflow
+
+### Fixed
+
+- *(release)* preserve queued versions and sync release notes
+- *(tui)* wrap long code lines instead of clipping them
+- *(tui)* keep the enhanced keyboard protocol on macOS
+
+### Other
+
+- merge main release 0.3.24 into development
+
 ### Added
 
 - Prepare unified workspace Release PRs automatically after main CI succeeds;
