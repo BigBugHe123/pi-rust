@@ -252,9 +252,9 @@ impl Markdown {
                     i += 1;
                     continue;
                 }
-                // Code is never reflowed: wrapping destroys indentation and
-                // makes copied snippets invalid. Tabs are normalized and long
-                // physical lines are clipped with an ellipsis.
+                // Code is never reflowed in the source sense — tabs are
+                // normalized and long physical lines wrap (see `push_code_line`)
+                // so a long command stays copyable instead of being ellipsized.
                 push_code_line(
                     line,
                     &pad,
@@ -641,6 +641,14 @@ fn fence_info(line: &str) -> Option<(char, String)> {
 }
 
 /// Render one physical code line on a subtle surface, without an outer frame.
+///
+/// A long line wraps instead of being clipped with an ellipsis. A code block is
+/// where long commands and paths show up, and a clipped row *copies* as broken
+/// text: on macOS the transcript is copied through the terminal's native
+/// selection, so the ellipsis lands in the clipboard and the rest of the
+/// command is gone. Wrapping keeps the whole line on screen and in the
+/// clipboard; the code surface is re-applied per row so the panel band stays
+/// continuous and every rendered row still fits the width.
 fn push_code_line(
     line: &str,
     pad: &str,
@@ -655,16 +663,18 @@ fn push_code_line(
     let panel_width = cwidth.saturating_sub(visible_width(indent)).max(1);
     let body_width = panel_width.saturating_sub(2).max(1);
     let expanded = line.replace('\t', "    ");
-    let clipped = truncate_to_width(&expanded, body_width, "…");
-    // Syntax-highlight the clipped plain text, then apply the panel background.
+    // Highlight the whole logical line first (the highlighter carries per-line
+    // state), then wrap the styled text so a wrapped row keeps its colors.
     let styled = match highlighter {
-        Some(h) => h.highlight(&clipped, &colors),
-        None => colors.md_code_block.fg(&clipped),
+        Some(h) => h.highlight(&expanded, &colors),
+        None => colors.md_code_block.fg(&expanded),
     };
-    let body = format!(" {styled}");
-    let body =
-        apply_background_to_line(&body, panel_width, |text| colors.md_code_block_bg.bg(text));
-    out.push(format!("{pad}{indent}{body}"));
+    for chunk in wrap_text_with_ansi(&styled, body_width) {
+        let body = format!(" {chunk}");
+        let body =
+            apply_background_to_line(&body, panel_width, |text| colors.md_code_block_bg.bg(text));
+        out.push(format!("{pad}{indent}{body}"));
+    }
 }
 
 /// True when the whole line is a run of 1-2 fence chars (``/````/`~`/`~~`)
@@ -1061,7 +1071,7 @@ mod tests {
     }
 
     #[test]
-    fn test_markdown_code_expands_tabs_and_clips() {
+    fn test_markdown_code_expands_tabs_and_wraps_long_lines() {
         let md = Markdown::new("```\n\tlet value = 123456;\n```", 0, 0);
         let lines = md.render(14);
         let plain: Vec<String> = lines
@@ -1072,9 +1082,21 @@ mod tests {
             plain[0].starts_with("       let"),
             "tab/indent lost: {plain:?}"
         );
+        // A long code line wraps rather than clipping with an ellipsis, so the
+        // whole line survives rendering and therefore survives a native-selection
+        // copy (macOS copies the rendered rows, not the component text).
         assert!(
-            plain[0].contains('…'),
-            "long code line should clip: {plain:?}"
+            !plain.iter().any(|line| line.contains('…')),
+            "long code line must not clip: {plain:?}"
+        );
+        assert!(
+            plain.iter().filter(|line| !line.trim().is_empty()).count() >= 2,
+            "long code line should wrap: {plain:?}"
+        );
+        let compact: String = plain.iter().map(|line| line.replace(' ', "")).collect();
+        assert!(
+            compact.contains("letvalue=123456;"),
+            "wrapped rows lost text: {plain:?}"
         );
         assert!(plain.iter().all(|line| visible_width(line) <= 14));
     }
