@@ -11,55 +11,36 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
-## [0.4.0](https://github.com/bigfish1913/pi-rust/compare/v0.3.24...v0.4.0) - 2026-10-15
+## [0.4.0](https://github.com/bigfish1913/pi-rust/compare/v0.3.24...v0.4.0) - 2026-10-16
 
 ### Added
 
-- *(pricing)* track explicit cost configuration
-- *(config)* honor per-model cost rates from models.json
-- *(release)* add release-plz automation workflow
-
-### Fixed
-
-- *(release)* preserve queued versions and sync release notes
-- *(tui)* wrap long code lines instead of clipping them
-- *(tui)* keep the enhanced keyboard protocol on macOS
-
-### Other
-
-- merge main release 0.3.24 into development
-
-### Added
-
-- Prepare unified workspace Release PRs automatically after main CI succeeds;
-  publish crates, all five binary targets and install channels after the Release
-  PR merges. Submit Microsoft winget updates with retry-safe file and PR reuse.
-- Support per-model thinking-level mappings for OpenAI-compatible providers.
+- Configure per-model USD cost rates, long-context pricing tiers and thinking-level
+  mappings in `models.json`; preserve those values when saving the configuration.
+- Prepare unified workspace Release PRs automatically after main CI succeeds.
+  Merging a Release PR publishes crates, five platform binaries, Homebrew/Scoop
+  and a retry-safe Microsoft winget submission.
 
 ### Changed
 
-- Track explicit model pricing with `Model.cost_configured` (serialized as
-  `costConfigured`), including intentionally free models. Rust callers that use
-  `Model` struct literals must initialize the new field; `Model::new` supplies
-  the default.
+- Add `Model.cost_configured` (`costConfigured` in JSON) to distinguish unknown
+  prices from explicitly free models. `ModelDefinition` also adds `cost` and
+  `thinking_level_map`. Rust callers using exhaustive struct literals must supply
+  the new fields; `Model::new` provides its default. These API changes require the
+  0.4.0 release; the native extension SDK ABI remains unchanged.
+- Expose pricing availability in extension provider hooks and calculate request
+  costs using the configured model rates, including long-context tiers.
 
 ### Fixed
 
 - Release extension dialog state locks before submit callbacks, preventing
   free-form answers and editor submissions from deadlocking the TUI.
-- Preserve whether model pricing was explicitly configured and expose it to
-  extensions, so an unpriced model can be distinguished from explicit zero rates.
-- Honor per-model `cost` rates and pricing tiers from `models.json`, so request
-  usage, footer totals and extensions receive configured USD costs.
-- Restore the enhanced keyboard protocol on macOS for terminals that keep IME
-  composition working, so `Shift+Enter` inserts a newline again instead of
-  submitting in iTerm2 and other macOS emulators. Only terminals whose CJK input
-  stops working with the protocol pushed (Otty) fall back to legacy input, and
-  `RPI_KITTY_KEYBOARD=1` / `=0` still overrides either way.
-- Wrap long lines inside Markdown code blocks instead of clipping them with an
-  ellipsis. A long command in a reply rendered as truncated text, and macOS
-  sessions copy the rendered transcript through the terminal's native selection,
-  so the clipboard received a command with its tail missing.
+- Restore enhanced keyboard input on compatible macOS terminals so Shift+Enter
+  inserts a newline. Otty retains legacy input for CJK IME compatibility, with
+  `RPI_KITTY_KEYBOARD` available as an explicit override.
+- Wrap long Markdown code lines instead of clipping their tails with an ellipsis.
+- Keep different versions in separate publish queues and synchronize embedded
+  release notes before the Release PR becomes ready.
 
 ## [0.3.24] - 2026-10-15
 
