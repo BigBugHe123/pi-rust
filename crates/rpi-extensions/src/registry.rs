@@ -16,7 +16,7 @@ use rpi_agent::error::AgentError;
 use rpi_ai::types::Tool;
 use rpi_plugin_sdk::{
     BeforeAgentStartFn, CommandHandlerFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn,
-    ProviderRequestFn, RenderFn, ResourcesDiscoverFn, EVENT_TAG_COUNT,
+    ProviderRequestFn, ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, EVENT_TAG_COUNT,
 };
 
 use crate::tool::PluginToolHandle;
@@ -176,15 +176,30 @@ unsafe impl Sync for BeforeAgentStartHandler {}
 /// `user_data` is the plugin's opaque context, passed back on every
 /// `request_fn` call.
 ///
-/// SAFETY: the plugin warrants `request_fn` is callable from any thread (the
-/// host calls it from a `spawn_blocking` pool thread) and `user_data` is valid
-/// for the plugin's lifetime; the host never frees `user_data`.
+/// `stream_fn` is the **streaming** capability ([`ProviderStreamRequestFn`],
+/// registered through `register_streaming_provider`). When present the host
+/// drives it instead of `request_fn`: the plugin emits per-chunk envelopes that
+/// the host converts into `AssistantMessageEvent`s *as they arrive*, then the
+/// same plugin-owned `out` message still supplies the terminal event. `None`
+/// keeps the v1 one-shot behavior, so an existing plugin is unaffected.
+///
+/// That single signature also carries the cancellation protocol: the host always
+/// passes a [`ProviderStreamControl`](rpi_plugin_sdk::ProviderStreamControl), and
+/// whether the plugin polls it is the plugin's choice. There is deliberately no
+/// separate "cancellable" registration — one method, and the caller decides.
+///
+/// SAFETY: the plugin warrants `request_fn`/`stream_fn` are callable from any
+/// thread (the host calls them from a `spawn_blocking` pool thread) and
+/// `user_data` is valid for the plugin's lifetime; the host never frees
+/// `user_data`.
 #[derive(Clone)]
 pub struct RegisteredProvider {
     pub provider_id: String,
     pub base_url: String,
     pub api_style: String,
     pub request_fn: ProviderRequestFn,
+    /// Streaming request fn (streaming providers only).
+    pub stream_fn: Option<ProviderStreamRequestFn>,
     pub plugin_free_string: FreeStringFn,
     pub user_data: *mut std::ffi::c_void,
 }
@@ -573,6 +588,47 @@ impl ExtensionRegistry {
             .any(|p| p.provider_id == provider.provider_id)
         {
             return true;
+        }
+        self.providers.push(provider);
+        false
+    }
+
+    /// Register the **streaming** form of a custom provider (see
+    /// [`RegisteredProvider::stream_fn`]).
+    ///
+    /// Differs from [`register_provider`](Self::register_provider) in one way:
+    /// upgrading an id that already has a **one-shot** registration replaces it
+    /// instead of being dropped, because streaming is a strict superset of the
+    /// one-shot contract — losing the upgrade to first-wins would silently keep
+    /// the plugin on the non-streaming path. A registration that arrives when the
+    /// id already has a **streaming** fn is still dropped (first streaming
+    /// registration wins). Returns `true` when an existing streaming provider
+    /// was kept.
+    pub fn register_streaming_provider(&mut self, provider: RegisteredProvider) -> bool {
+        debug_assert!(
+            provider.stream_fn.is_some(),
+            "register_streaming_provider requires stream_fn; use register_provider otherwise"
+        );
+        if let Some(existing) = self
+            .providers
+            .iter_mut()
+            .find(|p| p.provider_id == provider.provider_id)
+        {
+            if existing.stream_fn.is_some() {
+                // Two streaming registrations for one id: first wins, like every
+                // other registrar in this registry.
+                return true;
+            }
+            // One-shot → streaming upgrade. Keep the record's slot (and its
+            // position) but adopt the richer capability + any identity the
+            // plugin re-sent.
+            existing.stream_fn = provider.stream_fn;
+            existing.request_fn = provider.request_fn;
+            existing.base_url = provider.base_url;
+            existing.api_style = provider.api_style;
+            existing.plugin_free_string = provider.plugin_free_string;
+            existing.user_data = provider.user_data;
+            return false;
         }
         self.providers.push(provider);
         false

@@ -11,6 +11,27 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- Stream custom plugin providers. A plugin registered with
+  `register_streaming_provider` emits per-chunk envelopes on a host callback and
+  the host maps them onto `AssistantMessageEvent`s as they arrive, so a plugin
+  provider renders progressively instead of appearing all at once when the
+  response is complete.
+- Cancel a plugin provider mid-generation. The streaming request fn now also
+  receives a `ProviderStreamControl` (plus a deferred completion signal reserved
+  for a future host). Polling it is the plugin's choice — one registration and one
+  signature cover both the fire-and-forget and the cooperative shape. A cancelled
+  run stops forwarding content and ends on `Error { reason: Aborted }` immediately,
+  and a cooperative plugin stops producing instead of streaming a generation
+  nobody will read.
+
+### Fixed
+
+- Report an aborted plugin provider as `ErrorReason::Aborted` rather than
+  `ErrorReason::Error`, so a user-cancelled run is no longer indistinguishable
+  from a provider failure.
+
 ## [0.3.24] - 2026-10-15
 
 ### Added

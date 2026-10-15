@@ -259,6 +259,82 @@ extern "C" fn on_before_agent_start(
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
 
+`api.register_streaming_provider` 注入**流式** Provider，签名与 `register_provider`
+一致，但 `request_fn` 多了宿主的逐块回调 `emit` 与它的 `emit_user_data`。插件在请求
+还未结束时调用 `emit`，把增量推给宿主：
+
+```json
+{"type":"text_delta","contentIndex":0,"delta":"hello "}
+{"type":"thinking_delta","contentIndex":1,"delta":"weighing"}
+{"type":"toolcall_delta","contentIndex":2,"delta":"{\"path\""}
+```
+
+宿主即时把它们映射成 `AssistantMessageEvent`（`TextDelta`/`ThinkingDelta`/
+`ToolCallDelta` 等），所以 TUI 在模型还在生成时就开始渲染，而不是等整段返回。
+可用的 `type`：`start`、`text_start`/`text_delta`/`text_end`、
+`thinking_start`/`thinking_delta`/`thinking_end`、
+`toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 忽略（向前兼容）。
+
+约定：
+
+- **`out` 仍是最终消息。** 回调只送增量；插件返回时写入 `out` 的完整
+  `AssistantMessage` 才是终态 `Done`/`Error` 的载荷。宿主会在终态前补一个 `Start`，
+  所以即使插件一个块都没发，事件流也合法。
+- **回调的所有权与工具 partial 一致。** 每个 chunk 都是插件分配的 `StbString`，宿主
+  用插件注册时给的 `plugin_free_string` 回收；`emit`/`emit_user_data` 只在本次请求
+  期间有效，插件不得保存。
+
+该槽位同样追加在结构体末尾且可为 `None`：面向旧宿主时应降级到 `register_provider`
+（一次性）而不是拒绝加载。同一 `provider_id` 先一次性、再流式注册时，流式会原地替换
+该记录（流式是一次性的超集）。可从 `examples/plugin-stub/src/lib.rs` 的
+`on_provider_stream_request` 复制完整可运行的骨架。
+
+#### 取消：同一个方法，插件自行决定
+
+长时间生成需要能被中断。**没有单独的「可取消」注册**：`register_streaming_provider`
+只有一个方法、一个签名，request fn 永远会收到一个 `control` 参数（宿主提供的同步
+控制面）。要不要轮询它，由插件自己决定。
+
+```rust
+// 每个 SSE frame 之间（真实 provider 通常在这里阻塞在 socket read 上）：
+if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) != 0 {
+    return 1; // 调用方已经走了，停止生成
+}
+```
+
+- `is_cancelled(user_data, chunk_kind)`：非阻塞轮询。传 `Content`（0）表示
+  “模型输出”，传 `Structural`（1）表示 `start`/`*_end`/`usage` 这类收尾帧。
+  取消后宿主只接受结构帧、拒收内容帧，所以你能把已经展示出去的消息收尾。
+- `wait_cancelled_ms(user_data, timeout_ms)`：阻塞版，供无法轮询的循环使用；
+  已取消时会立即返回，不会睡满超时。
+
+宿主的取消信号来自 `options.signal`（和内置 provider 同一个 `CancellationToken`，
+用户中断时由 agent loop 取消）。取消发生后宿主会：latch 控制面、停止转发内容 delta、
+**立即**发出 `Error { reason: Aborted }` 终态并结束事件流——不再等一次没人要的完整
+生成。`emit` 对内容帧返回非 0 也算同一个信号，插件可据此退出。
+
+轮询 `control` 是**可选**的，两种写法都合法：
+
+- **不轮询**（fire-and-forget）：插件照常把整段产出推完。取消时宿主仍会停止转发内容
+  帧并立刻结束该轮，插件只是多花了它已经产出的那部分 token。
+- **轮询**：插件在最早一个可检查点退出，省掉剩余生成。
+
+`control` 可能是 `null`（面向不支持控制面的宿主）；此时当作「不可取消」，不要拒绝加载。
+
+`completion` 参数在**当前宿主上恒为 `None`**：本宿主不允许插件在 request fn 返回后
+继续回调（那会让回调指针比调用活得久）。插件必须在 request fn 内收尾并写 `out`；
+ABI 里保留该参数是为了将来宿主能扩展，而不必再改签名。
+
+插件只需按 流式 → 一次性 逐级降级：
+
+```rust
+if let Some(register) = api.register_streaming_provider { /* 流式，可选轮询 control */ }
+else { /* register_provider，一次性 */ }
+```
+
+可从 `examples/plugin-stub/src/lib.rs` 的 `on_provider_stream_request`（不轮询）和
+`on_cancellable_provider_stream_request`（轮询）各复制一份骨架。
+
 ## 6. Rust 工具设计最佳实践
 
 1. 把领域逻辑写成普通 Rust 函数，FFI 函数只负责转换、生命周期和错误映射。

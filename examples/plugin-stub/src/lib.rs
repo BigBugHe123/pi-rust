@@ -38,8 +38,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rpi_plugin_sdk::{
-    EventTag, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult, StepResultTag,
-    ToolPartialCb,
+    EventTag, ProviderChunkKind, ProviderStreamCompletionFn, ProviderStreamControl,
+    ProviderStreamEmitFn, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
+    StepResultTag, ToolPartialCb,
 };
 // The provider/render fn signatures are referenced transitively by the
 // `register_provider`/`register_markdown_transformer` vtable slots (the host
@@ -48,7 +49,7 @@ use rpi_plugin_sdk::{
 use rpi_plugin_sdk::callbacks::free_string as plugin_free_string;
 use rpi_plugin_sdk::handles::ToolHandles;
 #[allow(unused_imports)]
-use rpi_plugin_sdk::{ProviderRequestFn, RenderFn};
+use rpi_plugin_sdk::{ProviderRequestFn, ProviderStreamRequestFn, RenderFn};
 
 // ---------------------------------------------------------------------------
 // The echo tool's per-drive state — owned by the safe opaque-handle registry.
@@ -323,6 +324,223 @@ rpi_plugin_sdk::string_handler! {
 }
 
 // ---------------------------------------------------------------------------
+// The streaming provider (B5c-s) — proves the delta round-trip
+// ---------------------------------------------------------------------------
+
+/// How many chunks the stub's streaming request fn emitted. The host smoke test
+/// reads this to assert the callback path ran (and that the plugin received a
+/// usable `emit`).
+static STREAM_EMIT_HITS: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the streaming-emit hit counter (host smoke test uses this).
+#[no_mangle]
+pub extern "C" fn plugin_stub_stream_emit_hits() -> usize {
+    STREAM_EMIT_HITS.load(Ordering::SeqCst)
+}
+
+/// The stub's streaming `ProviderStreamRequestFn`.
+///
+/// A real provider runs its HTTP/SSE loop here and emits one chunk per wire
+/// delta. The stub has no network, so it emits a fixed sequence through `emit`
+/// (thinking + text, with the `start`/`*_end` and `usage` frames) and then writes
+/// the matching final assistant-message JSON to `out`. That exercises every chunk
+/// kind the host mapper understands, in order.
+///
+/// Ownership: each chunk is an SDK-owned `StbString` transferred to the host,
+/// which reclaims it through the `plugin_free_string` we registered alongside.
+/// `out` is the final message, likewise plugin-owned. `emit_user_data` is the
+/// host's bridge pointer and must be passed back unchanged.
+extern "C" fn on_provider_stream_request(
+    req_json: StbStringRef,
+    emit: Option<ProviderStreamEmitFn>,
+    emit_user_data: *mut c_void,
+    // Declared but deliberately unused here: this stub shows the
+    // fire-and-forget shape, where a plugin streams its fixed output and the
+    // host still terminates an aborted run. See
+    // `on_cancellable_provider_stream_request` for the polling shape.
+    _control: *const ProviderStreamControl,
+    _completion: Option<ProviderStreamCompletionFn>,
+    _completion_user_data: *mut c_void,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        // Parse the envelope so a real provider's first step is exercised.
+        let request = unsafe { req_json.as_str() };
+        if !request.contains("\"model\"") {
+            return 2;
+        }
+
+        let chunks = [
+            r#"{"type":"start"}"#,
+            r#"{"type":"thinking_start","contentIndex":0}"#,
+            r#"{"type":"thinking_delta","contentIndex":0,"delta":"weighing"}"#,
+            r#"{"type":"thinking_delta","contentIndex":0,"delta":" options"}"#,
+            r#"{"type":"thinking_end","contentIndex":0,"content":"weighing options"}"#,
+            r#"{"type":"text_start","contentIndex":1}"#,
+            r#"{"type":"text_delta","contentIndex":1,"delta":"from-stub"}"#,
+            r#"{"type":"text_delta","contentIndex":1,"delta":"-stream"}"#,
+            r#"{"type":"text_end","contentIndex":1,"content":"from-stub-stream"}"#,
+            r#"{"type":"usage","usage":{"input":3,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":7,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}}"#,
+        ];
+
+        if let Some(emit) = emit {
+            for chunk in chunks {
+                let rc = emit(StbString::from_string(chunk.to_string()), emit_user_data);
+                if rc != 0 {
+                    // The host rejected a chunk (a cancelled run, say). Stop
+                    // emitting but still deliver the final message so the run
+                    // terminates cleanly instead of hanging.
+                    break;
+                }
+                STREAM_EMIT_HITS.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let json = r#"{"role":"assistant","content":[{"type":"thinking","thinking":"weighing options"},{"type":"text","text":"from-stub-stream"}],"api":"faux","provider":"stub-streaming-provider","model":"stub-model","usage":{"input":3,"output":4,"cacheRead":0,"cacheWrite":0,"totalTokens":7,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
+        // Raw ABI slot (not the `string_handler!` sugar): write the owning
+        // output through the pointer. `out` is aligned + initialized per the
+        // contract, and this fn is the sole writer for the call.
+        unsafe {
+            *out = StbString::from_string(json.to_string());
+        }
+        0
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The cancellable streaming provider (B5c-s) — proves the cancel protocol
+// ---------------------------------------------------------------------------
+
+/// Chunks the cancellable provider managed to emit before it noticed the
+/// cancellation. The smoke test asserts this stays **below** the number it would
+/// have produced if it ignored the signal.
+static CANCEL_EMITS_BEFORE_STOP: AtomicUsize = AtomicUsize::new(0);
+
+/// Set once the cancellable provider observed `is_cancelled` returning true.
+static CANCEL_OBSERVED: AtomicUsize = AtomicUsize::new(0);
+
+/// Read the "emitted before stopping" counter.
+#[no_mangle]
+pub extern "C" fn plugin_stub_cancel_emits_before_stop() -> usize {
+    CANCEL_EMITS_BEFORE_STOP.load(Ordering::SeqCst)
+}
+
+/// Read the "observed cancellation" flag (0/1).
+#[no_mangle]
+pub extern "C" fn plugin_stub_cancel_observed() -> usize {
+    CANCEL_OBSERVED.load(Ordering::SeqCst)
+}
+
+/// Reset both counters so a repeated test run starts from a known state.
+#[no_mangle]
+pub extern "C" fn plugin_stub_reset_cancel_counters() {
+    CANCEL_EMITS_BEFORE_STOP.store(0, Ordering::SeqCst);
+    CANCEL_OBSERVED.store(0, Ordering::SeqCst);
+}
+
+/// How many deltas the cancellable provider tries to emit.
+///
+/// Deliberately large: if the plugin honours the cancellation signal it stops
+/// after a couple of chunks, and the gap between this number and
+/// `plugin_stub_cancel_emits_before_stop()` is the observable proof. The sleeps
+/// give the host's `select!` a chance to observe the token, so the test is not
+/// racing a plugin that finishes before the cancellation can land.
+const CANCEL_TOTAL_DELTAS: usize = 200;
+
+/// The stub's cancellable streaming request fn: same chunk protocol as
+/// [`on_provider_stream_request`], but it actually **polls** the control surface.
+///
+/// This is the shape a real long-running provider should have — an SSE loop that
+/// checks `control.is_cancelled` between chunks and stops as soon as the caller
+/// has gone away, instead of streaming a whole generation nobody will read.
+///
+/// Note there is no separate "cancellable registration": both stubs register
+/// through the same `register_streaming_provider` and receive the same
+/// `control`. Honoring it is the plugin's choice.
+///
+/// `control` is `null` only against a host that cannot describe its control
+/// surface; the stub then falls back to the emit-everything behavior rather than
+/// refusing to run.
+extern "C" fn on_cancellable_provider_stream_request(
+    req_json: StbStringRef,
+    emit: Option<ProviderStreamEmitFn>,
+    emit_user_data: *mut c_void,
+    control: *const ProviderStreamControl,
+    completion: Option<ProviderStreamCompletionFn>,
+    completion_user_data: *mut c_void,
+    out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    rpi_plugin_sdk::guard_or(1, || {
+        let request = unsafe { req_json.as_str() };
+        if !request.contains("\"model\"") {
+            return 2;
+        }
+        // This host offers no deferred-completion channel; a plugin must not
+        // expect one (see `ProviderStreamCompletionFn`).
+        let _ = (completion, completion_user_data);
+
+        // SAFETY: the host keeps the control struct live for this call only, and
+        // hands it over exactly once. Null against an older/limited host.
+        let control = if control.is_null() {
+            None
+        } else {
+            Some(unsafe { *control })
+        };
+
+        let cancelled = |kind: ProviderChunkKind| -> bool {
+            match control {
+                Some(c) => {
+                    (c.is_cancelled)(c.user_data, kind as u32) != 0
+                        || (c.wait_cancelled_ms)(c.user_data, 0) != 0
+                }
+                None => false,
+            }
+        };
+
+        if let Some(emit) = emit {
+            let _ = emit(
+                StbString::from_string(r#"{"type":"text_start","contentIndex":0}"#.to_string()),
+                emit_user_data,
+            );
+            for index in 0..CANCEL_TOTAL_DELTAS {
+                // The check a real provider makes between SSE frames. Poll the
+                // cheap flag first, then block briefly (a real plugin would be
+                // parked in a socket read here).
+                if cancelled(ProviderChunkKind::Content) {
+                    CANCEL_OBSERVED.store(1, Ordering::SeqCst);
+                    return 1;
+                }
+                if let Some(c) = control {
+                    if (c.wait_cancelled_ms)(c.user_data, 20) != 0 {
+                        CANCEL_OBSERVED.store(1, Ordering::SeqCst);
+                        return 1;
+                    }
+                }
+                let chunk =
+                    format!(r#"{{"type":"text_delta","contentIndex":0,"delta":"{index},"}}"#);
+                if emit(StbString::from_string(chunk), emit_user_data) != 0 {
+                    // The host rejected a content chunk: it has stopped
+                    // listening. Same conclusion as an explicit cancellation.
+                    CANCEL_OBSERVED.store(1, Ordering::SeqCst);
+                    CANCEL_EMITS_BEFORE_STOP.fetch_add(1, Ordering::SeqCst);
+                    return 1;
+                }
+                CANCEL_EMITS_BEFORE_STOP.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let json = r#"{"role":"assistant","content":[{"type":"text","text":"cancel-provider-finished"}],"api":"faux","provider":"stub-cancel-provider","model":"stub-model","usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":2,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
+        // SAFETY: sole writer for this call; `out` is aligned + initialized.
+        unsafe {
+            *out = StbString::from_string(json.to_string());
+        }
+        0
+    })
+}
+
+// ---------------------------------------------------------------------------
 // The markdown-transformer renderer (B5c) — proves the renderer registrar
 // ---------------------------------------------------------------------------
 
@@ -469,6 +687,41 @@ rpi_plugin_sdk::export_plugin!(|api| {
     );
     if rc != 0 {
         return rc;
+    }
+
+    // Register a **streaming** provider (B5c-s). Same identity triple as above
+    // but a different id, plus the per-chunk callback the host relays into
+    // `AssistantMessageEvent`s while the request is still running. This slot is
+    // nullable: a host that predates it falls back to the one-shot provider
+    // above, which is exactly why the stub registers both.
+    if let Some(register_streaming_provider) = api.register_streaming_provider {
+        let rc = register_streaming_provider(
+            StbStringRef::from_str("stub-streaming-provider"),
+            StbStringRef::from_str("https://stub.example"),
+            StbStringRef::from_str("faux"),
+            on_provider_stream_request,
+            plugin_free_string,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return rc;
+        }
+
+        // A second streaming provider that actually **uses** the cancellation
+        // control surface: it emits on a budget and stops as soon as the caller
+        // goes away. Registration is identical — one method, and the caller
+        // decides whether to poll `control`.
+        let rc = register_streaming_provider(
+            StbStringRef::from_str("stub-cancel-provider"),
+            StbStringRef::from_str("https://stub.example"),
+            StbStringRef::from_str("faux"),
+            on_cancellable_provider_stream_request,
+            plugin_free_string,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return rc;
+        }
     }
 
     // Register a markdown transformer (B5c). The host records it now; TUI

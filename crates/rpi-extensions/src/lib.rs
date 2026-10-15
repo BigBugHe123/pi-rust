@@ -62,8 +62,9 @@ use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
     BeforeAgentStartFn, EventHandlerFn, EventTag, FreeStringFn, OAuthRequestFn, ProviderRequestFn,
-    RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
-    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    ProviderStreamRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent,
+    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
+    ToolPollFn,
 };
 use thiserror::Error;
 
@@ -279,6 +280,7 @@ impl HostApi {
             register_shortcut: Some(trampoline_register_shortcut),
             register_flag: Some(trampoline_register_flag),
             register_provider: Some(trampoline_register_provider), // B5c
+            register_streaming_provider: Some(trampoline_register_streaming_provider), // B5c-s
             register_message_renderer: Some(trampoline_register_message_renderer), // B5c
             register_markdown_transformer: Some(trampoline_register_markdown_transformer), // B5c
             register_entry_renderer: Some(trampoline_register_entry_renderer), // B5c
@@ -577,6 +579,9 @@ extern "C" fn trampoline_register_provider(
         base_url: unsafe { base_url.as_str().to_string() },
         api_style: unsafe { api_style.as_str().to_string() },
         request_fn,
+        // One-shot registration: no streaming fn. A plugin that also calls
+        // `register_streaming_provider` upgrades this record in place.
+        stream_fn: None,
         plugin_free_string,
         user_data,
     };
@@ -591,6 +596,64 @@ extern "C" fn trampoline_register_provider(
     } else {
         -1
     }
+}
+
+/// B5c-s: `register_streaming_provider` trampoline. Identical bookkeeping to
+/// [`trampoline_register_provider`], but records the plugin's
+/// [`ProviderStreamRequestFn`] as the record's `stream_fn` — the host then drives
+/// the per-chunk callback path (with the cancellation control surface) instead of
+/// the one-shot `request_fn`.
+///
+/// Upgrading an id that a plugin already registered one-shot **replaces** the
+/// record in place (see `ExtensionRegistry::register_streaming_provider`), so a
+/// plugin that registers both ends up on the streaming path.
+extern "C" fn trampoline_register_streaming_provider(
+    provider_id: StbStringRef,
+    base_url: StbStringRef,
+    api_style: StbStringRef,
+    request_fn: ProviderStreamRequestFn,
+    plugin_free_string: FreeStringFn,
+    user_data: *mut c_void,
+) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // The one-shot slot stays non-null (a placeholder that fails loudly) so the
+    // record is uniform: the host prefers `stream_fn` whenever it is present.
+    let record = crate::registry::RegisteredProvider {
+        provider_id: unsafe { provider_id.as_str().to_string() },
+        base_url: unsafe { base_url.as_str().to_string() },
+        api_style: unsafe { api_style.as_str().to_string() },
+        request_fn: unsupported_one_shot_provider_request,
+        stream_fn: Some(request_fn),
+        plugin_free_string,
+        user_data,
+    };
+    let ok = with_current_api(|api| {
+        api.with_registry(|reg| reg.register_streaming_provider(record))
+            .is_some()
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
+}
+
+/// Placeholder `request_fn` for a streaming-only registration. The host never
+/// calls it (`RegisteredProvider::stream_fn.is_some()` routes to the streaming
+/// driver), so this exists purely to keep the record's one-shot field non-null
+/// and to fail loudly with a diagnostic instead of a null deref if a future code
+/// path ever does call it.
+extern "C" fn unsupported_one_shot_provider_request(
+    _req_json: StbStringRef,
+    _out: *mut StbString,
+    _user_data: *mut c_void,
+) -> i32 {
+    tracing::error!(
+        "a streaming-only plugin provider was driven through the one-shot request path"
+    );
+    1
 }
 
 /// Register an OAuth provider manifest and action callback. The manifest is
