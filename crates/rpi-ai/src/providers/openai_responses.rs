@@ -1750,7 +1750,7 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
         body["max_output_tokens"] = Value::from(max.max(16));
     }
     if model.reasoning {
-        if let Some(e) = reasoning_effort(opts.reasoning_level()) {
+        if let Some(e) = reasoning_effort(model, opts.reasoning_level()) {
             body["reasoning"] = json!({"effort":e});
         }
     }
@@ -2202,13 +2202,18 @@ fn responses_url(base: &str) -> String {
         format!("{b}/v1/responses")
     }
 }
-fn reasoning_effort(l: ThinkingLevel) -> Option<&'static str> {
+fn reasoning_effort(model: &Model, l: ThinkingLevel) -> Option<String> {
+    if let Some(map) = &model.thinking_level_map {
+        if let Some(mapped) = map.get(&l) {
+            return mapped.clone();
+        }
+    }
     match l {
         ThinkingLevel::Off => None,
-        ThinkingLevel::Minimal => Some("minimal"),
-        ThinkingLevel::Low => Some("low"),
-        ThinkingLevel::Medium => Some("medium"),
-        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high"),
+        ThinkingLevel::Minimal => Some("minimal".into()),
+        ThinkingLevel::Low => Some("low".into()),
+        ThinkingLevel::Medium => Some("medium".into()),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => Some("high".into()),
     }
 }
 fn supports_strict_mode(model: &Model) -> bool {

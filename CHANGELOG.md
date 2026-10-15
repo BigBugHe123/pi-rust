@@ -11,6 +11,38 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- Prepare unified workspace Release PRs automatically after main CI succeeds;
+  publish crates, all five binary targets and install channels after the Release
+  PR merges. Submit Microsoft winget updates with retry-safe file and PR reuse.
+- Support per-model thinking-level mappings for OpenAI-compatible providers.
+
+### Changed
+
+- Track explicit model pricing with `Model.cost_configured` (serialized as
+  `costConfigured`), including intentionally free models. Rust callers that use
+  `Model` struct literals must initialize the new field; `Model::new` supplies
+  the default.
+
+### Fixed
+
+- Release extension dialog state locks before submit callbacks, preventing
+  free-form answers and editor submissions from deadlocking the TUI.
+- Preserve whether model pricing was explicitly configured and expose it to
+  extensions, so an unpriced model can be distinguished from explicit zero rates.
+- Honor per-model `cost` rates and pricing tiers from `models.json`, so request
+  usage, footer totals and extensions receive configured USD costs.
+- Restore the enhanced keyboard protocol on macOS for terminals that keep IME
+  composition working, so `Shift+Enter` inserts a newline again instead of
+  submitting in iTerm2 and other macOS emulators. Only terminals whose CJK input
+  stops working with the protocol pushed (Otty) fall back to legacy input, and
+  `RPI_KITTY_KEYBOARD=1` / `=0` still overrides either way.
+- Wrap long lines inside Markdown code blocks instead of clipping them with an
+  ellipsis. A long command in a reply rendered as truncated text, and macOS
+  sessions copy the rendered transcript through the terminal's native selection,
+  so the clipboard received a command with its tail missing.
+
 ## [0.3.24] - 2026-10-15
 
 ### Added

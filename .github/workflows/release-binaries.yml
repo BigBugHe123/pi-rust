@@ -4,9 +4,16 @@ name: Release binaries
 # tag. This is what makes `curl -fsSL .../install.sh | sh` work and what removes
 # the "you need a Rust toolchain and a C linker" barrier to trying the CLI.
 #
-# crates.io publishing is handled separately by ci.yml (push to main).
+# Main CI calls release.yml after tests; that workflow publishes crates.io
+# and calls this workflow directly once the Release PR's tag is ready.
 
 on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Existing tag to build
+        required: true
+        type: string
   push:
     tags: ["v*"]
   workflow_dispatch:
@@ -18,11 +25,16 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: release-binaries-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
+    if: github.repository == 'bigfish1913/pi-rust'
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
@@ -51,7 +63,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -151,6 +164,7 @@ jobs:
             ${{ steps.stage.outputs.checksum }}
             ${{ steps.stage.outputs.asset }}.prebuilt.json
           if-no-files-found: error
+          overwrite: true
 
   release:
     name: Attach binaries to the release
@@ -161,7 +175,8 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag || github.ref }}
+          ref: ${{ inputs.tag || github.ref }}
+          persist-credentials: false
 
       - name: Download all artifacts
         uses: actions/download-artifact@v4
@@ -179,7 +194,7 @@ jobs:
 
       - name: Verify all targets and assemble CLI manifest
         env:
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           python scripts/prebuilt-release.py assemble --directory dist \
             --tag "${TAG}" --commit "$(git rev-parse HEAD)" --output rpi-release.json
@@ -187,7 +202,7 @@ jobs:
       - name: Publish to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -205,3 +220,10 @@ jobs:
           fi
           # Upload last: a manifest means all five verified archives are ready.
           gh release upload "${TAG}" rpi-release.json --clobber
+
+  channels:
+    needs: release
+    uses: ./.github/workflows/release-channels.yml
+    with:
+      tag: ${{ inputs.tag || github.ref_name }}
+    secrets: inherit

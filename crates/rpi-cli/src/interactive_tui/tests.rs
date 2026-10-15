@@ -2886,6 +2886,71 @@ fn paste_probe_ignores_the_enter_keys_own_release() {
 // ---- ask_user TUI bridge ----
 
 #[test]
+fn ask_user_freeform_submit_releases_dialog_locks_before_callback() {
+    let state = test_tui_state();
+    let mailbox = rpi_extensions::UiDialogMailbox::new();
+    let bridge = AskUserBridge::new(mailbox.clone());
+    bridge.attach();
+    for id in ["freeform", "next"] {
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": id,
+                "ui": {"kind": "input", "question": "Answer?"}
+            }))
+            .unwrap();
+    }
+    let request = bridge.take_pending().unwrap();
+    let input = Arc::new(Input::new());
+    input.handle_paste("自定义回答");
+    let state_submit = state.clone();
+    let bridge_submit = bridge.clone();
+    input.on_submit(Arc::new(move |text| {
+        // Fail immediately instead of hanging the test on a recursive lock.
+        let mut editor = state_submit
+            .active_extension_editor
+            .try_lock()
+            .expect("editor slot locked during submit");
+        let mut input = state_submit
+            .active_extension_input
+            .try_lock()
+            .expect("input slot locked during submit");
+        bridge_submit.respond(&request.request_id, serde_json::json!({"text": text}));
+        *editor = None;
+        *input = None;
+    }));
+    *state.active_extension_input.lock().unwrap() = Some(input);
+    handle_extension_dialog_key(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!state.extension_dialog_open());
+    assert_eq!(
+        mailbox.poll("freeform").unwrap()["answer"]["text"],
+        "自定义回答"
+    );
+    assert_eq!(bridge.take_pending().unwrap().request_id, "next");
+}
+
+#[test]
+fn extension_editor_submit_releases_dialog_locks_before_callback() {
+    let state = test_tui_state();
+    let editor = Arc::new(Editor::simple());
+    editor.set_text("response");
+    let state_submit = state.clone();
+    editor.on_submit(Arc::new(move |text| {
+        assert_eq!(text, "response");
+        *state_submit
+            .active_extension_editor
+            .try_lock()
+            .expect("editor slot locked during submit") = None;
+        *state_submit
+            .active_extension_input
+            .try_lock()
+            .expect("input slot locked during submit") = None;
+    }));
+    *state.active_extension_editor.lock().unwrap() = Some(editor);
+    handle_extension_dialog_key(&state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!state.extension_dialog_open());
+}
+
+#[test]
 fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
     let flat = rpi_extensions::UiDialogRequest {
         request_id: "r1".into(),
