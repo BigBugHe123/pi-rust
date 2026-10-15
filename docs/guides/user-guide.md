@@ -354,8 +354,10 @@ rpi --extensions-dir target/debug -p 'echo "hi"'
 ```bash
 rpi install rpi-todo
 rpi install rpi-todo --version 0.2.0
-rpi install rpi-todo --force
+rpi install rpi-todo --force # 同版本重装
 ```
+
+`rpi install <包名>` 可直接安装或升级；目标版本已安装时会提示并跳过。同版本重装或降级需要 `--force`。源码构建也遵循这一规则，本地开发修改代码但未更改版本时，使用 `--force` 重装。
 
 安装器从 crates.io 选择最新未撤回的稳定版本，并用包的 `repository` 元数据找到 GitHub 仓库，再读取 `<包名>-v<版本>` Release 中的 `rpi-extension.json`。它按精确目标三元组匹配预编译文件，校验压缩包大小和 SHA-256、解压后的库文件 SHA-256、平台架构及声明的 SDK ABI。库文件名以 manifest 的 `library.path` 为准。同一仓库里的扩展可以独立版本发布。
 

@@ -514,11 +514,6 @@ pub async fn install(
 ) -> Result<(), String> {
     let records = crate::install::installed_native_packages_strict()?;
     let existing = records.iter().find(|p| p.name == name);
-    if existing.is_some() && !force {
-        return Err(format!(
-            "{name} is already installed; use --force to replace it"
-        ));
-    }
     let target = host_target()?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -539,6 +534,15 @@ pub async fn install(
                     .into(),
             );
         }
+    }
+    if !crate::install::should_install_version(
+        name,
+        existing.map(|p| p.version.as_str()),
+        &package.version,
+        force,
+    )? {
+        crate::install::print_already_installed(name, &package.version);
+        return Ok(());
     }
     println!(
         "downloading prebuilt {} {} for {target}",
@@ -933,6 +937,75 @@ mod tests {
             assert_eq!(origin.repository, package.repository);
             assert_eq!(origin.archive_sha256, hash(&archive));
             assert_eq!(origin.library_sha256, hash(&object(target)));
+        }
+    }
+
+    #[test]
+    fn prebuilt_packages_upgrade_without_force_and_same_version_is_unchanged() {
+        for target in TARGETS {
+            let (mut package, mut value, archive) = fixture(target);
+            let manifest: Manifest = serde_json::from_value(value.clone()).unwrap();
+            let agent = tempfile::tempdir().unwrap();
+            install_archive_at(
+                &package,
+                &manifest,
+                &serde_json::to_vec(&value).unwrap(),
+                &archive,
+                target,
+                agent.path(),
+                false,
+            )
+            .unwrap();
+            package.version = "1.2.4".into();
+            value["version"] = serde_json::json!(package.version);
+            value["tag"] = serde_json::json!("independent-plugin-v1.2.4");
+            let distribution = value.pointer_mut(&format!("/targets/{target}")).unwrap();
+            let format = distribution["format"].as_str().unwrap();
+            let file = if format == "zip" {
+                "package.zip"
+            } else {
+                "package.tar.gz"
+            };
+            distribution["url"] = serde_json::json!(release_url(
+                &package.repository,
+                &package.name,
+                &package.version,
+                file,
+            )
+            .unwrap());
+            let manifest = serde_json::from_value(value.clone()).unwrap();
+            let raw = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                install_archive_at(
+                    &package,
+                    &manifest,
+                    &raw,
+                    &archive,
+                    target,
+                    agent.path(),
+                    false,
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            let metadata = agent.path().join("native-packages.json");
+            let registry = std::fs::read(&metadata).unwrap();
+            let records: Vec<crate::install::InstalledNativePackage> =
+                serde_json::from_slice(&registry).unwrap();
+            assert_eq!(records[0].version, "1.2.4");
+            assert!(install_archive_at(
+                &package,
+                &manifest,
+                &raw,
+                &archive,
+                target,
+                agent.path(),
+                false,
+            )
+            .unwrap()
+            .is_empty());
+            assert_eq!(std::fs::read(&metadata).unwrap(), registry);
         }
     }
 

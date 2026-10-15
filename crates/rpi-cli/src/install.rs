@@ -42,6 +42,44 @@ pub struct InstalledNativePackage {
     pub artifacts: Vec<String>,
 }
 
+impl InstalledNativePackage {
+    /// Prebuilt provenance also uses `source`; only local development builds
+    /// should be excluded from registry update discovery and commands.
+    pub(crate) fn supports_registry_update(&self) -> bool {
+        self.source.is_none() || self.prebuilt.is_some()
+    }
+}
+
+/// Decide before downloads/builds, then recheck under the package mutation lock.
+/// `false` means the requested version is already installed; only --force
+/// reinstalls it. Build metadata does not change semantic-version precedence.
+pub(crate) fn should_install_version(
+    name: &str,
+    current: Option<&str>,
+    requested: &str,
+    force: bool,
+) -> Result<bool, String> {
+    let Some(current) = current.filter(|_| !force) else {
+        return Ok(true);
+    };
+    let parse = |version: &str| {
+        semver::Version::parse(version).map_err(|_| {
+            format!("cannot compare version `{version}` for `{name}`; use --force to replace it")
+        })
+    };
+    match parse(requested)?.cmp_precedence(&parse(current)?) {
+        std::cmp::Ordering::Greater => Ok(true),
+        std::cmp::Ordering::Equal => Ok(false),
+        std::cmp::Ordering::Less => Err(format!(
+            "{name} {current} is installed; use --force to downgrade to {requested}"
+        )),
+    }
+}
+
+pub(crate) fn print_already_installed(name: &str, version: &str) {
+    println!("{name} {version} is already installed; use --force to reinstall it");
+}
+
 /// The on-disk state of the Rust-native extension registry.
 ///
 /// A malformed or unreadable registry is returned as an error, rather than
@@ -199,10 +237,15 @@ pub fn run(args: &[String]) -> i32 {
     // Validate before Cargo work or extension-store mutations. A damaged file
     // may contain the only record of installed artifacts, so treating it as
     // an empty registry would make a later write destructive.
-    if let Err(error) = read_native_package_registry() {
-        eprintln!("error: cannot safely install while native package metadata is invalid: {error}");
-        return 1;
-    }
+    let records = match installed_native_packages_strict() {
+        Ok(records) => records,
+        Err(error) => {
+            eprintln!(
+                "error: cannot safely install while native package metadata is invalid: {error}"
+            );
+            return 1;
+        }
+    };
     if !options.build && options.path.is_none() {
         eprintln!(
             "error: prebuilt installs use the async dispatcher; Cargo compilation requires --build"
@@ -249,6 +292,25 @@ pub fn run(args: &[String]) -> i32 {
             return 1;
         }
     };
+    match should_install_version(
+        &package.name,
+        records
+            .iter()
+            .find(|p| p.name == package.name)
+            .map(|p| p.version.as_str()),
+        &package.version,
+        options.force,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            print_already_installed(&package.name, &package.version);
+            return 0;
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    }
     let cdylib_targets: Vec<&CargoTarget> = package
         .targets
         .iter()
@@ -601,6 +663,16 @@ fn install_native_package_at_with_hook(
         .find(|candidate| candidate.name == record.name)
         .cloned();
 
+    if !should_install_version(
+        &record.name,
+        previous.as_ref().map(|p| p.version.as_str()),
+        &record.version,
+        force,
+    )? {
+        print_already_installed(&record.name, &record.version);
+        return Ok(Vec::new());
+    }
+
     let mut new_artifacts = Vec::with_capacity(artifacts.len());
     let mut new_keys = HashSet::new();
     for artifact in artifacts {
@@ -643,6 +715,7 @@ fn install_native_package_at_with_hook(
     }
 
     let mut stale_targets = Vec::new();
+    let mut owned_keys = HashSet::new();
     if let Some(previous) = &previous {
         if previous.artifacts.is_empty() {
             let wanted = normalize_name(&record.name);
@@ -662,13 +735,16 @@ fn install_native_package_at_with_hook(
                     .map(|stem| normalize_name(stem.trim_start_matches("lib")) == wanted)
                     .unwrap_or(false);
                 if matches_legacy_name && is_dynamic_library(&path) {
+                    owned_keys.insert(native_artifact_identity(&artifact_file_name(&path)?));
                     stale_targets.push(path);
                 }
             }
         } else {
             for old_name in &previous.artifacts {
+                let old_path = checked_registered_artifact_path(destination, old_name)?;
+                owned_keys.insert(native_artifact_identity(old_name));
                 if !new_keys.contains(&native_artifact_identity(old_name)) {
-                    stale_targets.push(checked_registered_artifact_path(destination, old_name)?);
+                    stale_targets.push(old_path);
                 }
             }
         }
@@ -680,6 +756,9 @@ fn install_native_package_at_with_hook(
         .collect::<Vec<_>>();
     if !force {
         for target in &installed_targets {
+            if owned_keys.contains(&native_artifact_identity(&artifact_file_name(target)?)) {
+                continue;
+            }
             match std::fs::symlink_metadata(target) {
                 Ok(_) => {
                     return Err(format!(
@@ -1127,7 +1206,7 @@ fn help_requested() -> &'static str {
 }
 
 pub fn print_help() {
-    println!("Usage: rpi install [<crate>] [options]\n\nInstall a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Replace an existing installed extension\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
+    println!("Usage: rpi install [<crate>] [options]\n\nInstall or upgrade a prebuilt Rust extension using the versioned rpi-extension.json protocol.\nRepository and latest stable version are resolved from crates.io metadata.\nNewer versions upgrade automatically; an already installed version is skipped.\n\nOptions:\n  --version <version>  Install an exact package version\n  --github <owner/repo> Use this GitHub repository; default version comes from package-specific tags\n  --build              Explicitly compile the extension with Cargo\n  --path <directory>   Build a local extension crate; crate name may be omitted\n  --locked             Require Cargo.lock to remain unchanged (with --build/--path)\n  --force, -f          Reinstall the same version or allow a downgrade/replacement\n  --help, -h           Show this help\n\nExamples:\n  rpi install rpi-todo\n  rpi install rpi-todo --version 0.2.0\n  rpi install my-extension --github owner/repo --version 1.2.3\n  rpi install rpi-todo --build\n  rpi install --path . --force\n\nA missing or incompatible prebuilt release is an error; Cargo compilation requires --build.");
 }
 
 fn print_uninstall_help() {
@@ -1297,6 +1376,124 @@ mod tests {
             prebuilt: None,
             artifacts: vec![format!("{name}.dll")],
         }
+    }
+
+    #[test]
+    fn install_version_policy_allows_upgrades_and_requires_force_for_downgrades() {
+        assert!(should_install_version("demo", None, "1.0.0", false).unwrap());
+        for (current, requested) in [
+            ("0.1.11", "0.1.12"),
+            ("1.0.0-beta.1", "1.0.0"),
+            ("1.0.0-beta.1", "1.0.0-beta.2"),
+        ] {
+            assert!(should_install_version("demo", Some(current), requested, false).unwrap());
+            let error =
+                should_install_version("demo", Some(requested), current, false).unwrap_err();
+            assert!(error.contains("--force to downgrade"), "{error}");
+            assert!(should_install_version("demo", Some(requested), current, true).unwrap());
+        }
+        for requested in ["1.2.3", "1.2.3+new-build"] {
+            assert!(!should_install_version("demo", Some("1.2.3"), requested, false).unwrap());
+            assert!(should_install_version("demo", Some("1.2.3"), requested, true).unwrap());
+        }
+        assert!(should_install_version("demo", Some("unknown"), "1.0.0", false).is_err());
+        assert!(should_install_version("demo", Some("unknown"), "1.0.0", true).unwrap());
+    }
+
+    #[test]
+    fn native_install_same_version_is_unchanged_and_force_reinstalls_or_downgrades() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        let build = temp.path().join("demo.dll");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("demo.dll"), b"installed").unwrap();
+        let record = native_record("demo");
+        write_native_packages_at(&metadata, &[record.clone()]).unwrap();
+        let original_registry = std::fs::read(&metadata).unwrap();
+        std::fs::write(&build, b"rebuilt").unwrap();
+
+        assert!(install_native_package_at(
+            &destination,
+            &metadata,
+            record.clone(),
+            &[build.clone()],
+            false,
+        )
+        .unwrap()
+        .is_empty());
+        assert_eq!(
+            std::fs::read(destination.join("demo.dll")).unwrap(),
+            b"installed"
+        );
+        assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+        let mut older = record.clone();
+        older.version = "1.0.0".into();
+        let error = install_native_package_at(
+            &destination,
+            &metadata,
+            older.clone(),
+            &[build.clone()],
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("--force to downgrade"));
+        assert_eq!(
+            std::fs::read(destination.join("demo.dll")).unwrap(),
+            b"installed"
+        );
+        assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+
+        for forced in [record, older] {
+            install_native_package_at(
+                &destination,
+                &metadata,
+                forced.clone(),
+                &[build.clone()],
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(destination.join("demo.dll")).unwrap(),
+                b"rebuilt"
+            );
+            let records = read_native_package_registry_at(&metadata)
+                .unwrap()
+                .into_records();
+            assert_eq!(records[0].version, forced.version);
+        }
+        assert_no_native_transaction_files(&destination);
+    }
+
+    #[test]
+    fn native_upgrade_does_not_overwrite_unowned_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("extensions");
+        let metadata = temp.path().join(NATIVE_PACKAGES_FILE);
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::write(destination.join("demo.dll"), b"installed").unwrap();
+        std::fs::write(destination.join("unowned.dll"), b"unowned").unwrap();
+        write_native_packages_at(&metadata, &[native_record("demo")]).unwrap();
+        let original_registry = std::fs::read(&metadata).unwrap();
+        let artifact = temp.path().join("unowned.dll");
+        std::fs::write(&artifact, b"new").unwrap();
+        let mut upgraded = native_record("demo");
+        upgraded.version = "2.0.0".into();
+        assert!(
+            install_native_package_at(&destination, &metadata, upgraded, &[artifact], false,)
+                .unwrap_err()
+                .contains("already exists")
+        );
+        assert_eq!(
+            std::fs::read(destination.join("demo.dll")).unwrap(),
+            b"installed"
+        );
+        assert_eq!(
+            std::fs::read(destination.join("unowned.dll")).unwrap(),
+            b"unowned"
+        );
+        assert_eq!(std::fs::read(&metadata).unwrap(), original_registry);
+        assert_no_native_transaction_files(&destination);
     }
 
     struct TempAgent {
@@ -1539,7 +1736,7 @@ mod tests {
                 artifacts: Vec::new(),
             },
             &[build.join("new.dll"), build.join("same.dll")],
-            true,
+            false,
         )
         .unwrap();
 
@@ -1599,7 +1796,7 @@ mod tests {
                 artifacts: Vec::new(),
             },
             &[build.join("new.dll"), build.join("same.dll")],
-            true,
+            false,
             |_, target| {
                 if target == metadata_path {
                     Err("injected registry activation failure".into())

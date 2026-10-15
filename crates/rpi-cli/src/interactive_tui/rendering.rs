@@ -123,14 +123,13 @@ pub(super) fn add_update_notices(
 
     for notice in report.notices.iter().filter(|notice| notice.name != "rpi") {
         let body = format!(
-            "{}\n{} {}{}",
+            "{}\n{} {}",
             colors.muted.fg(&format!(
                 "{} {} -> {}",
                 notice.name, notice.current, notice.latest
             )),
             colors.muted.fg("Run"),
-            colors.accent.fg(&notice.command),
-            colors.muted.fg(".")
+            colors.accent.fg(&notice.command)
         );
         add_update_panel(&group, "Package Update Available", &body, colors.warning);
     }
