@@ -11,6 +11,14 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- Restore the enhanced keyboard protocol on macOS for terminals that keep IME
+  composition working, so `Shift+Enter` inserts a newline again instead of
+  submitting in iTerm2 and other macOS emulators. Only terminals whose CJK input
+  stops working with the protocol pushed (Otty) fall back to legacy input, and
+  `RPI_KITTY_KEYBOARD=1` / `=0` still overrides either way.
+
 ## [0.3.23] - 2026-10-13
 
 ### Changed

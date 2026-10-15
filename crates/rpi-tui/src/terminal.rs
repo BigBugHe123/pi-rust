@@ -23,15 +23,45 @@ const fn mouse_tracking_enabled_by_default() -> bool {
     mouse_tracking_enabled_for(cfg!(target_os = "macos"))
 }
 
-/// The kitty keyboard protocol (`\x1b[>u`) makes macOS IME composition stop
-/// working (no candidate window → CJK input breaks). Disable it on macOS by
-/// default; `RPI_KITTY_KEYBOARD=1` re-enables it for push-to-talk-style
-/// key-release handling, `RPI_KITTY_KEYBOARD=0` forces it off elsewhere.
+/// Terminals that advertise keyboard-enhancement support but stop delivering
+/// IME composition once the protocol is pushed (no candidate window → CJK input
+/// breaks). Otty is the reported case; it keeps the legacy input path.
+#[cfg(any(unix, test))]
+fn is_ime_incompatible_terminal(term_program: Option<&str>, term: Option<&str>) -> bool {
+    let names_otty = |value: Option<&str>| {
+        value.is_some_and(|value| value.to_ascii_lowercase().contains("otty"))
+    };
+    names_otty(term_program) || names_otty(term)
+}
+
+/// The kitty keyboard protocol (`\x1b[>7u`) is what tells `Shift+Enter` apart
+/// from `Enter` in most terminals, and it carries the key-release events
+/// push-to-talk extensions need — so keep it on everywhere the terminal
+/// survives it, macOS included. Only a terminal whose IME composition it breaks
+/// falls back to legacy input; the one emulator that cannot opt in at all
+/// (Apple Terminal) is covered by [`normalize_key_event`]'s native Shift check.
+#[cfg(any(unix, test))]
+fn keyboard_protocol_enabled_for(
+    is_macos: bool,
+    term_program: Option<&str>,
+    term: Option<&str>,
+) -> bool {
+    !is_macos || !is_ime_incompatible_terminal(term_program, term)
+}
+
+/// `RPI_KITTY_KEYBOARD=1` forces the protocol on, `RPI_KITTY_KEYBOARD=0` forces
+/// legacy input; otherwise [`keyboard_protocol_enabled_for`] decides from the
+/// platform and the terminal name.
+#[cfg(unix)]
 fn keyboard_protocol_enabled() -> bool {
     if let Some(value) = std::env::var_os("RPI_KITTY_KEYBOARD") {
         return value != "0";
     }
-    !cfg!(target_os = "macos")
+    keyboard_protocol_enabled_for(
+        cfg!(target_os = "macos"),
+        std::env::var("TERM_PROGRAM").ok().as_deref(),
+        std::env::var("TERM").ok().as_deref(),
+    )
 }
 
 /// Errors that can occur during terminal operations.
@@ -575,6 +605,43 @@ mod tests {
     fn mouse_tracking_default_preserves_native_selection_on_macos() {
         assert!(!mouse_tracking_enabled_for(true));
         assert!(mouse_tracking_enabled_for(false));
+    }
+
+    #[test]
+    fn macos_keeps_the_kitty_protocol_except_where_it_breaks_ime() {
+        // iTerm2's Shift+Enter needs the protocol: disabling it macOS-wide in
+        // 0.3.21 made Shift+Enter submit instead of inserting a newline.
+        assert!(keyboard_protocol_enabled_for(
+            true,
+            Some("iTerm.app"),
+            Some("xterm-256color")
+        ));
+        assert!(keyboard_protocol_enabled_for(true, Some("ghostty"), None));
+        assert!(keyboard_protocol_enabled_for(
+            true,
+            Some("Apple_Terminal"),
+            None
+        ));
+        // An unknown local terminal keeps the protocol rather than silently
+        // losing Shift+Enter; `RPI_KITTY_KEYBOARD=0` is the escape hatch.
+        assert!(keyboard_protocol_enabled_for(
+            true,
+            None,
+            Some("xterm-256color")
+        ));
+        // Otty composes CJK input only on the legacy path.
+        assert!(!keyboard_protocol_enabled_for(
+            true,
+            Some("Otty"),
+            Some("xterm-256color")
+        ));
+        assert!(!keyboard_protocol_enabled_for(true, None, Some("otty")));
+        // Other platforms never consult the terminal name.
+        assert!(keyboard_protocol_enabled_for(
+            false,
+            Some("Otty"),
+            Some("otty")
+        ));
     }
 
     #[test]
