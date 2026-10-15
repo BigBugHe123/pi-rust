@@ -11,8 +11,24 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Added
+
+- Prepare unified workspace Release PRs automatically after main CI succeeds;
+  publish crates, all five binary targets and install channels after the Release
+  PR merges. Submit Microsoft winget updates with retry-safe file and PR reuse.
+- Support per-model thinking-level mappings for OpenAI-compatible providers.
+
+### Changed
+
+- Track explicit model pricing with `Model.cost_configured` (serialized as
+  `costConfigured`), including intentionally free models. Rust callers that use
+  `Model` struct literals must initialize the new field; `Model::new` supplies
+  the default.
+
 ### Fixed
 
+- Release extension dialog state locks before submit callbacks, preventing
+  free-form answers and editor submissions from deadlocking the TUI.
 - Preserve whether model pricing was explicitly configured and expose it to
   extensions, so an unpriced model can be distinguished from explicit zero rates.
 - Honor per-model `cost` rates and pricing tiers from `models.json`, so request
@@ -26,6 +42,29 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
   ellipsis. A long command in a reply rendered as truncated text, and macOS
   sessions copy the rendered transcript through the terminal's native selection,
   so the clipboard received a command with its tail missing.
+
+## [0.3.24] - 2026-10-15
+
+### Added
+
+- Install prebuilt native extensions through the versioned `rpi-extension.json`
+  protocol. Resolve repositories from crates.io metadata or `--github`, use
+  package-specific release tags, and verify archive size, SHA-256, SDK ABI and
+  the exact native platform before installing.
+- Update the CLI from verified GitHub release binaries using `rpi-release.json`.
+  Keep Cargo compilation explicit with `--build`, and preserve the existing
+  executable or installed extension when validation or replacement fails.
+- Add a dedicated author sponsorship page with WeChat Pay, Alipay and Binance
+  Pay QR codes, plus a separate sponsorship button in the website header.
+
+### Changed
+
+- Publish the CLI distribution manifest only after all five platform archives
+  and their checksums are available. Retain repository provenance when updating
+  extensions installed from a custom GitHub repository.
+- Keep language selection across dynamically rendered documentation links,
+  guide navigation, reloads and blog navigation. Remove untranslated UI text
+  and keep README donation codes in a three-column Markdown table.
 
 ## [0.3.23] - 2026-10-13
 
