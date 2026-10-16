@@ -1,5 +1,7 @@
 # Provider packages
 
+新增接入请遵循 [Provider 接入规范](../extensions/provider-integration.md)；本文说明当前架构与迁移行为。
+
 核心保留 Anthropic Messages、OpenAI Chat Completions / Responses、DeepSeek，以及离线测试用的 Faux。
 OpenRouter、llama.cpp 和 Proxy 的供应商配置、模型目录及专用管理功能放到独立 package。
 它们复用核心协议实现，保留流式工具调用、用量统计、重试和取消行为。
@@ -126,7 +128,7 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 环境变量：安装带 `apiKeyEnv` 声明的 package，或在 models.json 显式填写 `apiKey: "$VENDOR_API_KEY"`。
 已有 auth.json 和显式 apiKey 配置无需迁移，package 默认模型由其目录提供。
 
-`/reload` 重新绑定 fresh plugin runtime、私有执行配置和公开模型目录，同时更新 `/model` 选择器和插件的 `set_model`。
+涉及 provider package 的 `/reload` 重新绑定 fresh plugin runtime、私有执行配置和公开模型目录，同时更新 `/model` 选择器和插件的 `set_model`。
 `/provider` 每次打开时读取重载后的 package 声明。
 如果当前模型所属的 package 消失或无法重新解析，reload 返回错误并保留原会话，先切换模型再移除该 package。
 取消立即结束宿主请求；插件桥接会取消自己的网络任务，DLL 引用保持到同步请求真正退出。
@@ -138,7 +140,7 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 以及需要显式启用的真实 DeepSeek API smoke test。
 
 ```sh
-cargo build -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
+cargo build -p rpi-example-provider-deepseek -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
 cargo test -p rpi-cli --test provider_packages
 cargo test --workspace
 ```

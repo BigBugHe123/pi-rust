@@ -171,13 +171,16 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 
 ### Provider 与渲染器
 
+推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。
+
 `api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
 
-`api.register_streaming_provider` 注入**流式** Provider。签名与 `register_provider`
-一致，但 `request_fn` 多了两个参数：宿主的逐块回调 `emit` 与它的 `emit_user_data`。
-插件在请求还没结束时就调用 `emit`，把增量推给宿主：
+`api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
+端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
+`emit_user_data`、可选控制面 `control` 和当前宿主恒为 `None` 的 `completion`。
+插件在请求还没结束时调用 `emit`，把增量推给宿主：
 
 ```json
 {"type":"text_delta","contentIndex":0,"delta":"hello "}
@@ -467,22 +470,78 @@ rpi auth login --provider <id>
 `rpi auth logout --provider <id>` 会先调用 `revoke`，成功后才删除本地凭证。插件不得
 把 token 写入普通事件、模型消息或日志。
 
-## Provider package 目录声明
+## Provider 接入规范
 
-Provider 插件可在现有 `declare` 中提供 `providers` 数组，每项包含 `id`、完整
-`rpi_ai::Model` 数组 `models`、可选的 `apiKeyEnv` 和默认 `true` 的 `requiresAuth`。
-目录只在同一插件成功注册对应 provider 后生效，同名冲突时目录与第一份实现一起保留。
-宿主在选择模型前仅加载一次插件，因此安装后的模型可直接用于 `--provider`、
-`--model` 和无凭据的 `--list-models`；`--no-extensions` 同时禁用实现和目录。
+完整规范：[Provider 接入规范](provider-integration.md)。创建推理扩展时优先复制
+[DeepSeek 模板](https://github.com/bigfish1913/pi-rust/tree/feature-stream-porider/examples/provider-deepseek)，
+通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
 
-核心保留 OpenAI、Anthropic、DeepSeek 与 Faux。OpenRouter、llama.cpp、Proxy 在
-`packages/provider-*`，使用 `rpi-provider-runtime::export_provider!` 桥接流式请求和取消。
-`/reload` 会重新绑定 runtime、凭据、端点和 `/model` 目录；当前 provider 无法重新加载时
-保留原会话并返回错误。凭据仍按 provider id 隔离，匿名运行必须显式声明。
+### 方式与目录
 
-开发时在仓库根目录运行：
+只改已支持协议的端点、模型和 key 时，优先使用 `models.json`；需要可安装目录、
+认证策略或供应商逻辑时，使用独立 package。新供应商不添加为 CLI 的默认依赖。
+Provider 负责推理，auth 负责凭据和登录流程，两者独立注册。
+
+通过 `declare` 的 `providers` 数组声明 `id`、完整 `rpi_ai::Model` 数组 `models`、
+可选 `apiKeyEnv` 和默认 `true` 的 `requiresAuth`。用 `Model::new` 构造后序列化，
+不能使用 models.json 的简写对象。provider ID、每个模型的 `provider`、实际注册 ID
+必须一致；model ID 是发送给服务端的名称。匿名服务必须显式设置 `requiresAuth: false`，
+协议客户端也必须允许匿名，不能只修改目录声明。
+
+目录只在同一插件成功注册对应 provider 后生效，同名冲突时保留第一份实现及其目录。
+注册和目录发现不要求凭据；宿主在选择模型前加载扩展、合并 models.json 覆盖。
+`--list-models` 可无凭据显示目录；`--no-extensions` 同时禁用实现和声明。
+
+### Factory 与私有执行绑定
+
+推荐 `rpi-provider-runtime::export_provider!`，package 提供
+`fn(&Model, &SimpleStreamOptions) -> Arc<dyn Provider>`。OpenAI-compatible 接入可复用
+`rpi_provider_runtime::completions(model, options, anonymous)`，无需复制 SSE 解析器。
+宿主私有 `ProviderFactory` 统一选择扩展 / 内置协议，不是插件需要实现的接口。
+运行时依赖使用 `rpi-ai`、`rpi-plugin-sdk` 与桥接库，不依赖 `rpi-cli`；宿主加载器
+可以作为测试依赖。
+
+公开目录、当前模型及配置后 `Provider::models()` 返回的描述不携带请求头。
+宿主私有 `ExecutionBinding` 保存实际端点、模型请求头及默认认证，执行前按
+provider / API / model ID 恢复；修改公开描述不能重定向绑定的凭据。
+`base_url` 仍公开用于展示，每次请求显式传入的 options 仍按既有规则生效。
+插件必须使用请求传入的 model / options，不能改用硬编码端点或进程环境变量中的 key。
+
+### 认证与重载
+
+默认凭据由宿主按 provider ID 解析：选中 provider 的 `--api-key` → `auth.json`
+有效 key / OAuth → `models.json` → 声明的 `apiKeyEnv` → 显式允许的匿名。
+协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和过期 token 不算可用。
+目录不得含凭据；请求参数、token 与私密请求头不得进入日志、普通事件或错误文本。
+OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负责通用命令与存储。
+
+`auth check`、`/provider` 与实际请求使用同一认证解析。`auth check` 只检查本地状态，
+不访问服务端或刷新 token；退出码为就绪 0、缺少凭据 1、配置错误 2。
+`/provider` 保存默认值后重启生效，`/model` 切换当前会话；`/provider remove` 删除配置，
+卸载 package 使用 `rpi package unlink`。API-key logout 不会清除环境变量或 models.json。
+
+涉及 provider package 的 `/reload` 会重新绑定 runtime、凭据、端点与公开目录；
+当前 package 消失或无法重新解析时返回错误并保留旧会话。仅内置 provider 的会话仍使用
+既有资源重载逻辑，不承诺重新解析所有 provider 配置；完整重载尚非原子代次切换。
+
+### 流式与验收
+
+增量必须在生成期间发出，最终 `out` 仍提供完整消息，宿主只产生一个 Done / Error。
+取消要及时停止请求并保留部分输出；同步 request fn 返回后禁止继续调用 `emit`。
+使用桥接库处理 ABI 字符串释放、取消与 runtime 生命周期，手写 ABI 遵守前述协议。
+
+验收必须包含真实动态库加载、本地 SSE 在首个正文增量到达后才继续发送的门控测试、
+UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
+覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
+真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
+DeepSeek 模板验证文本 / 思考流，未完成思考模式工具循环的多轮 `reasoning_content` 回传。
+
+在仓库根目录运行模板的离线验证：
 
 ```sh
-rpi package link openrouter --path packages/provider-openrouter --debug
-rpi --list-models openrouter
+cargo build -p rpi-example-provider-deepseek -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
+cargo test -p rpi-example-provider-deepseek --test streaming
+cargo test -p rpi-cli --test provider_packages
 ```
+
+新增 package 还必须构建并测试自身动态库，不能仅凭模板通过就声称接入完成。

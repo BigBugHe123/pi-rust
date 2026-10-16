@@ -1,5 +1,7 @@
 # DeepSeek 流式 provider 扩展示例
 
+接入约定与验收要求见 [Provider 接入规范](../../docs/extensions/provider-integration.md)。
+
 该示例使用独立的 `deepseek-extension` provider ID，通过真实 DLL / so / dylib 注册流式回调，
 复用 `rpi-provider-runtime` 的 ABI 桥接和 OpenAI-compatible SSE 解析。
 它不会替换核心的 `deepseek` provider，也不会成为默认 CLI 的依赖。

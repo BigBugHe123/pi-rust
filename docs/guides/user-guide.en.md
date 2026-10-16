@@ -74,7 +74,7 @@ When several sources are present, rpi checks them in this order:
 3. The provider's `apiKey` in `~/.rpi/agent/models.json`
 4. Environment variables
 
-Anthropic providers accept `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`. OpenAI-compatible providers use `OPENAI_API_KEY` unless a custom provider configuration supplies another value. Credential checks do not make a network request:
+The built-in Anthropic provider accepts `ANTHROPIC_API_KEY` or `ANTHROPIC_AUTH_TOKEN`; built-in OpenAI and DeepSeek use `OPENAI_API_KEY` and `DEEPSEEK_API_KEY`, respectively. Provider packages declare their own `apiKeyEnv`; custom providers can explicitly reference a variable in `models.json`. Using an OpenAI-compatible protocol does not inherit `OPENAI_API_KEY`. See the [provider integration specification](../extensions/provider-integration.md). Credential checks do not make a network request:
 
 ```bash
 rpi auth check
