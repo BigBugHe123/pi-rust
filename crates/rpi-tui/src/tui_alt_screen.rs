@@ -659,14 +659,31 @@ impl TuiAltScreen {
             &previous, &lines,
         ));
 
-        // Size changes alter wrapping or viewport coordinates everywhere;
-        // mirror upstream and rebuild once. Normal streaming updates stay
-        // incremental and preserve terminal scrollback.
+        let mut first_changed = None;
+        let mut last_changed = None;
+        for index in 0..previous.len().max(lines.len()) {
+            if previous.get(index) != lines.get(index) {
+                first_changed.get_or_insert(index);
+                last_changed = Some(index);
+            }
+        }
+        let viewport_top = *self.main_viewport_top.lock().unwrap();
+        let changed_in_scrollback = first_changed.is_some_and(|first| {
+            first < viewport_top || lines.len().saturating_sub(1) < viewport_top
+        });
+
+        // Saved scrollback cannot be addressed by cursor movement or CSI T:
+        // SD only inserts blanks in the live screen. Rebuild the document when
+        // an old row changes, otherwise repainting its tail appends duplicate
+        // history until a bounded terminal buffer evicts the conversation start.
+        // Size changes also require a rebuild; ordinary screen-local updates
+        // remain incremental.
         if (previous_width != 0 && previous_width != width)
             || (previous_height != 0 && previous_height != height)
+            || changed_in_scrollback
         {
-            terminal.write("\x1b[2J\x1b[H\x1b[3J");
             terminal.write("\x1b[?2026h");
+            terminal.write("\x1b[2J\x1b[H\x1b[3J");
             terminal.write(&lines.join("\r\n"));
             terminal.write("\x1b[?2026l");
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
@@ -678,15 +695,6 @@ impl TuiAltScreen {
             *self.main_hardware_row.lock().unwrap() = lines.len().saturating_sub(1);
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
-            let mut first_changed = None;
-            let mut last_changed = None;
-            let max = previous.len().max(lines.len());
-            for index in 0..max {
-                if previous.get(index) != lines.get(index) {
-                    first_changed.get_or_insert(index);
-                    last_changed = Some(index);
-                }
-            }
             if first_changed.is_none() && cursor == previous_cursor {
                 return;
             }
@@ -704,27 +712,7 @@ impl TuiAltScreen {
                     first
                 };
                 let mut output = String::from("\x1b[?2026h");
-                let mut force_tail_repaint = false;
-                if move_target < viewport_top {
-                    // The changed range starts above the visible viewport (e.g.
-                    // a long streamed message re-wrapping above the visible
-                    // tail). Scroll the viewport up so the write lands on the
-                    // correct document rows; without this the cursor clamps to
-                    // the top row and the transcript is painted over the dock,
-                    // while `advanced` under-counts the real scroll and corrupts
-                    // `main_viewport_top`/`main_hardware_row` for later frames.
-                    //
-                    // SD leaves the rows below the rewritten range blank, so
-                    // when the rewrite does NOT reach the document tail (an
-                    // in-place edit above the viewport) those rows must still be
-                    // repainted — force the write range through the last line.
-                    force_tail_repaint = true;
-                    let scroll = viewport_top - move_target;
-                    output.push_str("\x1b[H");
-                    output.push_str(&format!("\x1b[{scroll}T"));
-                    viewport_top = move_target;
-                    hardware_row = move_target;
-                } else if move_target > viewport_bottom {
+                if move_target > viewport_bottom {
                     let current_screen = hardware_row
                         .saturating_sub(viewport_top)
                         .min(height.saturating_sub(1));
@@ -745,10 +733,7 @@ impl TuiAltScreen {
                     output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
                 }
                 output.push_str(if append_start { "\r\n" } else { "\r" });
-                let mut render_end = last.min(lines.len().saturating_sub(1));
-                if force_tail_repaint {
-                    render_end = lines.len().saturating_sub(1);
-                }
+                let render_end = last.min(lines.len().saturating_sub(1));
                 if !deleted_tail_only {
                     for index in first..=render_end {
                         if index > first {

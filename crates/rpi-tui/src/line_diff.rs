@@ -78,6 +78,23 @@ fn context(atoms: &[Atom<'_>]) -> String {
     }
     format!("{sgr}{link}")
 }
+
+/// Wrapped rows can be repainted independently. Carry their incoming style
+/// explicitly and close it at the row boundary instead of depending on the
+/// previous physical row having just been written by the terminal.
+pub(crate) fn isolate_wrapped_lines(lines: &mut [String]) {
+    let mut carry = String::new();
+    for line in lines {
+        let source = format!("{carry}{line}");
+        let Some(parsed) = atoms(&source) else {
+            carry.clear();
+            continue;
+        };
+        carry = context(&parsed);
+        *line = format!("{source}\x1b[0m\x1b]8;;\x07");
+    }
+}
+
 /// Slice terminal columns without losing SGR/OSC8 context or splitting wide graphemes.
 /// Unsupported control protocols retain their existing unsliced fallback path.
 pub(crate) fn slice(line: &str, start: usize, width: usize) -> Option<String> {
