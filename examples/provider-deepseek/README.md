@@ -5,7 +5,7 @@
 该示例使用独立的 `deepseek-extension` provider ID，通过真实 DLL / so / dylib 注册流式回调，
 复用 `rpi-provider-runtime` 的 ABI 桥接和 OpenAI-compatible SSE 解析。
 它是 ABI 教学样例，不会成为默认 CLI 的依赖。正式 `deepseek` provider 已迁出核心，位于
-[独立 rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek)。
+[独立 rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。
 
 默认模型使用 `deepseek-flash`，认证声明为 `DEEPSEEK_API_KEY`。
 模型名与 `reasoning_content` 字段参照 [DeepSeek 首次调用](https://api-docs.deepseek.com/)

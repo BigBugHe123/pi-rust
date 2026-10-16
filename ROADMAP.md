@@ -90,8 +90,9 @@ long session, compaction cost, and interactive TUI frame cost.
 
 ## Provider packages
 
-Provider boundary cleanup now keeps Anthropic and OpenAI in core; DeepSeek lives in the independent rpi-package project,
-with OpenRouter, llama.cpp and Proxy supplied as optional native packages.
+Provider boundary cleanup keeps Anthropic and OpenAI in core. DeepSeek,
+OpenRouter, llama.cpp and Proxy share one optional rpi-providers package in the
+independent rpi-package project, with one install and upgrade entry point.
 See [Provider packages](docs/architecture/provider-packages.md) for installation,
 catalog registration, credential isolation and migration details.
 

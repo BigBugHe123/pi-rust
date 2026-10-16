@@ -165,7 +165,9 @@ fan-out 到所有已注册 handler，合并返回的 <code>{skillPaths, promptPa
 <h3 id="provider">Provider 与渲染器</h3>
 <p>Provider 接入遵循 <a href="https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md">Provider 接入规范</a>，
 完整模板见 <a href="https://github.com/bigfish1913/pi-rust/tree/feature-stream-porider/examples/provider-deepseek">DeepSeek 扩展</a>。
-只改已有协议的端点和模型时优先使用 <code>models.json</code>；需要目录、认证策略或协议适配时使用独立 package。</p>
+只改已有协议的端点和模型时优先使用 <code>models.json</code>；需要目录、认证策略或协议适配时使用独立 package。
+生产实现统一维护在 <a href="https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers">rpi-providers</a>，
+一个安装入口提供多个独立 provider；新增供应商在包内加模块，根模块只导出一次插件入口。</p>
 <p>推荐 <code>rpi-provider-runtime::export_provider!</code>：通过 <code>declare</code> 声明完整模型目录、
 <code>apiKeyEnv</code> 与 <code>requiresAuth</code>，优先注册 <code>register_streaming_provider</code>，旧宿主降级
 <code>register_provider</code>。流式增量在生成期间发送，最终 <code>out</code> 仍返回完整消息；宿主产生唯一终态。

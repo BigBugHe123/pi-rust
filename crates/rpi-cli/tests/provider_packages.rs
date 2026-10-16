@@ -1,5 +1,6 @@
-//! Build packages first: cargo build -p rpi-provider-openrouter
-//! -p rpi-provider-llama-cpp -p rpi-provider-proxy
+//! Build rpi-providers in the independent rpi-package workspace, then set
+//! RPI_TEST_PROVIDER_LIBRARY to its DLL/so/dylib and RPI_TEST_PROVIDER_PACKAGE
+//! to its package directory. The host has no vendor crate dependency.
 //! Then run cargo test -p rpi-cli --test provider_packages.
 use std::{
     path::PathBuf,
@@ -9,6 +10,14 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn library(name: &str) -> Option<PathBuf> {
+    if name == "rpi_providers" {
+        let path = PathBuf::from(std::env::var_os("RPI_TEST_PROVIDER_LIBRARY")?);
+        assert!(
+            path.is_file(),
+            "RPI_TEST_PROVIDER_LIBRARY must name the built bundle"
+        );
+        return Some(path);
+    }
     let profile = std::env::current_exe()
         .ok()?
         .parent()?
@@ -79,8 +88,8 @@ fn assert_auth_output(output: std::process::Output, ready: bool, source: &str) {
 
 #[test]
 fn auth_check_uses_package_policy_precedence_and_provider_isolation() {
-    let Some(library) = library("rpi_provider_openrouter") else {
-        eprintln!("SKIP: build rpi-provider-openrouter first");
+    let Some(library) = library("rpi_providers") else {
+        eprintln!("SKIP: build rpi-providers and set RPI_TEST_PROVIDER_LIBRARY first");
         return;
     };
     let temp = tempfile::tempdir().unwrap();
@@ -186,10 +195,7 @@ fn auth_check_uses_package_policy_precedence_and_provider_isolation() {
 
 #[test]
 fn auth_check_honors_anonymous_packages_and_logout_keeps_environment_keys() {
-    for (library_name, provider) in [
-        ("rpi_provider_proxy", "proxy"),
-        ("rpi_provider_llama_cpp", "llama-cpp"),
-    ] {
+    for (library_name, provider) in [("rpi_providers", "proxy"), ("rpi_providers", "llama-cpp")] {
         let Some(library) = library(library_name) else {
             continue;
         };
@@ -208,7 +214,7 @@ fn auth_check_honors_anonymous_packages_and_logout_keeps_environment_keys() {
             "none",
         );
     }
-    let Some(library) = library("rpi_provider_openrouter") else {
+    let Some(library) = library("rpi_providers") else {
         return;
     };
     let temp = tempfile::tempdir().unwrap();
@@ -293,8 +299,8 @@ fn deepseek_example_is_discovered_as_an_extension_with_its_own_auth_policy() {
 
 #[test]
 fn package_catalog_is_available_without_credentials_and_respects_no_extensions() {
-    let Some(library) = library("rpi_provider_openrouter") else {
-        eprintln!("SKIP: build rpi-provider-openrouter first");
+    let Some(library) = library("rpi_providers") else {
+        eprintln!("SKIP: build rpi-providers and set RPI_TEST_PROVIDER_LIBRARY first");
         return;
     };
     let temp = tempfile::tempdir().unwrap();
@@ -318,7 +324,7 @@ fn package_catalog_is_available_without_credentials_and_respects_no_extensions()
 
 #[test]
 fn openrouter_package_does_not_inherit_openai_credentials() {
-    let Some(library) = library("rpi_provider_openrouter") else {
+    let Some(library) = library("rpi_providers") else {
         return;
     };
     let temp = tempfile::tempdir().unwrap();
@@ -344,43 +350,33 @@ fn openrouter_package_does_not_inherit_openai_credentials() {
 async fn packaged_providers_stream_through_the_real_dll_and_cli() {
     for (name, provider, model, source) in [
         (
-            "rpi_provider_openrouter",
+            "rpi_providers",
             "openrouter",
             "openrouter/auto",
             "environment",
         ),
         (
-            "rpi_provider_openrouter",
+            "rpi_providers",
             "openrouter",
             "openrouter/auto",
             "models.json",
         ),
         (
-            "rpi_provider_openrouter",
+            "rpi_providers",
             "openrouter",
             "openrouter/auto",
             "auth.json",
         ),
+        ("rpi_providers", "openrouter", "openrouter/auto", "oauth"),
         (
-            "rpi_provider_openrouter",
-            "openrouter",
-            "openrouter/auto",
-            "oauth",
-        ),
-        (
-            "rpi_provider_openrouter",
+            "rpi_providers",
             "openrouter",
             "openrouter/auto",
             "expired-fallback",
         ),
-        (
-            "rpi_provider_openrouter",
-            "openrouter",
-            "openrouter/auto",
-            "cli",
-        ),
-        ("rpi_provider_llama_cpp", "llama-cpp", "local", "anonymous"),
-        ("rpi_provider_proxy", "proxy", "default", "anonymous"),
+        ("rpi_providers", "openrouter", "openrouter/auto", "cli"),
+        ("rpi_providers", "llama-cpp", "local", "anonymous"),
+        ("rpi_providers", "proxy", "default", "anonymous"),
     ] {
         let auth = source != "anonymous";
         let Some(library) = library(name) else {
@@ -537,8 +533,7 @@ async fn packaged_providers_stream_through_the_real_dll_and_cli() {
 
 #[tokio::test]
 async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
-    let local_library = library("rpi_provider_llama_cpp");
-    let Some(library) = library("rpi_provider_proxy") else {
+    let Some(library) = library("rpi_providers") else {
         return;
     };
     // The child gets an isolated environment; parallel tests never mutate the
@@ -569,8 +564,7 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         return;
     }
     let cwd = PathBuf::from(std::env::var_os("RPI_TEST_PACKAGE_CWD").unwrap());
-    let mut extensions = vec![library];
-    extensions.extend(local_library);
+    let extensions = vec![library];
     let args = rpi_cli::args::Args {
         extension: extensions,
         provider: Some("proxy".into()),
@@ -767,12 +761,14 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
 
 #[test]
 fn linked_package_is_discovered_and_unlinked_cleanly() {
-    if library("rpi_provider_openrouter").is_none() {
+    if library("rpi_providers").is_none() {
         return;
     }
     let temp = tempfile::tempdir().unwrap();
     let source =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../packages/provider-openrouter");
+        PathBuf::from(std::env::var_os("RPI_TEST_PROVIDER_PACKAGE").expect(
+            "set RPI_TEST_PROVIDER_PACKAGE to packages/rpi-providers for link/unlink testing",
+        ));
     let run = |args: &[&str]| {
         Command::new(env!("CARGO_BIN_EXE_rpi"))
             .current_dir(temp.path())
@@ -786,7 +782,7 @@ fn linked_package_is_discovered_and_unlinked_cleanly() {
     let linked = run(&[
         "package",
         "link",
-        "openrouter",
+        "providers",
         "--path",
         source.to_str().unwrap(),
         "--debug",
@@ -797,15 +793,19 @@ fn linked_package_is_discovered_and_unlinked_cleanly() {
         "{}",
         String::from_utf8_lossy(&linked.stderr)
     );
-    let catalog = run(&["--list-models", "openrouter"]);
+    let catalog = run(&["--list-models"]);
     assert!(catalog.status.success());
-    assert!(String::from_utf8_lossy(&catalog.stdout).contains("openrouter/auto"));
-    let unlinked = run(&["package", "unlink", "openrouter"]);
+    for model in ["deepseek-flash", "openrouter/auto", "local", "default"] {
+        assert!(String::from_utf8_lossy(&catalog.stdout).contains(model));
+    }
+    let unlinked = run(&["package", "unlink", "providers"]);
     assert!(
         unlinked.status.success(),
         "{}",
         String::from_utf8_lossy(&unlinked.stderr)
     );
-    let catalog = run(&["--list-models", "openrouter"]);
-    assert!(!String::from_utf8_lossy(&catalog.stdout).contains("openrouter/auto"));
+    let catalog = run(&["--list-models"]);
+    for model in ["deepseek-flash", "openrouter/auto"] {
+        assert!(!String::from_utf8_lossy(&catalog.stdout).contains(model));
+    }
 }

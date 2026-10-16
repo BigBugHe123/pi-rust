@@ -149,6 +149,8 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 Provider 接入遵循 [Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)，
 完整模板见 [DeepSeek 扩展](https://github.com/bigfish1913/pi-rust/tree/feature-stream-porider/examples/provider-deepseek)。
 只改已有协议的端点和模型时优先使用 `models.json`；需要目录、认证策略或协议适配时使用独立 package。
+生产实现统一维护在 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+一个安装入口提供多个独立 provider；新增供应商在包内加模块，根模块只导出一次插件入口。
 
 推荐 `rpi-provider-runtime::export_provider!`：通过 `declare` 声明完整模型目录、
 `apiKeyEnv` 与 `requiresAuth`，优先注册 `register_streaming_provider`，旧宿主降级

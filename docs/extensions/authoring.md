@@ -472,6 +472,10 @@ rpi auth login --provider <id>
 
 ## Provider 接入规范
 
+统一生产包为 `rpi-providers`，一个安装入口包含 DeepSeek、OpenRouter、llama.cpp 和 Proxy。
+新增供应商优先在包内添加模块；只有根模块导出一次 `export_plugin!`，各模块共用注册桥接。
+provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
+
 完整规范：[Provider 接入规范](provider-integration.md)。创建推理扩展时优先复制
 [DeepSeek 模板](https://github.com/bigfish1913/pi-rust/tree/feature-stream-porider/examples/provider-deepseek)，
 通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
@@ -494,7 +498,8 @@ Provider 负责推理，auth 负责凭据和登录流程，两者独立注册。
 
 ### Factory 与私有执行绑定
 
-推荐 `rpi-provider-runtime::export_provider!`，package 提供
+统一包内复用 `crate::registration::register_provider!`；单 provider 教学包可使用
+`rpi-provider-runtime::export_provider!`。模块提供
 `fn(&Model, &SimpleStreamOptions) -> Arc<dyn Provider>`。OpenAI-compatible 接入可复用
 `rpi_provider_runtime::completions(model, options, anonymous)`，无需复制 SSE 解析器。
 宿主私有 `ProviderFactory` 统一选择扩展 / 内置协议，不是插件需要实现的接口。
@@ -534,15 +539,17 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
 覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
 真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
-本仓库 DeepSeek 教学模板仅验证文本 / 思考流。生产 package 位于独立
-[rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek)，
+本仓库 DeepSeek 教学模板仅验证文本 / 思考流。生产统一包位于独立
+[rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
 保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
 
 在仓库根目录运行模板的离线验证：
 
 ```sh
-cargo build -p rpi-example-provider-deepseek -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
+cargo build -p rpi-example-provider-deepseek
 cargo test -p rpi-example-provider-deepseek --test streaming
+# 生产包在 rpi-package 仓库执行：cargo build -p rpi-providers && cargo test -p rpi-providers
+# CLI 集成需设置 RPI_TEST_PROVIDER_LIBRARY 和 RPI_TEST_PROVIDER_PACKAGE，见完整规范
 cargo test -p rpi-cli --test provider_packages
 ```
 

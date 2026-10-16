@@ -2,8 +2,8 @@
 
 本文约定当前 provider package 的实现、认证与验收要求。架构背景见
 [Provider packages](../architecture/provider-packages.md)，底层 ABI 见
-[扩展开发](authoring.md)。生产 DeepSeek package 见
-[独立 package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek)。
+[扩展开发](authoring.md)。生产统一包 `rpi-providers`（含 DeepSeek / OpenRouter / llama.cpp / Proxy）见
+[独立 package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。
 本仓库保留 ABI 教学用的 [DeepSeek 扩展示例](../../examples/provider-deepseek/README.md)。
 
 ## 1. 选择接入方式
@@ -80,6 +80,14 @@ serde_json::json!({
 `/provider remove <id>` 删除配置；卸载 package 使用 `rpi package unlink <name>`。
 
 ## 4. 推荐实现骨架
+
+生产供应商统一维护在 `rpi-providers`，新增供应商优先增加包内模块，不新增独立 crate。
+根 `src/lib.rs` 只导出一次 `export_plugin!`，遍历各模块的注册函数；每个模块仍有独立的
+provider ID、目录、认证策略与 factory。安装 / 卸载 / 升级一次作用于整个包。
+
+下面展示单 provider 教学扩展的写法。用于统一包时，调用包内
+`crate::registration::register_provider!` 生成注册函数，并在根模块登记；不要在各模块
+重复调用 `export_provider!`，否则会重复导出原生插件入口。
 
 先复制 [示例 Cargo.toml](../../examples/provider-deepseek/Cargo.toml) 的 `cdylib` / `rlib`
 设置及依赖，再参考下面的 OpenAI-compatible 适配。完整源码见
@@ -218,8 +226,9 @@ factory 优先于内置 API factory，两者使用同一 `ConfiguredProvider` �
 在仓库根目录运行现有模板的离线验证：
 
 ```sh
-cargo build -p rpi-example-provider-deepseek -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
+cargo build -p rpi-example-provider-deepseek
 cargo test -p rpi-example-provider-deepseek --test streaming
+# 跨项目 CLI 集成需要先构建统一包并设置下文环境变量
 cargo test -p rpi-cli --test provider_packages
 cargo fmt --all -- --check
 cargo check --workspace
@@ -231,3 +240,9 @@ cargo test --workspace
 不把 key 写入代码、快照或测试输出。具体命令见 [DeepSeek 示例](../../examples/provider-deepseek/README.md)。
 本仓库教学示例只验证文本 / 思考流，交互使用 `--no-tools`，不能据此宣称完整工具循环。
 独立生产 package 使用 `requiresReasoningContent` 保留历史思考，并提供工具续轮的动态库集成测试。
+
+统一包验证在 rpi-package 仓库运行 `cargo build -p rpi-providers`、`cargo test -p rpi-providers`。
+本仓库 CLI 测试通过 `RPI_TEST_PROVIDER_LIBRARY` 指定该包的 DLL / so / dylib，
+通过 `RPI_TEST_PROVIDER_PACKAGE` 指定 `packages/rpi-providers` 源码目录，覆盖 link / unlink。
+不设置路径的跳过结果不能作为跨项目验收；具体命令见 [Provider packages](../architecture/provider-packages.md#验证)。
+同一动态库必须注册全部预期 provider，并验证并发请求不会串用 factory 或 key。

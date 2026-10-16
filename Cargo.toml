@@ -16,9 +16,6 @@ members = [
     "examples/plugin-stub",
     "examples/provider-deepseek",
     "packages/provider-runtime",
-    "packages/provider-openrouter",
-    "packages/provider-llama-cpp",
-    "packages/provider-proxy",
 ]
 default-members = [
     "crates/rpi-agent",

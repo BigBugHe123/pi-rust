@@ -2442,48 +2442,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpi-provider-llama-cpp"
-version = "0.3.24"
-dependencies = [
- "async-trait",
- "reqwest",
- "rpi-ai",
- "rpi-plugin-sdk",
- "rpi-provider-runtime",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "rpi-provider-openrouter"
-version = "0.3.24"
-dependencies = [
- "async-trait",
- "reqwest",
- "rpi-ai",
- "rpi-plugin-sdk",
- "rpi-provider-runtime",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "rpi-provider-proxy"
-version = "0.3.24"
-dependencies = [
- "async-trait",
- "reqwest",
- "rpi-ai",
- "rpi-plugin-sdk",
- "rpi-provider-runtime",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "rpi-provider-runtime"
 version = "0.3.24"
 dependencies = [

@@ -46,9 +46,9 @@ it is the default.
   and the optional `DeferredProvider` capability for long-poll APIs.
 - `providers` — concrete implementations: `faux` (always), `anthropic`,
   `openai_completions`, `openai_responses` (behind `providers`).
-  DeepSeek lives in the independent [rpi-package repository](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek).
-  OpenRouter, llama.cpp and Proxy live in the optional packages under
-  `packages/provider-*`; see the [migration guide](../../docs/architecture/provider-packages.md).
+  DeepSeek, OpenRouter, llama.cpp and Proxy live together in the optional
+  [rpi-providers package](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers);
+  see the [migration guide](../../docs/architecture/provider-packages.md).
 
 ## The `Provider` trait
 

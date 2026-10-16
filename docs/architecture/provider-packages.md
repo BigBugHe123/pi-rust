@@ -1,69 +1,60 @@
 # Provider packages
 
-新增接入请遵循 [Provider 接入规范](../extensions/provider-integration.md)；本文说明当前架构与迁移行为。
+供应商策略统一放在独立 rpi-package 项目的
+[`rpi-providers`](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。
+一个 Cargo package、一个动态库、一个安装 / 升级入口，内部按供应商分模块。
+新增接入遵循 [Provider 接入规范](../extensions/provider-integration.md)。
 
 核心保留 Anthropic Messages、OpenAI Chat Completions / Responses，以及离线测试用的 Faux。
-DeepSeek、OpenRouter、llama.cpp 和 Proxy 的供应商配置、模型目录及专用管理功能放到独立 package。
-它们复用核心协议实现，保留流式工具调用、用量统计、重试和取消行为。
+CLI 不依赖供应商实现。`rpi-provider-runtime` 留在核心仓库作为通用 ABI / 异步协议桥接库，
+不会登记供应商或解析宿主凭据。
 
-## 当前拆分
+## 统一包中的 provider
 
-| package | 能力 | 默认认证 |
+| provider ID | 模块 | 默认认证 |
 | --- | --- | --- |
-| [`rpi-provider-deepseek`](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek) | DeepSeek 模型目录、思考开关与工具续轮；位于独立 rpi-package 仓库 | `DEEPSEEK_API_KEY` |
-| `rpi-provider-openrouter` | OpenRouter 目录、请求头和 OpenAI-compatible 推理 | `OPENROUTER_API_KEY` |
-| `rpi-provider-llama-cpp` | 本地推理、健康检查、模型查询，以及 `rpi-llama` 管理程序 | 可匿名；可选 `LLAMA_CPP_API_KEY` |
-| `rpi-provider-proxy` | 自定义 OpenAI-compatible 代理 | 可匿名；可选 `PROXY_API_KEY` |
-| `rpi-provider-runtime` | package 共用的同步 ABI / 异步 Provider 桥接库 | 不解析宿主凭据 |
+| `deepseek` | `src/deepseek.rs`：目录、思考开关、历史思考与工具续轮 | `DEEPSEEK_API_KEY`，必须认证 |
+| `openrouter` | `src/openrouter.rs`：目录、HTTP-Referer / X-Title | `OPENROUTER_API_KEY`，必须认证 |
+| `llama-cpp` | `src/llama_cpp/`：本地推理、模型查询及服务管理 | 可匿名，可选 `LLAMA_CPP_API_KEY` |
+| `proxy` | `src/proxy/`：通用 OpenAI-compatible 代理 | 可匿名，可选 `PROXY_API_KEY` |
 
-OpenRouter、llama.cpp、Proxy 和桥接库是本仓库 workspace 的独立成员；DeepSeek 位于独立 `rpi-package` 项目。
-CLI 不依赖这些供应商 package，构建默认 CLI 不会把适配器链接进可执行文件。
-原 `rpi_ai::providers::{openrouter,llama_cpp,proxy}` 的库调用方需要改用对应的独立 crate。
-已有 `models.json` 网关继续可以显式配置通用 OpenAI-compatible 协议。DeepSeek 完整的模型目录、专属环境变量与思考 / 工具续轮策略由独立 package 提供。
+旧的各供应商 crate 已从本仓库 workspace 移除，DeepSeek 专用核心实现也已移除。
+维护任意供应商只修改统一包的对应模块；增加模块后由 `src/lib.rs` 的唯一插件入口注册。
+`src/registration.rs` 复用通用桥接库，不让每个模块分别导出插件入口。
 
-## 安装和配置
+## 安装、使用与迁移
 
-DeepSeek 在独立 package 项目中安装（使用本分支构建的宿主）：
+在 rpi-package 仓库根目录，使用本分支构建的宿主安装一次：
 
 ```sh
-rpi package link deepseek --path /path/to/rpi-package/packages/rpi-provider-deepseek --debug
+rpi package link providers --path packages/rpi-providers --debug
+rpi --list-models
 rpi auth login --provider deepseek
 rpi --provider deepseek --model deepseek-flash
-```
-
-保留 `deepseek` ID，无需迁移已有 auth.json。单独设置 `DEEPSEEK_API_KEY` 只有在加载包的声明后才生效；
-不安装包时也可在 models.json 显式写 `apiKey: "$DEEPSEEK_API_KEY"`，但通用协议不会自动补上包的思考 / 工具策略。
-
-
-在本仓库根目录开发、验证：
-
-```sh
-rpi package link openrouter --path packages/provider-openrouter --debug
-rpi --list-models openrouter
-```
-
-配置 `OPENROUTER_API_KEY` 后：
-
-```sh
+# 配置 OPENROUTER_API_KEY 后
 rpi --provider openrouter --model openrouter/auto
-```
-
-切换到项目中的本地模型：
-
-```sh
-rpi package link llama-cpp --path packages/provider-llama-cpp --debug
+# 本地服务已运行时
 rpi --provider llama-cpp --model local --base-url http://localhost:8080/v1
 ```
 
-`local` 和 Proxy 的 `default` 是启动用的目录预设。服务器需要其他模型 id、上下文大小或 token 上限时，在原有 `models.json` 中配置同名 provider 的 `models`。
-用户的模型定义、端点和请求头覆盖 package 默认值。安装的 package 通过 `rpi package unlink <name>` 移除；
-已有 `models.json` 的通用协议配置仍可工作。
+`local` 与 Proxy 的 `default` 是目录预设；服务器使用其他模型名、上下文或输出上限时，
+在 models.json 中覆盖对应 provider。用户端点与请求头同样覆盖包的默认值。
+匿名目录就绪不代表服务已运行，使用时指定需要的 provider。
 
-llama.cpp 的服务管理代码位于 package 内，开发时可运行：
+若已分别安装旧包，先 `rpi package unlink <旧安装名>`，再 link `providers`，避免旧实现
+按加载顺序占用同名 ID。原有 provider ID、models.json 与 auth.json 保持兼容，不合并供应商凭据。
+之后升级只更新统一包，卸载使用 `rpi package unlink providers`；会一起移除四份目录和实现。
+本包尚未发布 crates.io，固定依赖兼容的核心提交，当前使用源码 link。
+
+Rust 调用方改用 `rpi_providers::{deepseek,openrouter,llama_cpp,proxy}` 中的类型。
+llama.cpp 管理程序仍在包内，入口改为：
 
 ```sh
-cargo run -p rpi-provider-llama-cpp --bin rpi-llama -- status
+cargo run -p rpi-providers --bin rpi-llama -- status
 ```
+
+已有 models.json 可以继续使用通用协议；但只配置通用协议不会自动提供统一包中的
+供应商思考 / 工具策略或专属环境变量声明。
 
 ## 注册与加载
 
@@ -108,7 +99,7 @@ factory 负责提供协议实现，不读取环境变量、不决定凭据优先
 完整重载仍包含多个对象的更新，单一代次快照的原子切换属于后续生命周期改进。
 
 `rpi_ai::providers::deepseek::DeepSeekProvider` 已移除。Rust 调用方改用独立
-`rpi_provider_deepseek::DeepSeekProvider::new`；CLI 用户安装 package 后仍使用 `deepseek` ID，
+`rpi_providers::deepseek::DeepSeekProvider::new`；CLI 用户安装 package 后仍使用 `deepseek` ID，
 已有同 ID 的 auth.json / models.json 配置可以复用。package 顺序提供默认模型，核心不再保留 DeepSeek 默认项。
 通用 Chat Completions 的 `requiresReasoningContent` 兼容选项支持独立回传历史思考；DeepSeek package
 启用该能力并处理思考开关与 effort 映射，核心协议不判断 DeepSeek 身份。
@@ -142,7 +133,7 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 退出码为：就绪 `0`，缺少凭据 `1`，配置读取失败 `2`。API-key logout 只删除存储的 key，不清除环境变量或 models.json。
 
 核心只保留 Anthropic、OpenAI 的环境变量回退和默认模型优先项。DeepSeek 等供应商不再隐式识别
-环境变量：安装带 `apiKeyEnv` 声明的 package，或在 models.json 显式填写 `apiKey: "$VENDOR_API_KEY"`。
+环境变量：安装统一的 `rpi-providers`（其中分别声明 `apiKeyEnv`），或在 models.json 显式填写 `apiKey: "$VENDOR_API_KEY"`。
 已有 auth.json 和显式 apiKey 配置无需迁移，package 默认模型由其目录提供。
 
 涉及 provider package 的 `/reload` 重新绑定 fresh plugin runtime、私有执行配置和公开模型目录，同时更新 `/model` 选择器和插件的 `set_model`。
@@ -157,10 +148,27 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 以及需要显式启用的真实 DeepSeek API smoke test。
 
 ```sh
-cargo build -p rpi-example-provider-deepseek -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
-cargo test -p rpi-cli --test provider_packages
+# 本仓库的 ABI 教学样例
+cargo build -p rpi-example-provider-deepseek
+cargo test -p rpi-example-provider-deepseek --test streaming
 cargo test --workspace
 ```
 
 端到端测试用真实 DLL、CLI 子进程和本机 SSE 服务，覆盖无凭据目录、禁用扩展、认证隔离、带认证的
 OpenRouter、匿名 llama.cpp / Proxy，以及实际流式输出。其他协议可以沿同样的声明和 factory 边界接入。
+
+生产统一包在 rpi-package 仓库根目录运行 `cargo build -p rpi-providers` 与
+`cargo test -p rpi-providers`。包的单 DLL 测试覆盖四份目录与认证策略，以及并发请求的
+factory / key 隔离；DeepSeek 思考工具续轮、取消与错误测试也在包内。
+
+本仓库的跨项目 CLI / reload / link 集成测试使用同一份动态库，无需 CLI 依赖供应商 crate：
+
+```powershell
+$env:RPI_TEST_PROVIDER_LIBRARY = 'C:\path\to\target\debug\rpi_providers.dll'
+$env:RPI_TEST_PROVIDER_PACKAGE = 'C:\path\to\rpi-package\packages\rpi-providers'
+cargo test -p rpi-cli --test provider_packages
+```
+
+Linux / macOS 改用对应的 `librpi_providers.so` / `librpi_providers.dylib` 路径。
+未设置路径时跳过外部包集成用例；显式提供无效路径会报错。跨项目验收应同时构建两个项目，
+显式设置路径运行，不能把跳过当作已验证。
