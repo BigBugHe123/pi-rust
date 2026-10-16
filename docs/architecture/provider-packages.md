@@ -68,6 +68,32 @@ serde_json::json!({
 同名 provider 按加载顺序保留第一个，其目录也随该实现一起保留。声明可以早于或晚于 provider 注册。
 没有目录声明的旧插件仍可配合 `models.json` 工作。
 
+## Factory 与执行绑定
+
+内置协议和原生扩展实现同一个宿主侧 `ProviderFactory` 契约。注册表优先查找 provider ID 对应的扩展 factory，
+再查找 API 协议对应的内置 factory；两者均由同一个 `ConfiguredProvider` 包装。
+factory 负责提供协议实现，不读取环境变量、不决定凭据优先级；认证统一由宿主解析并绑定。
+
+解析阶段将每个模型分成两种视图：
+
+| 视图 | 内容与用途 |
+| --- | --- |
+| 公开描述 | 仍使用现有 `Model` 类型以兼容 CLI / harness / 插件 ABI，但不携带任何请求头。用于目录、当前模型和模型切换 |
+| 私有 `ExecutionBinding` | 保存该实例的真实端点、模型级请求头与默认认证，只在执行请求时恢复 |
+
+`Provider::models()`、`catalog_all()`、`catalog_with_manifests()`、认证后的目录以及 `ResolvedModel.model` 均返回公开描述。
+`base_url` 仍在描述中可见以兼容现有配置和展示；实际执行以私有绑定为准。
+调用者传入的模型必须匹配已注册的 provider / API / model ID，不能通过改写描述中的端点或请求头重定向已绑定凭据。
+每次请求的 `SimpleStreamOptions` 仍可以按既有规则提供显式 API key 或额外请求头。
+
+涉及 provider package 的 `/reload` 会重新解析配置并构建新的执行绑定，随后替换 provider 实例和公开目录；
+凭据不再通过当前模型的 headers 传递。仅内置 provider 的会话保留既有的资源重载行为。
+当前 package 被移除时，重载会在切换前失败并保留旧会话，避免把同名配置静默转交给另一个协议实现。
+完整重载仍包含多个对象的更新，单一代次快照的原子切换属于后续生命周期改进。
+
+核心 `DeepSeekProvider::new` 保留现有入口，推理已委托通用 Chat Completions 流式实现，
+统一文本 / 思考事件、错误、用量和取消路径，并使用传入模型配置的端点。
+
 启动顺序是：加载扩展一次 → 收集 package 目录和 runtime factories → 合并用户模型配置 →
 按 provider id 解析凭据 → 选择模型并绑定 runtime → 创建 harness。
 `--list-models` 可在无凭据时显示 package 模型；`--no-extensions` 禁用这些声明和实现。
@@ -100,7 +126,7 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 环境变量：安装带 `apiKeyEnv` 声明的 package，或在 models.json 显式填写 `apiKey: "$VENDOR_API_KEY"`。
 已有 auth.json 和显式 apiKey 配置无需迁移，package 默认模型由其目录提供。
 
-`/reload` 重新绑定 fresh plugin runtime、认证后的目录和当前模型，同时更新 `/model` 选择器和插件的 `set_model`。
+`/reload` 重新绑定 fresh plugin runtime、私有执行配置和公开模型目录，同时更新 `/model` 选择器和插件的 `set_model`。
 `/provider` 每次打开时读取重载后的 package 声明。
 如果当前模型所属的 package 消失或无法重新解析，reload 返回错误并保留原会话，先切换模型再移除该 package。
 取消立即结束宿主请求；插件桥接会取消自己的网络任务，DLL 引用保持到同步请求真正退出。

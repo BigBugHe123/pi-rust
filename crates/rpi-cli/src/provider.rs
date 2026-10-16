@@ -77,7 +77,9 @@ use rpi_ai::{
     AssistantMessageEventStream, Context, Model, Provider, SimpleStreamOptions, ThinkingLevel,
 };
 
+mod binding;
 mod factories;
+use binding::{ExecutionBinding, RequestAuth};
 use factories::RuntimeFactories;
 
 use crate::args::parse_thinking_level;
@@ -117,10 +119,8 @@ pub struct ResolvedModel {
     /// Whether the selected runtime is configured with a provider-default key
     /// or an explicit anonymous policy. Otherwise auth belongs to model headers.
     ///
-    /// Kept so [`available_catalog`] can reproduce the auth-filtered snapshot
-    /// (pi `getAvailableSnapshot`: `available = all.filter(m =>
-    /// configuredProviders.has(m.provider))`) and surface only models that
-    /// won't fail at request time with "No API key for provider".
+    /// Retained for diagnostics and API compatibility. Published catalogs are
+    /// already filtered when their execution bindings are constructed.
     pub has_provider_key: bool,
     /// Saved theme name from `~/.rpi/agent/settings.json`, if any. Best-effort:
     /// the TUI applies it at startup when it matches a known preset
@@ -130,6 +130,8 @@ pub struct ResolvedModel {
     /// The harness resolves a provider lazily by `model.provider`, so this lets
     /// `/model` hot-switch across providers without a restart.
     pub providers: Vec<Arc<dyn Provider>>,
+    /// Private state shared with the selected configured provider.
+    execution: Arc<ExecutionBinding>,
 }
 
 impl std::fmt::Debug for ResolvedModel {
@@ -141,35 +143,6 @@ impl std::fmt::Debug for ResolvedModel {
             .field("has_provider_key", &self.has_provider_key)
             .field("theme", &self.theme)
             .finish()
-    }
-}
-
-/// Bind the Anthropic wire implementation to the provider id declared in
-/// models.json. upstream keeps providers isolated by id even when they share
-/// the same protocol and model ids; the wrapper preserves that routing identity
-/// without duplicating the protocol implementation.
-struct NamedAnthropicProvider {
-    id: String,
-    inner: AnthropicProvider,
-}
-
-#[async_trait::async_trait]
-impl Provider for NamedAnthropicProvider {
-    fn id(&self) -> &str {
-        &self.id
-    }
-
-    fn models(&self) -> &[Model] {
-        self.inner.models()
-    }
-
-    async fn stream_simple(
-        &self,
-        model: &Model,
-        ctx: &Context,
-        opts: &SimpleStreamOptions,
-    ) -> AssistantMessageEventStream {
-        self.inner.stream_simple(model, ctx, opts).await
     }
 }
 
@@ -633,16 +606,7 @@ fn resolve_with_factories(
         });
     }
 
-    if let Some(AnthropicCredential::Headers(headers)) = &selected_anthropic_credential {
-        merge_auth_headers(&mut model, headers);
-    }
-    if let Some(key) = &selected_openai_key {
-        merge_auth_headers(
-            &mut model,
-            &BTreeMap::from([("authorization".into(), format!("Bearer {key}"))]),
-        );
-    }
-    let (provider, has_provider_key) = build_runtime(
+    let (provider, execution, has_provider_key) = build_runtime(
         &selected_provider,
         &selected_api,
         &full_catalog,
@@ -703,7 +667,7 @@ fn resolve_with_factories(
             if !authed {
                 continue;
             }
-            let (runtime, _) = build_runtime(
+            let (runtime, _, _) = build_runtime(
                 &candidate.provider,
                 &candidate.api,
                 &full_catalog,
@@ -716,14 +680,31 @@ fn resolve_with_factories(
         }
     }
 
-    Ok(ResolvedModel {
+    // Only credential-free descriptors leave the resolver. The private binding
+    // owns the authoritative endpoint and all request headers.
+    model = execution
+        .models()
+        .iter()
+        .find(|candidate| {
+            candidate.api == model.api && candidate.id.eq_ignore_ascii_case(&model.id)
+        })
+        .expect("selected model is bound")
+        .clone();
+    let resolved = ResolvedModel {
         provider,
         model,
         thinking_level,
         has_provider_key,
         theme: settings.theme.clone(),
         providers,
-    })
+        execution,
+    };
+    debug_assert!(resolved
+        .execution
+        .models()
+        .iter()
+        .all(|model| model.headers.is_none()));
+    Ok(resolved)
 }
 
 /// Build one provider runtime from a pre-computed credential. Shared by
@@ -737,144 +718,32 @@ fn build_runtime(
     openai_key: Option<&str>,
     settings: &settings::Settings,
     factories: &RuntimeFactories,
-) -> (Arc<dyn Provider>, bool) {
-    let mut provider_models: Vec<Model> = catalog
+) -> (Arc<dyn Provider>, Arc<ExecutionBinding>, bool) {
+    let anonymous = factories
+        .manifests
         .iter()
-        .filter(|candidate| candidate.api == *api && candidate.provider == provider_id)
+        .any(|manifest| manifest.id == provider_id && !manifest.requires_auth);
+    let provider_has_auth = anthropic_credential.is_some() || openai_key.is_some() || anonymous;
+    let models = catalog
+        .iter()
+        .filter(|model| model.api == *api && model.provider == provider_id)
+        .filter(|model| provider_has_auth || model_has_header_auth(model))
         .cloned()
         .collect();
-    if let Some(AnthropicCredential::Headers(headers)) = anthropic_credential {
-        for candidate in &mut provider_models {
-            merge_auth_headers(candidate, headers);
-        }
-    }
-    if let Some(key) = openai_key {
-        let headers = BTreeMap::from([("authorization".into(), format!("Bearer {key}"))]);
-        for candidate in &mut provider_models {
-            merge_auth_headers(candidate, &headers);
-        }
-    }
-    let provider_has_auth = anthropic_credential.is_some()
-        || openai_key.is_some()
-        || factories
-            .manifests
-            .iter()
-            .any(|manifest| manifest.id == provider_id && !manifest.requires_auth);
-    provider_models.retain(|model| provider_has_auth || model_has_header_auth(model));
-    if factories.providers.contains_key(provider_id) {
-        let api_key = openai_key.map(str::to_string).or_else(|| {
-            anthropic_credential
-                .and_then(AnthropicCredential::provider_key)
-                .map(str::to_string)
-        });
-        // Bind request auth to this provider's models so reload can retain it.
-        if let Some(key) = &api_key {
-            let name = if *api == rpi_ai::Api::AnthropicMessages {
-                "x-api-key"
-            } else {
-                "authorization"
-            };
-            let value = if name == "authorization" {
-                format!("Bearer {key}")
-            } else {
-                key.clone()
-            };
-            for model in &mut provider_models {
-                merge_auth_headers(model, &BTreeMap::from([(name.into(), value.clone())]));
-            }
-        }
-        return (
-            factories
-                .configure(provider_id, provider_models, api_key)
-                .expect("registered provider factory"),
-            true,
-        );
-    }
-    match api {
-        rpi_ai::Api::AnthropicMessages => {
-            let provider_key = anthropic_credential
-                .and_then(AnthropicCredential::provider_key)
-                .map(str::to_string);
-            let has_key = provider_key.is_some();
-            let http =
-                provider_http_client(&provider_models, "https://api.anthropic.com", settings);
-            let inner = if provider_id == DEFAULT_PROVIDER_ID
-                && !matches!(anthropic_credential, Some(AnthropicCredential::Headers(_)))
-            {
-                AnthropicProvider::with_models(provider_key, http, provider_models)
-            } else {
-                AnthropicProvider::with_models_without_env_api_key(
-                    provider_key,
-                    http,
-                    provider_models,
-                )
-            };
-            (
-                Arc::new(NamedAnthropicProvider {
-                    id: provider_id.to_string(),
-                    inner,
-                }),
-                has_key,
-            )
-        }
-        rpi_ai::Api::OpenaiCompletions => {
-            let has_key = openai_key.is_some();
-            let http =
-                provider_http_client(&provider_models, "https://api.openai.com/v1", settings);
-            let inner = if provider_id == "openai" {
-                OpenAiCompletionsProvider::with_models(
-                    provider_id.to_string(),
-                    openai_key.map(str::to_string),
-                    http,
-                    provider_models,
-                )
-            } else {
-                OpenAiCompletionsProvider::with_models_without_env_api_key(
-                    provider_id.to_string(),
-                    openai_key.map(str::to_string),
-                    http,
-                    provider_models,
-                )
-            };
-            (Arc::new(inner), has_key)
-        }
-        rpi_ai::Api::OpenaiResponses => {
-            let has_key = openai_key.is_some();
-            let http =
-                provider_http_client(&provider_models, "https://api.openai.com/v1", settings);
-            let inner = if provider_id == "openai" {
-                OpenAiResponsesProvider::with_models(
-                    provider_id.to_string(),
-                    openai_key.map(str::to_string),
-                    http,
-                    provider_models,
-                )
-            } else {
-                OpenAiResponsesProvider::with_models_without_env_api_key(
-                    provider_id.to_string(),
-                    openai_key.map(str::to_string),
-                    http,
-                    provider_models,
-                )
-            };
-            (Arc::new(inner), has_key)
-        }
-        _ => unreachable!("unsupported APIs are filtered while loading models.json"),
-    }
+    let auth = match anthropic_credential {
+        Some(AnthropicCredential::ProviderKey(key)) => RequestAuth::ApiKey(key.clone()),
+        Some(AnthropicCredential::Headers(headers)) => RequestAuth::Headers(headers.clone()),
+        None => openai_key.map_or(RequestAuth::None, |key| RequestAuth::ApiKey(key.into())),
+    };
+    let has_provider_key = matches!(auth, RequestAuth::ApiKey(_)) || anonymous;
+    let (provider, binding) = factories
+        .configure(provider_id, api, models, auth, settings)
+        .expect("supported protocol or registered provider factory");
+    (provider, binding, has_provider_key)
 }
 
-/// The catalog the TUI's `/model` selector displays (read-only). Re-derives the
-/// **auth-filtered** snapshot the provider was built from so the selector shows
-/// exactly the models that can actually run (mirrors pi `getAvailableSnapshot`:
-/// `available = all.filter(m => configuredProviders.has(m.provider))` — v1's
-/// single-provider equivalent of "configured" is [`model_is_authed`]).
-///
-/// The runtime provider already owns one provider-id-specific catalog. The
-/// additional auth filter keeps header-only and provider-key paths consistent
-/// if a future runtime exposes a broader snapshot.
-///
-/// On any config read error it falls back to the built-in Anthropic catalog —
-/// the selector is non-critical and must never block the TUI from starting.
+/// Credential-free descriptors for the selected provider. Authentication was
+/// already checked before the common factory created its execution binding.
 pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
     let selected_api = &resolved.model.api;
     let selected_provider = &resolved.model.provider;
@@ -887,16 +756,13 @@ pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
         // and gateway providers can expose a broader catalog. The selector
         // must only offer models the current lane can actually route to.
         .filter(|m| m.api == *selected_api && m.provider == *selected_provider)
-        .filter(|m| model_is_authed(m, resolved.has_provider_key))
         .filter(|m| seen.insert((m.api.clone(), m.provider.clone(), m.id.to_ascii_lowercase())))
         .cloned()
         .collect()
 }
 
-/// Return every authenticated model across ALL configured providers (built-in
-/// + models.json), not just the currently selected one. Derived from the
-/// already-built provider runtimes so each model keeps its merged auth headers
-/// and base-url override (a `catalog_all()`-based derivation would drop both).
+/// Credential-free descriptors for every configured runtime, including packages.
+/// Bound credentials and request headers stay inside each execution binding.
 pub fn authenticated_catalog(resolved: &ResolvedModel) -> Vec<Model> {
     let mut seen = std::collections::HashSet::new();
     resolved
@@ -929,9 +795,19 @@ pub fn manifests_from_session(
     })
 }
 
-/// Full catalog for discovery and default selection, including packages that
-/// have not been authenticated yet. User configuration overrides declarations.
+/// Public catalog for discovery and default selection, including packages that
+/// have not been authenticated yet. Request headers are never published.
 pub fn catalog_with_manifests(
+    manifests: &[rpi_extensions::ProviderManifest],
+) -> Result<Vec<Model>, config::ConfigError> {
+    Ok(execution_catalog_with_manifests(manifests)?
+        .iter()
+        .map(binding::descriptor)
+        .collect())
+}
+
+/// Internal configuration view used only to evaluate header-based auth policy.
+pub(crate) fn execution_catalog_with_manifests(
     manifests: &[rpi_extensions::ProviderManifest],
 ) -> Result<Vec<Model>, config::ConfigError> {
     let mut cfg = config::load_models_config()?;
@@ -1028,15 +904,6 @@ enum AnthropicCredential {
     ProviderKey(String),
     /// Folded only onto models owned by the selected provider.
     Headers(BTreeMap<String, String>),
-}
-
-impl AnthropicCredential {
-    fn provider_key(&self) -> Option<&str> {
-        match self {
-            Self::ProviderKey(key) => Some(key),
-            Self::Headers(_) => None,
-        }
-    }
 }
 
 type AnthropicCredentials = BTreeMap<String, AnthropicCredential>;
@@ -1434,10 +1301,6 @@ fn model_belongs_to_default_provider(
 ///
 /// The selected provider snapshot is identity-homogeneous. A model is runnable
 /// when its own headers carry auth or that selected provider has a default key.
-fn model_is_authed(m: &Model, has_provider_key: bool) -> bool {
-    model_has_header_auth(m) || has_provider_key
-}
-
 fn model_is_authed_for_resolution(
     model: &Model,
     anthropic_credentials: &AnthropicCredentials,
@@ -1622,9 +1485,9 @@ mod tests {
             .find(|model| model.provider == "second")
             .unwrap();
         assert_eq!(second.base_url, "https://second.example/v1");
-        assert_eq!(
-            second.headers.as_ref().unwrap()["authorization"],
-            "Bearer second-key"
+        assert!(
+            second.headers.is_none(),
+            "catalogs never expose credentials"
         );
     }
 
@@ -1651,13 +1514,47 @@ mod tests {
     }
 
     #[test]
+    fn every_published_catalog_omits_header_auth_but_requests_recover_it() {
+        let _env = TestEnv::new();
+        std::fs::write(config::models_path().unwrap(), r#"{"providers":{"gateway":{
+            "api":"openai-completions","headers":{"Authorization":"Bearer catalog-secret","X-Private-Header":"private-value"},
+            "models":[{"id":"model"}]
+        }}}"#).unwrap();
+        let resolved = resolve(Some("gateway"), Some("model"), None, None, None).unwrap();
+        for catalog in [
+            catalog_all().unwrap(),
+            available_catalog(&resolved),
+            authenticated_catalog(&resolved),
+        ] {
+            assert!(catalog.iter().all(|model| model.headers.is_none()));
+            let json = serde_json::to_string(&catalog).unwrap();
+            assert!(!json.contains("catalog-secret") && !json.contains("private-value"));
+        }
+        assert!(resolved.model.headers.is_none());
+        let request = resolved.execution.request_model(&resolved.model);
+        assert_eq!(
+            request.headers.as_ref().unwrap()["Authorization"],
+            "Bearer catalog-secret"
+        );
+        assert_eq!(
+            request.headers.as_ref().unwrap()["X-Private-Header"],
+            "private-value"
+        );
+    }
+
+    #[test]
     fn stored_oauth_uses_bearer_and_expired_tokens_do_not_authenticate_requests() {
         let _env = TestEnv::new();
         config::upsert_oauth_token("anthropic", "access-token".into(), "refresh".into(), 0)
             .unwrap();
         let resolved = resolve(Some("anthropic"), None, None, None, None).unwrap();
         assert_eq!(
-            resolved.model.headers.as_ref().unwrap()["authorization"],
+            resolved
+                .execution
+                .request_model(&resolved.model)
+                .headers
+                .as_ref()
+                .unwrap()["authorization"],
             "Bearer access-token"
         );
         config::upsert_oauth_token("anthropic", "expired-token".into(), "refresh".into(), 1)
@@ -1950,7 +1847,8 @@ mod tests {
         // x-api-key path: no Bearer header folded onto the model (auth rides on
         // the provider's default key, surfaced to the provider at build time).
         assert!(
-            r.model
+            r.execution
+                .request_model(&r.model)
                 .headers
                 .as_ref()
                 .and_then(|h| h.get("authorization"))
@@ -2159,7 +2057,8 @@ mod tests {
         assert_eq!(lower.model.base_url, "https://lower.example.com");
         assert_eq!(
             lower
-                .model
+                .execution
+                .request_model(&lower.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2172,7 +2071,8 @@ mod tests {
         assert_eq!(upper.model.base_url, "https://upper.example.com");
         assert_eq!(
             upper
-                .model
+                .execution
+                .request_model(&upper.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2316,7 +2216,8 @@ mod tests {
         assert!(!resolved.has_provider_key);
         assert_eq!(
             resolved
-                .model
+                .execution
+                .request_model(&resolved.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2331,7 +2232,11 @@ mod tests {
         std::env::set_var(ANTHROPIC_AUTH_TOKEN_ENV, "tok-123");
         let r = resolve(None, None, None, None, None).unwrap();
         // No provider key carries auth — it lives on the model header.
-        let headers = r.model.headers.as_ref().expect("bearer header on model");
+        let headers = r
+            .execution
+            .request_model(&r.model)
+            .headers
+            .expect("bearer header on model");
         assert_eq!(
             headers.get("authorization").map(|s| s.as_str()),
             Some("Bearer tok-123")
@@ -2358,7 +2263,8 @@ mod tests {
         // (no Bearer header on the model).
         let r = resolve(None, None, None, Some("flag-key"), None).unwrap();
         assert!(
-            r.model
+            r.execution
+                .request_model(&r.model)
                 .headers
                 .as_ref()
                 .and_then(|h| h.get("authorization"))
@@ -2441,7 +2347,11 @@ mod tests {
         assert_eq!(r.model.provider, "gateway");
         assert_eq!(r.provider.id(), "gateway");
         // Provider-level authHeader folded in.
-        let headers = r.model.headers.as_ref().expect("headers merged");
+        let headers = r
+            .execution
+            .request_model(&r.model)
+            .headers
+            .expect("headers merged");
         assert_eq!(
             headers.get("authorization").map(|s| s.as_str()),
             Some("Bearer gw-secret")
@@ -2524,7 +2434,7 @@ mod tests {
         assert!(!providers.contains("anthropic"));
         assert!(!providers.contains("openai"));
         // Auth headers merged at build time survive into the selector catalog.
-        assert!(catalog.iter().all(|m| m.headers.is_some()));
+        assert!(catalog.iter().all(|m| m.headers.is_none()));
     }
 
     #[test]
@@ -2561,7 +2471,8 @@ mod tests {
         assert!(resolved.has_provider_key);
         assert_eq!(
             resolved
-                .model
+                .execution
+                .request_model(&resolved.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2640,7 +2551,8 @@ mod tests {
         assert_eq!(alpha.model.base_url, "https://alpha.example.com");
         assert_eq!(
             alpha
-                .model
+                .execution
+                .request_model(&alpha.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2652,7 +2564,8 @@ mod tests {
         assert_eq!(beta.provider.id(), "beta");
         assert_eq!(beta.model.base_url, "https://beta.example.com");
         assert_eq!(
-            beta.model
+            beta.execution
+                .request_model(&beta.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2809,7 +2722,8 @@ mod tests {
         .unwrap();
         assert!(chat.has_provider_key);
         assert_eq!(
-            chat.model
+            chat.execution
+                .request_model(&chat.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2828,7 +2742,8 @@ mod tests {
         assert!(responses.has_provider_key);
         assert_eq!(
             responses
-                .model
+                .execution
+                .request_model(&responses.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -2926,7 +2841,8 @@ mod tests {
             assert!(resolved.has_provider_key);
             assert_eq!(
                 resolved
-                    .model
+                    .execution
+                    .request_model(&resolved.model)
                     .headers
                     .as_ref()
                     .and_then(|headers| headers.get("authorization"))
@@ -2966,18 +2882,24 @@ mod tests {
         assert_eq!(alpha.model.provider, "alpha");
         assert_eq!(alpha.model.base_url, "https://alpha.example.com");
         assert!(alpha.has_provider_key);
-        assert!(alpha.model.headers.as_ref().map_or(true, |headers| {
-            headers
-                .keys()
-                .all(|name| !name.eq_ignore_ascii_case("x-api-key"))
-        }));
+        assert!(alpha
+            .execution
+            .request_model(&alpha.model)
+            .headers
+            .as_ref()
+            .map_or(true, |headers| {
+                headers
+                    .keys()
+                    .all(|name| !name.eq_ignore_ascii_case("x-api-key"))
+            }));
 
         let beta = resolve(None, Some("beta/shared-model"), None, None, None).unwrap();
         assert_eq!(beta.provider.id(), "beta");
         assert_eq!(beta.model.provider, "beta");
         assert_eq!(beta.model.base_url, "https://beta.example.com");
         assert_eq!(
-            beta.model
+            beta.execution
+                .request_model(&beta.model)
                 .headers
                 .as_ref()
                 .and_then(|headers| headers.get("authorization"))
@@ -3084,7 +3006,11 @@ mod tests {
         let r = resolve(None, Some("custom-claude"), None, None, None).unwrap();
         assert_eq!(r.model.id, "custom-claude");
         assert_eq!(r.model.base_url, "https://gw.example.com");
-        let headers = r.model.headers.as_ref().expect("bearer folded onto model");
+        let headers = r
+            .execution
+            .request_model(&r.model)
+            .headers
+            .expect("bearer folded onto model");
         assert_eq!(
             headers.get("authorization").map(|s| s.as_str()),
             Some("Bearer gw-secret")
@@ -3128,7 +3054,11 @@ mod tests {
         assert_eq!(r.model.id, "custom-claude");
         assert_eq!(r.model.base_url, "https://gw.example.com");
         // Gateway model carries the folded Bearer.
-        let headers = r.model.headers.as_ref().expect("bearer on gateway model");
+        let headers = r
+            .execution
+            .request_model(&r.model)
+            .headers
+            .expect("bearer on gateway model");
         assert_eq!(
             headers.get("authorization").map(|s| s.as_str()),
             Some("Bearer gw-secret")
@@ -3154,7 +3084,8 @@ mod tests {
         .unwrap();
         let r = resolve(None, Some("custom-claude"), None, Some("flag-key"), None).unwrap();
         assert_eq!(
-            r.model
+            r.execution
+                .request_model(&r.model)
                 .headers
                 .as_ref()
                 .and_then(|h| h.get("authorization"))
@@ -3194,12 +3125,17 @@ mod tests {
         assert_eq!(r.model.id, "custom-claude");
         assert_eq!(r.model.base_url, "https://gw.example.com");
         assert!(r.has_provider_key);
-        assert!(r.model.headers.as_ref().map_or(true, |headers| {
-            headers.keys().all(|name| {
-                !name.eq_ignore_ascii_case("x-api-key")
-                    && !name.eq_ignore_ascii_case("authorization")
-            })
-        }));
+        assert!(r
+            .execution
+            .request_model(&r.model)
+            .headers
+            .as_ref()
+            .map_or(true, |headers| {
+                headers.keys().all(|name| {
+                    !name.eq_ignore_ascii_case("x-api-key")
+                        && !name.eq_ignore_ascii_case("authorization")
+                })
+            }));
     }
 
     /// The bare-`apiKey` x-api-key fold is endpoint-specific: with no `--model`,
@@ -3312,7 +3248,11 @@ mod tests {
 
         // bearer-gw's key folds as Bearer onto bearer-model only.
         let r = resolve(None, Some("bearer-model"), None, None, None).unwrap();
-        let h = r.model.headers.as_ref().expect("bearer folded");
+        let h = r
+            .execution
+            .request_model(&r.model)
+            .headers
+            .expect("bearer folded");
         assert_eq!(
             h.get("authorization").map(|s| s.as_str()),
             Some("Bearer bearer-secret")
@@ -3325,12 +3265,17 @@ mod tests {
         // xkey-gw's bare apiKey becomes only that provider's default key.
         let r2 = resolve(None, Some("xkey-model"), None, None, None).unwrap();
         assert!(r2.has_provider_key);
-        assert!(r2.model.headers.as_ref().map_or(true, |headers| {
-            headers.keys().all(|name| {
-                !name.eq_ignore_ascii_case("x-api-key")
-                    && !name.eq_ignore_ascii_case("authorization")
-            })
-        }));
+        assert!(r2
+            .execution
+            .request_model(&r2.model)
+            .headers
+            .as_ref()
+            .map_or(true, |headers| {
+                headers.keys().all(|name| {
+                    !name.eq_ignore_ascii_case("x-api-key")
+                        && !name.eq_ignore_ascii_case("authorization")
+                })
+            }));
 
         // The active provider exposes only its own catalog. Selecting the
         // other provider explicitly creates a separately keyed provider.

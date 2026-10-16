@@ -1313,6 +1313,29 @@ where
     let refreshed = if packaged {
         let mut args = effective_args.clone();
         if let Ok(current) = harness.lane("main").get_model().await {
+            let was_package = ctx
+                .extension_session
+                .lock()
+                .unwrap()
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.provider_manifest(&current.provider).is_some());
+            let has_replacement = extension_session.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .providers()
+                    .iter()
+                    .any(|provider| provider.provider_id == current.provider)
+            });
+            if was_package && !has_replacement {
+                return ReloadOutcome {
+                    summary: "Reload failed while resolving provider packages".into(),
+                    had_warnings: true,
+                    details: vec![format!(
+                        "active provider package '{}' is no longer loaded",
+                        current.provider
+                    )],
+                    had_errors: true,
+                };
+            }
             args.provider = Some(current.provider.clone());
             args.model = Some(current.id);
             if current.provider != ctx.resolved_model.provider {
@@ -1576,7 +1599,8 @@ where
         *ctx.catalog
             .write()
             .unwrap_or_else(|error| error.into_inner()) = catalog;
-        // Keep the active model's refreshed headers and endpoint as well.
+        // Refresh the public descriptor. Credentials remain in the newly bound
+        // provider instances installed above and never enter the lane model.
         let _ = harness.lane("main").set_model(resolved.model.clone()).await;
     }
 

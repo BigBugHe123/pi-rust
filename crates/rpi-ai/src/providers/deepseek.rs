@@ -1,270 +1,163 @@
-//! DeepSeek provider implementation.
-//!
-//! DeepSeek is a Chinese AI company providing large language models.
-//! API compatible with OpenAI format.
+//! DeepSeek compatibility provider backed by the maintained Chat Completions
+//! implementation. Authentication, reasoning deltas, tools, retries and aborts
+//! share the same protocol path as configured OpenAI-compatible providers.
+use crate::{AssistantMessageEventStream, Context, Model, Provider, SimpleStreamOptions};
 
-use async_trait::async_trait;
-use reqwest::Client;
-use serde_json::Value;
-
-use crate::event_stream::AssistantMessageEventStream;
-use crate::model::Model;
-use crate::provider::{Provider, SimpleStreamOptions};
-use crate::providers::anthropic::sse::SseEventStream;
-use crate::types::{
-    AssistantMessage, AssistantMessageEvent, AssistantRole, Content, Context, DoneReason,
-    TextContent, TextContentType, Usage,
-};
-
-/// DeepSeek API endpoint
 const DEEPSEEK_API_BASE: &str = "https://api.deepseek.com/v1";
 
-/// DeepSeek provider implementation
 #[derive(Debug, Clone)]
 pub struct DeepSeekProvider {
-    client: Client,
     api_key: Option<String>,
 }
 
 impl DeepSeekProvider {
-    /// Create a new DeepSeek provider
     pub fn new(api_key: Option<String>) -> Self {
-        // Route through the shared HTTP builder so HTTP_PROXY/NO_PROXY and the
-        // pooled-connection idle timeout apply uniformly.
-        let client = crate::http::build_client(DEEPSEEK_API_BASE, None, None)
-            .unwrap_or_else(|_| Client::new());
-        Self { client, api_key }
-    }
-
-    /// Build request headers
-    fn build_headers(&self, opts: &SimpleStreamOptions) -> Vec<(String, String)> {
-        let mut headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-
-        // API key from opts or stored
-        let api_key = opts.api_key.as_ref().or(self.api_key.as_ref());
-        if let Some(key) = api_key {
-            headers.push(("Authorization".to_string(), format!("Bearer {}", key)));
-        }
-
-        headers.push(("User-Agent".to_string(), crate::http::user_agent()));
-
-        headers
-    }
-
-    /// Build request body
-    fn build_request_body(
-        &self,
-        model: &Model,
-        ctx: &Context,
-        opts: &SimpleStreamOptions,
-    ) -> Value {
-        let mut body = serde_json::json!({
-            "model": model.id,
-            "messages": ctx.messages,
-            "stream": true,
-        });
-
-        // Add optional parameters
-        if let Some(temperature) = opts.temperature {
-            body["temperature"] = serde_json::json!(temperature);
-        }
-
-        if let Some(max_tokens) = opts.max_tokens {
-            body["max_tokens"] = serde_json::json!(max_tokens);
-        }
-
-        body
+        Self { api_key }
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl Provider for DeepSeekProvider {
     fn id(&self) -> &str {
         "deepseek"
     }
-
     fn models(&self) -> &[Model] {
-        // DeepSeek models are configured via models.json
         &[]
     }
 
     async fn stream_simple(
         &self,
         model: &Model,
-        ctx: &Context,
-        opts: &SimpleStreamOptions,
+        context: &Context,
+        options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
-        use crate::event_stream::create_assistant_message_event_stream;
-        use crate::types::{ErrorReason, StopReason};
-
-        let (mut producer, stream) = create_assistant_message_event_stream();
-
-        let url = format!("{}/chat/completions", DEEPSEEK_API_BASE);
-        let headers = self.build_headers(opts);
-        let body = self.build_request_body(model, ctx, opts);
-
-        let client = self.client.clone();
-        let model_id = model.id.clone();
-        let api = model.api.clone();
-        let opts = opts.clone();
-
-        tokio::spawn(async move {
-            let mut request = client.post(&url).json(&body);
-
-            for (key, value) in headers {
-                request = request.header(&key, &value);
-            }
-
-            let result = request.send().await;
-
-            match result {
-                Ok(response) => {
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        let error_text = response
-                            .text()
-                            .await
-                            .unwrap_or_else(|_| "Unknown error".to_string());
-                        let error_msg = format!("HTTP {}: {}", status.as_u16(), error_text);
-
-                        let error_message = AssistantMessage::terminal(
-                            api,
-                            "deepseek".to_string(),
-                            model_id,
-                            StopReason::Error,
-                            error_msg,
-                            0,
-                        );
-
-                        producer.push(AssistantMessageEvent::Error {
-                            reason: ErrorReason::Error,
-                            error: error_message,
-                        });
-                        return;
-                    }
-
-                    // Parse SSE stream
-                    let mut events = SseEventStream::new(response, opts.signal.clone());
-                    let mut content = String::new();
-                    let mut finish_reason = None;
-
-                    loop {
-                        match events.next_event().await {
-                            Ok(Some(event)) if event.data.trim() == "[DONE]" => {
-                                break;
-                            }
-                            Ok(Some(event)) => {
-                                if let Ok(chunk) =
-                                    serde_json::from_str::<serde_json::Value>(&event.data)
-                                {
-                                    if let Some(choices) =
-                                        chunk.get("choices").and_then(|c| c.as_array())
-                                    {
-                                        if let Some(choice) = choices.first() {
-                                            if let Some(delta) = choice.get("delta") {
-                                                if let Some(text) =
-                                                    delta.get("content").and_then(|c| c.as_str())
-                                                {
-                                                    content.push_str(text);
-                                                }
-                                            }
-                                            if let Some(reason) =
-                                                choice.get("finish_reason").and_then(|r| r.as_str())
-                                            {
-                                                finish_reason = Some(reason.to_string());
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(None) => break,
-                            Err(e) => {
-                                let error_message = AssistantMessage::terminal(
-                                    api,
-                                    "deepseek".to_string(),
-                                    model_id,
-                                    StopReason::Error,
-                                    format!("SSE stream error: {}", e),
-                                    0,
-                                );
-                                producer.push(AssistantMessageEvent::Error {
-                                    reason: ErrorReason::Error,
-                                    error: error_message,
-                                });
-                                return;
-                            }
-                        }
-                    }
-
-                    let stop_reason = match finish_reason.as_deref() {
-                        Some("stop") => StopReason::Stop,
-                        Some("length") => StopReason::Length,
-                        Some("tool_calls") => StopReason::ToolUse,
-                        _ => StopReason::Stop,
-                    };
-
-                    let message = AssistantMessage {
-                        role: AssistantRole,
-                        content: vec![Content::Text(TextContent {
-                            kind: TextContentType,
-                            text: content,
-                            text_signature: None,
-                        })],
-                        api,
-                        provider: "deepseek".to_string(),
-                        model: model_id,
-                        response_model: None,
-                        response_id: None,
-                        usage: Usage::zero(),
-                        stop_reason,
-                        deferred: None,
-                        error_message: None,
-                        raw_stop_reason: finish_reason,
-                        end_turn: None,
-                        timestamp: 0,
-                    };
-
-                    let done_reason = match stop_reason {
-                        StopReason::Stop => DoneReason::Stop,
-                        StopReason::Length => DoneReason::Length,
-                        StopReason::ToolUse => DoneReason::ToolUse,
-                        _ => DoneReason::Stop,
-                    };
-
-                    producer.push(AssistantMessageEvent::Done {
-                        reason: done_reason,
-                        message,
-                    });
-                }
-                Err(e) => {
-                    let error_message = AssistantMessage::terminal(
-                        api,
-                        "deepseek".to_string(),
-                        model_id,
-                        StopReason::Error,
-                        format!("Request failed: {}", e),
-                        0,
-                    );
-
-                    producer.push(AssistantMessageEvent::Error {
-                        reason: ErrorReason::Error,
-                        error: error_message,
-                    });
-                }
-            }
-        });
-
-        stream
+        let mut model = model.clone();
+        model.provider = self.id().into();
+        if model.base_url.is_empty() {
+            model.base_url = DEEPSEEK_API_BASE.into();
+        }
+        if model.compat.is_none() {
+            model.compat = Some(crate::model::StreamingProtocolCompat::OpenaiCompletions(
+                crate::model::OpenaiCompletionsCompat {
+                    supports_store: Some(false),
+                    supports_developer_role: Some(false),
+                    supports_strict_mode: Some(false),
+                    max_tokens_field: Some(crate::model::MaxTokensField::MaxTokens),
+                    ..Default::default()
+                },
+            ));
+        }
+        let http = crate::http::build_client(&model.base_url, None, None)
+            .unwrap_or_else(|_| reqwest::Client::new());
+        let provider =
+            super::openai_completions::OpenAiCompletionsProvider::with_models_without_env_api_key(
+                self.id(),
+                self.api_key.clone(),
+                http,
+                vec![model.clone()],
+            );
+        provider.stream_simple(&model, context, options).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Content, Message, StopReason, UserMessage};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
     fn test_deepseek_provider_creation() {
-        let provider = DeepSeekProvider::new(Some("test-key".to_string()));
-        assert_eq!(provider.id(), "deepseek");
+        assert_eq!(
+            DeepSeekProvider::new(Some("test-key".into())).id(),
+            "deepseek"
+        );
+    }
+
+    #[tokio::test]
+    async fn deepseek_wrapper_streams_before_eof_and_honors_the_model_endpoint() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let text = "The shared DeepSeek protocol delivers this partial output before the server completes its response.";
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() < end + 4 + length {
+                        continue;
+                    }
+                    assert!(headers.starts_with("post /v1/chat/completions "));
+                    assert!(headers.contains("authorization: bearer request-key"));
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&request[end + 4..]).unwrap();
+                    assert_eq!(body["stream"], true);
+                    assert_eq!(body["messages"][0]["content"], "hello");
+                    break;
+                }
+            }
+            let first = format!(
+                "data: {}\n\n",
+                serde_json::json!({"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]})
+            );
+            let last = "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let headers = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", first.len()+last.len());
+            socket.write_all(headers.as_bytes()).await.unwrap();
+            socket.write_all(first.as_bytes()).await.unwrap();
+            gate.await.unwrap();
+            socket.write_all(last.as_bytes()).await.unwrap();
+        });
+        let provider = DeepSeekProvider::new(Some("provider-key".into()));
+        let model = Model::new(
+            "deepseek-flash",
+            "DeepSeek",
+            crate::Api::OpenaiCompletions,
+            "deepseek",
+            base,
+        );
+        let options = SimpleStreamOptions {
+            api_key: Some("request-key".into()),
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        let context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+        let mut stream = provider.stream_simple(&model, &context, &options).await;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap();
+            match event {
+                crate::AssistantMessageEvent::TextDelta { delta, .. } => {
+                    assert_eq!(delta, text);
+                    break;
+                }
+                crate::AssistantMessageEvent::Done { .. }
+                | crate::AssistantMessageEvent::Error { .. } => {
+                    panic!("terminal before partial output")
+                }
+                _ => {}
+            }
+        }
+        release.send(()).unwrap();
+        while stream.next().await.is_some() {}
+        let message = stream.result().await.unwrap();
+        assert_eq!(message.provider, "deepseek");
+        assert_eq!(message.stop_reason, StopReason::Stop);
+        assert_eq!(Content::text_only(&message.content, ""), text);
+        server.await.unwrap();
     }
 }

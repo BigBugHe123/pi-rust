@@ -626,6 +626,8 @@ pub(super) fn provider_selector_items(
     let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
     let models_cfg = crate::config::load_models_config().unwrap_or_default();
     let auth = crate::config::read_auth().unwrap_or_default();
+    let execution_catalog =
+        crate::provider::execution_catalog_with_manifests(manifests).unwrap_or_default();
     let current = crate::settings::load_settings()
         .ok()
         .and_then(|s| s.default_provider)
@@ -655,7 +657,7 @@ pub(super) fn provider_selector_items(
             let key_status = match credential.source {
                 crate::credentials::CredentialSource::Anonymous => "无需 key",
                 crate::credentials::CredentialSource::Missing => {
-                    if catalog.iter().any(|model| {
+                    if execution_catalog.iter().any(|model| {
                         model.provider == id
                             && crate::credentials::has_header_auth(model.headers.as_ref())
                     }) {

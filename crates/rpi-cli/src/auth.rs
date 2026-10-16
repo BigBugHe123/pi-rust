@@ -385,7 +385,7 @@ fn detect_credential(
             .filter_map(|provider| snapshot.provider_manifest(&provider.provider_id).cloned())
             .collect()
     });
-    let catalog = crate::provider::catalog_with_manifests(&manifests)?;
+    let catalog = crate::provider::execution_catalog_with_manifests(&manifests)?;
     if catalog.iter().any(|model| {
         model.provider == provider && crate::credentials::has_header_auth(model.headers.as_ref())
     }) {

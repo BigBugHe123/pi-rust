@@ -595,8 +595,42 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         .unwrap();
     let agent = rpi_cli::config::agent_dir().unwrap();
     std::fs::create_dir_all(&agent).unwrap();
-    std::fs::write(agent.join("models.json"), r#"{"providers":{"proxy":{"baseUrl":"http://localhost:9012/v1","models":[{"id":"default"},{"id":"second"}]}}}"#).unwrap();
-    for _ in 0..2 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        for expected in ["reload-key-0", "reload-key-1"] {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0; 4096];
+                let count = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if request.len() < end + 4 + length {
+                        continue;
+                    }
+                    assert!(headers.contains(&format!("authorization: bearer {expected}")));
+                    break;
+                }
+            }
+            let body = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"reload works\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+    for index in 0..2 {
+        std::fs::write(agent.join("models.json"), serde_json::json!({"providers":{"proxy":{
+            "baseUrl":base,"apiKey":format!("reload-key-{index}"),"models":[{"id":"default"},{"id":"second"}]
+        }}}).to_string()).unwrap();
         let outcome = rpi_cli::session::reload_extension_resources(&harness, &context).await;
         assert!(
             !outcome.had_errors,
@@ -617,9 +651,19 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         assert!(manifests.iter().any(|manifest| manifest.id == "proxy"));
         assert!(discovery.iter().any(|model| model.provider == "proxy"
             && model.id == "second"
-            && model.base_url == "http://localhost:9012/v1"));
+            && model.base_url == base));
         let model = harness.lane("main").get_model().await.unwrap();
-        assert_eq!(model.base_url, "http://localhost:9012/v1");
+        assert_eq!(model.base_url, base);
+        assert!(
+            model.headers.is_none(),
+            "lane descriptors do not retain request auth"
+        );
+        assert!(context
+            .catalog
+            .read()
+            .unwrap()
+            .iter()
+            .all(|model| model.headers.is_none()));
         let provider = context
             .providers
             .read()
@@ -628,6 +672,22 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
             .find(|provider| provider.id() == "proxy")
             .cloned()
             .unwrap();
+        let request_options = rpi_ai::SimpleStreamOptions {
+            timeout: Some(Duration::from_secs(3)),
+            max_retries: Some(0),
+            ..Default::default()
+        };
+        let message = provider
+            .stream_simple(&model, &rpi_ai::Context::new(vec![]), &request_options)
+            .await
+            .result()
+            .await
+            .unwrap();
+        assert_eq!(message.stop_reason, rpi_ai::StopReason::Stop);
+        assert_eq!(
+            rpi_ai::types::Content::text_only(&message.content, ""),
+            "reload works"
+        );
         let options = rpi_ai::SimpleStreamOptions::default();
         options.signal.cancel();
         let result = provider
@@ -642,6 +702,10 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
             "fresh runtime must not retain a stale snapshot"
         );
     }
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(!before.is_active());
     let local = context
         .catalog
