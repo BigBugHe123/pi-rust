@@ -2162,6 +2162,23 @@ fn provider_commands_respect_package_model_overrides_and_config_removal() {
 }
 
 #[test]
+fn package_catalog_resolves_header_references_without_binding_credentials() {
+    with_isolated_config_dir(|| {
+        let manifests = vec![command_package_manifest("package-gateway", "model", true)];
+        let cfg = serde_json::from_value(serde_json::json!({"providers":{"package-gateway":{
+            "apiKey":"secret-value", "headers":{"Authorization":"$RPI_TEST_MISSING_PACKAGE_HEADER"}, "models":[]
+        }}})).unwrap();
+        crate::config::save_models_config(&cfg).unwrap();
+        let catalog = crate::provider::catalog_with_manifests(&manifests).unwrap();
+        let model = catalog
+            .iter()
+            .find(|model| model.provider == "package-gateway")
+            .unwrap();
+        assert!(!crate::credentials::has_header_auth(model.headers.as_ref()));
+    });
+}
+
+#[test]
 fn provider_package_key_status_uses_its_declared_environment() {
     with_isolated_config_dir(|| {
         let manifest = command_package_manifest("openrouter", "openrouter/auto", true);

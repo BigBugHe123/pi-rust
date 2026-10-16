@@ -1317,6 +1317,7 @@ where
             args.model = Some(current.id);
             if current.provider != ctx.resolved_model.provider {
                 args.api_key = None;
+                args.base_url = None;
             }
         }
         match crate::provider::resolve_with_extensions(
@@ -1752,6 +1753,15 @@ fn build_models_with_extensions_for_reload(
     let mut models: Vec<Arc<dyn Provider>> = providers.to_vec();
     let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
     for provider in pluggable {
+        // Declared packages must enter through credential-bound factories.
+        // Falling back to a raw adapter would reintroduce packages rejected by
+        // auth filtering and would discard their configured model snapshot.
+        if extension_session
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.provider_manifest(provider.id()).is_some())
+        {
+            continue;
+        }
         if !models.iter().any(|known| known.id() == provider.id()) {
             models.push(provider);
         }
@@ -1808,14 +1818,7 @@ fn build_models_with_extensions(
     extension_session: &ExtensionSession,
     runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn Provider>> {
-    let mut models: Vec<Arc<dyn Provider>> = resolved.providers.clone();
-    let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
-    for provider in pluggable {
-        if !models.iter().any(|known| known.id() == provider.id()) {
-            models.push(provider);
-        }
-    }
-    models
+    build_models_with_extensions_for_reload(&resolved.providers, extension_session, runtime)
 }
 
 /// Resolve project resource loading without prompting. Explicit CLI overrides
@@ -1837,12 +1840,15 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
 /// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
 /// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
 /// the `--verbose` summary.
-fn load_extensions(
+pub(crate) fn load_extensions(
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
+    if args.no_extensions {
+        return ExtensionSession::none();
+    }
     let mut dirs = if args.dev_local_only {
         Vec::new()
     } else if args.project_only {
@@ -2785,6 +2791,51 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unauthenticated_packages_are_not_reintroduced_as_legacy_adapters() {
+        extern "C" fn request(
+            _: rpi_plugin_sdk::StbStringRef,
+            _: *mut rpi_plugin_sdk::StbString,
+            _: *mut std::ffi::c_void,
+        ) -> i32 {
+            1
+        }
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        for id in ["package", "legacy"] {
+            registry.register_provider(rpi_extensions::RegisteredProvider {
+                provider_id: id.into(),
+                base_url: "http://localhost".into(),
+                api_style: "openai-completions".into(),
+                request_fn: request,
+                stream_fn: None,
+                plugin_free_string: rpi_plugin_sdk::callbacks::free_string,
+                user_data: std::ptr::null_mut(),
+            });
+        }
+        assert!(registry.apply_declaration_json(&serde_json::json!({"providers":[{
+            "id":"package", "requiresAuth":true,
+            "models":[rpi_ai::Model::new("model", "Model", rpi_ai::Api::OpenaiCompletions, "package", "http://localhost")]
+        }]}).to_string()));
+        let session = ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            vec![],
+            None,
+        );
+        let providers = build_models_with_extensions_for_reload(
+            &[],
+            &session,
+            tokio::runtime::Handle::current(),
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id())
+                .collect::<Vec<_>>(),
+            ["legacy"]
+        );
+    }
     use crate::args::Args;
 
     #[test]

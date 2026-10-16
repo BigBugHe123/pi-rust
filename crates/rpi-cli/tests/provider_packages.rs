@@ -26,7 +26,7 @@ fn library(name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
-fn command(temp: &tempfile::TempDir, library: &std::path::Path) -> Command {
+fn command_base(temp: &tempfile::TempDir) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_rpi"));
     cmd.current_dir(temp.path())
         .stdin(Stdio::null())
@@ -39,9 +39,211 @@ fn command(temp: &tempfile::TempDir, library: &std::path::Path) -> Command {
         .env_remove("OPENROUTER_API_KEY")
         .env_remove("LLAMA_CPP_API_KEY")
         .env_remove("PROXY_API_KEY")
-        .arg("--extension")
-        .arg(library);
+        .env_remove("DEEPSEEK_API_KEY");
     cmd
+}
+
+fn command(temp: &tempfile::TempDir, library: &std::path::Path) -> Command {
+    let mut cmd = command_base(temp);
+    cmd.arg("--extension").arg(library);
+    cmd
+}
+
+fn auth_command(temp: &tempfile::TempDir, library: &std::path::Path, provider: &str) -> Command {
+    let mut cmd = command_base(temp);
+    cmd.args([
+        "auth",
+        "check",
+        "--provider",
+        provider,
+        "--json",
+        "--extension",
+    ])
+    .arg(library);
+    cmd
+}
+
+fn assert_auth_output(output: std::process::Output, ready: bool, source: &str) {
+    assert_eq!(
+        output.status.code(),
+        Some(if ready { 0 } else { 1 }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["ready"], ready);
+    assert_eq!(value["source"], source);
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("secret-value"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("secret-value"));
+}
+
+#[test]
+fn auth_check_uses_package_policy_precedence_and_provider_isolation() {
+    let Some(library) = library("rpi_provider_openrouter") else {
+        eprintln!("SKIP: build rpi-provider-openrouter first");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .output()
+            .unwrap(),
+        false,
+        "none",
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .env("OPENAI_API_KEY", "secret-value-openai")
+            .env("ANTHROPIC_API_KEY", "secret-value-anthropic")
+            .output()
+            .unwrap(),
+        false,
+        "none",
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .env("OPENROUTER_API_KEY", "secret-value-env")
+            .output()
+            .unwrap(),
+        true,
+        "OPENROUTER_API_KEY",
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .env("OPENROUTER_API_KEY", "secret-value-env")
+            .arg("--no-extensions")
+            .output()
+            .unwrap(),
+        false,
+        "none",
+    );
+
+    let agent = temp.path().join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("models.json"),
+        r#"{"providers":{"openrouter":{"apiKey":"secret-value-config","models":[]}}}"#,
+    )
+    .unwrap();
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .env("OPENROUTER_API_KEY", "secret-value-env")
+            .output()
+            .unwrap(),
+        true,
+        "models.json",
+    );
+    std::fs::write(
+        agent.join("auth.json"),
+        r#"{"openrouter":{"type":"api_key","key":"secret-value-stored"}}"#,
+    )
+    .unwrap();
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .env("OPENROUTER_API_KEY", "secret-value-env")
+            .output()
+            .unwrap(),
+        true,
+        "auth.json",
+    );
+    std::fs::write(
+        agent.join("auth.json"),
+        r#"{"openrouter":{"type":"api_key","key":"$RPI_TEST_MISSING_PACKAGE_AUTH"}}"#,
+    )
+    .unwrap();
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .output()
+            .unwrap(),
+        true,
+        "models.json",
+    );
+    std::fs::write(
+        agent.join("auth.json"),
+        r#"{"openrouter":{"type":"oauth","access":"secret-value-access","expires":1}}"#,
+    )
+    .unwrap();
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .output()
+            .unwrap(),
+        true,
+        "models.json",
+    );
+    std::fs::write(
+        agent.join("auth.json"),
+        r#"{"openrouter":{"type":"oauth","access":"secret-value-access","expires":0}}"#,
+    )
+    .unwrap();
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .output()
+            .unwrap(),
+        true,
+        "oauth",
+    );
+}
+
+#[test]
+fn auth_check_honors_anonymous_packages_and_logout_keeps_environment_keys() {
+    for (library_name, provider) in [
+        ("rpi_provider_proxy", "proxy"),
+        ("rpi_provider_llama_cpp", "llama-cpp"),
+    ] {
+        let Some(library) = library(library_name) else {
+            continue;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        assert_auth_output(
+            auth_command(&temp, &library, provider).output().unwrap(),
+            true,
+            "anonymous",
+        );
+        assert_auth_output(
+            auth_command(&temp, &library, provider)
+                .arg("--no-extensions")
+                .output()
+                .unwrap(),
+            false,
+            "none",
+        );
+    }
+    let Some(library) = library("rpi_provider_openrouter") else {
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let agent = temp.path().join("agent");
+    std::fs::create_dir_all(&agent).unwrap();
+    std::fs::write(
+        agent.join("auth.json"),
+        r#"{"openrouter":{"type":"api_key","key":"secret-value-stored"}}"#,
+    )
+    .unwrap();
+    let output = command_base(&temp)
+        .args(["auth", "logout", "--provider", "openrouter", "--extension"])
+        .arg(&library)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .output()
+            .unwrap(),
+        false,
+        "none",
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "openrouter")
+            .env("OPENROUTER_API_KEY", "secret-value-env")
+            .output()
+            .unwrap(),
+        true,
+        "OPENROUTER_API_KEY",
+    );
 }
 
 #[test]
@@ -95,16 +297,47 @@ fn openrouter_package_does_not_inherit_openai_credentials() {
 
 #[tokio::test]
 async fn packaged_providers_stream_through_the_real_dll_and_cli() {
-    for (name, provider, model, auth) in [
+    for (name, provider, model, source) in [
         (
             "rpi_provider_openrouter",
             "openrouter",
             "openrouter/auto",
-            true,
+            "environment",
         ),
-        ("rpi_provider_llama_cpp", "llama-cpp", "local", false),
-        ("rpi_provider_proxy", "proxy", "default", false),
+        (
+            "rpi_provider_openrouter",
+            "openrouter",
+            "openrouter/auto",
+            "models.json",
+        ),
+        (
+            "rpi_provider_openrouter",
+            "openrouter",
+            "openrouter/auto",
+            "auth.json",
+        ),
+        (
+            "rpi_provider_openrouter",
+            "openrouter",
+            "openrouter/auto",
+            "oauth",
+        ),
+        (
+            "rpi_provider_openrouter",
+            "openrouter",
+            "openrouter/auto",
+            "expired-fallback",
+        ),
+        (
+            "rpi_provider_openrouter",
+            "openrouter",
+            "openrouter/auto",
+            "cli",
+        ),
+        ("rpi_provider_llama_cpp", "llama-cpp", "local", "anonymous"),
+        ("rpi_provider_proxy", "proxy", "default", "anonymous"),
     ] {
+        let auth = source != "anonymous";
         let Some(library) = library(name) else {
             eprintln!("SKIP: build {name} first");
             continue;
@@ -185,7 +418,53 @@ async fn packaged_providers_stream_through_the_real_dll_and_cli() {
             "hello",
         ]);
         if auth {
-            cmd.env("OPENROUTER_API_KEY", "package-key");
+            cmd.env(
+                "OPENROUTER_API_KEY",
+                if matches!(source, "environment" | "expired-fallback") {
+                    "package-key"
+                } else {
+                    "lower-priority-env"
+                },
+            );
+            let agent = temp.path().join("agent");
+            std::fs::create_dir_all(&agent).unwrap();
+            match source {
+                "models.json" | "auth.json" | "oauth" | "cli" => {
+                    let key = if source == "models.json" {
+                        "package-key"
+                    } else {
+                        "lower-priority-config"
+                    };
+                    std::fs::write(
+                        agent.join("models.json"),
+                        serde_json::json!({"providers":{"openrouter":{"apiKey":key,"models":[]}}})
+                            .to_string(),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            match source {
+                "auth.json" => std::fs::write(
+                    agent.join("auth.json"),
+                    r#"{"openrouter":{"type":"api_key","key":"package-key"}}"#,
+                )
+                .unwrap(),
+                "oauth" => std::fs::write(
+                    agent.join("auth.json"),
+                    r#"{"openrouter":{"type":"oauth","access":"package-key","expires":0}}"#,
+                )
+                .unwrap(),
+                "expired-fallback" => std::fs::write(
+                    agent.join("auth.json"),
+                    r#"{"openrouter":{"type":"oauth","access":"expired-key","expires":1}}"#,
+                )
+                .unwrap(),
+                "cli" => {
+                    cmd.args(["--api-key", "package-key"]);
+                }
+                _ => {}
+            }
         }
         let output = tokio::time::timeout(
             Duration::from_secs(20),
@@ -213,6 +492,7 @@ async fn packaged_providers_stream_through_the_real_dll_and_cli() {
 
 #[tokio::test]
 async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
+    let local_library = library("rpi_provider_llama_cpp");
     let Some(library) = library("rpi_provider_proxy") else {
         return;
     };
@@ -244,8 +524,10 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         return;
     }
     let cwd = PathBuf::from(std::env::var_os("RPI_TEST_PACKAGE_CWD").unwrap());
+    let mut extensions = vec![library];
+    extensions.extend(local_library);
     let args = rpi_cli::args::Args {
-        extension: vec![library],
+        extension: extensions,
         provider: Some("proxy".into()),
         model: Some("default".into()),
         no_session: true,
@@ -316,6 +598,42 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
         );
     }
     assert!(!before.is_active());
+    let local = context
+        .catalog
+        .read()
+        .unwrap()
+        .iter()
+        .find(|model| model.provider == "llama-cpp")
+        .cloned();
+    if let Some(local) = local {
+        // Startup-only overrides belong to the startup provider even when
+        // `/reload` resolves a different provider after a live model switch.
+        context.args.base_url = Some("http://localhost:9999/v1".into());
+        context.args.api_key = Some("startup-proxy-key".into());
+        harness.lane("main").set_model(local.clone()).await.unwrap();
+        let outcome = rpi_cli::session::reload_extension_resources(&harness, &context).await;
+        assert!(
+            !outcome.had_errors,
+            "{} {:?}",
+            outcome.summary, outcome.details
+        );
+        let current = harness.lane("main").get_model().await.unwrap();
+        assert_eq!(current.base_url, local.base_url);
+        assert!(!current.headers.as_ref().is_some_and(|headers| headers
+            .values()
+            .any(|value| value.contains("startup-proxy-key"))));
+        context.args.base_url = None;
+        context.args.api_key = None;
+        let proxy = context
+            .catalog
+            .read()
+            .unwrap()
+            .iter()
+            .find(|model| model.provider == "proxy" && model.id == "default")
+            .cloned()
+            .unwrap();
+        harness.lane("main").set_model(proxy).await.unwrap();
+    }
     let before_failed = context
         .extension_session
         .lock()

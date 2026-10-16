@@ -80,6 +80,26 @@ TUI 的 `/provider` 同样显示已加载的 package、模型数和认证状态�
 凭据顺序保持 `--api-key`（仅选中的 provider）→ `auth.json` → `models.json` → provider 自己的环境变量。
 匿名运行必须由 package 明确声明，OpenAI 默认认证检查不会因此放宽，其他 package 不会继承 `OPENAI_API_KEY`。
 
+认证策略跟随 package，通用 `auth login/logout/check/refresh` 和 `auth.json` 存储由宿主管理。
+`auth check`、`/provider` 和实际请求共用凭据解析：空值、未解析的环境变量引用和过期 OAuth token 不算可用凭据；
+有效的 OAuth access token 按 Bearer 注入请求。`auth check` 不刷新 token，也不发起服务端认证验证。
+
+```sh
+rpi auth login --provider openrouter
+rpi auth check --provider openrouter --json
+rpi auth logout --provider openrouter
+# 未安装时也可显式加载（扩展路径在 auth 子命令后）
+rpi auth check --provider openrouter --extension /path/to/provider.dll --json
+```
+
+`auth check --json` 的 `source` 返回 `auth.json`、`oauth`、`models.json`、专属环境变量名、`headers`、`anonymous` 或 `none`，
+不输出凭据内容；`--no-extensions` 禁用 package 认证声明。auth 和启动使用相同的扩展发现、项目信任与显式路径规则。
+退出码为：就绪 `0`，缺少凭据 `1`，配置读取失败 `2`。API-key logout 只删除存储的 key，不清除环境变量或 models.json。
+
+核心只保留 Anthropic、OpenAI、DeepSeek 的环境变量回退和默认模型优先项。其他供应商不再隐式识别
+环境变量：安装带 `apiKeyEnv` 声明的 package，或在 models.json 显式填写 `apiKey: "$VENDOR_API_KEY"`。
+已有 auth.json 和显式 apiKey 配置无需迁移，package 默认模型由其目录提供。
+
 `/reload` 重新绑定 fresh plugin runtime、认证后的目录和当前模型，同时更新 `/model` 选择器和插件的 `set_model`。
 `/provider` 每次打开时读取重载后的 package 声明。
 如果当前模型所属的 package 消失或无法重新解析，reload 返回错误并保留原会话，先切换模型再移除该 package。

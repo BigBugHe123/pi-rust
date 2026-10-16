@@ -650,12 +650,21 @@ pub(super) fn provider_selector_items(
             };
             let manifest = manifests.iter().find(|manifest| manifest.id == id);
             let (origin, protocol) = provider_origin_protocol(&id, &models_cfg, manifest);
-            let key_status = if manifest.is_some_and(|manifest| !manifest.requires_auth) {
-                "无需 key"
-            } else if provider_has_key(&id, &models_cfg, &auth, manifest) {
-                "已配置 key"
-            } else {
-                "未配置 key"
+            let credential =
+                crate::credentials::resolve(&id, models_cfg.providers.get(&id), &auth, manifest);
+            let key_status = match credential.source {
+                crate::credentials::CredentialSource::Anonymous => "无需 key",
+                crate::credentials::CredentialSource::Missing => {
+                    if catalog.iter().any(|model| {
+                        model.provider == id
+                            && crate::credentials::has_header_auth(model.headers.as_ref())
+                    }) {
+                        "已配置认证头"
+                    } else {
+                        "未配置 key"
+                    }
+                }
+                _ => "已配置 key",
             };
             let description =
                 format!("{count} model(s) · {origin} · {protocol} · {key_status}{marker}");
@@ -720,52 +729,6 @@ fn provider_origin_protocol(
                 .unwrap_or("自定义协议");
             ("自定义", protocol)
         }
-    }
-}
-
-/// Whether a provider has a usable credential: a stored `auth.json` entry, a
-/// resolved `models.json` apiKey, or (for built-ins) its canonical env var.
-fn provider_has_key(
-    id: &str,
-    cfg: &crate::config::ModelsConfig,
-    auth: &crate::config::AuthStore,
-    manifest: Option<&rpi_extensions::ProviderManifest>,
-) -> bool {
-    if let Some(crate::config::Credential::ApiKey {
-        key: Some(key),
-        env,
-    }) = auth.get(id)
-    {
-        if crate::config::resolve_config_value(key, env.as_ref()).is_some_and(|key| !key.is_empty())
-        {
-            return true;
-        }
-    }
-    if let Some(provider_cfg) = cfg.providers.get(id) {
-        if let Some(raw) = provider_cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
-            if crate::config::resolve_config_value(raw, None)
-                .filter(|v| !v.is_empty())
-                .is_some()
-            {
-                return true;
-            }
-        }
-    }
-    if let Some(manifest) = manifest {
-        return manifest
-            .api_key_env
-            .as_deref()
-            .and_then(|name| std::env::var(name).ok())
-            .is_some_and(|key| !key.is_empty());
-    }
-    match id.to_ascii_lowercase().as_str() {
-        "anthropic" => std::env::var("ANTHROPIC_API_KEY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false),
-        "openai" => std::env::var("OPENAI_API_KEY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false),
-        _ => false,
     }
 }
 

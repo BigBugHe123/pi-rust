@@ -138,10 +138,15 @@ async fn run_inner() -> i32 {
     match argv.first().map(String::as_str) {
         Some("auth") => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-            let dirs = crate::resource_dirs::extension_dirs(&cwd);
-            let diagnostics: std::sync::Arc<dyn rpi_extensions::PluginDiagnostics> =
-                std::sync::Arc::new(rpi_extensions::NullDiagnostics);
-            let extension_session = rpi_extensions::load_session(&dirs, diagnostics, None);
+            let args = crate::args::parse_args(&argv[1..]);
+            if !args.errors.is_empty() {
+                for error in &args.errors {
+                    eprintln!("error: {error}");
+                }
+                return EXIT_USAGE;
+            }
+            let trusted = crate::session::resolve_project_trust(&args, &cwd);
+            let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
         }
