@@ -149,16 +149,17 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 
 ## 验证
 
-可运行的 DeepSeek 流式扩展示例见 [examples/provider-deepseek](../../examples/provider-deepseek/README.md)。
-它使用独立的 `deepseek-extension` ID，提供真实动态库加载、本地分段 SSE、取消和 HTTP 错误测试，
-以及需要显式启用的真实 DeepSeek API smoke test。
+可运行的 DeepSeek 流式实现和测试位于独立的 `rpi-providers` package，provider ID 为 `deepseek`。
 
 ```sh
-# 本仓库的 ABI 教学样例
-cargo build -p rpi-example-provider-deepseek
-cargo test -p rpi-example-provider-deepseek --test streaming
-cargo test --workspace
+cd /path/to/rpi-package
+cargo build -p rpi-providers
+cargo test -p rpi-providers --test streaming
+cargo test -p rpi-providers --test host
 ```
+
+在 `pi-rust` 中运行 CLI 集成测试前，将 `RPI_TEST_PROVIDER_LIBRARY` 指向构建出的
+`rpi_providers.dll` / `librpi_providers.so` / `librpi_providers.dylib`。
 
 端到端测试用真实 DLL、CLI 子进程和本机 SSE 服务，覆盖无凭据目录、禁用扩展、认证隔离、带认证的
 OpenRouter、匿名 llama.cpp / Proxy，以及实际流式输出。其他协议可以沿同样的声明和 factory 边界接入。

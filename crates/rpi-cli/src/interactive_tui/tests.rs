@@ -460,6 +460,8 @@ fn test_tui_state() -> Arc<TuiState> {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1568,6 +1570,8 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2197,6 +2201,52 @@ fn command_package_manifest(
 }
 
 #[test]
+fn login_provider_items_are_provider_scoped_and_exclude_anonymous_packages() {
+    with_isolated_config_dir(|| {
+        let manifests = vec![
+            command_package_manifest("deepseek", "deepseek-flash", true),
+            command_package_manifest("llama-cpp", "local", false),
+        ];
+        let items = login_provider_items(&manifests);
+        let deepseek = items
+            .iter()
+            .find(|item| item.value == "deepseek")
+            .expect("DeepSeek should be login-capable");
+        assert!(deepseek
+            .description
+            .as_deref()
+            .is_some_and(|text| text.contains("RPI_TEST_PROVIDER_COMMAND_KEY")));
+        assert!(!items.iter().any(|item| item.value == "llama-cpp"));
+        assert!(items.iter().any(|item| item.value == "anthropic"));
+        assert!(items.iter().any(|item| item.value == "openai"));
+    });
+}
+#[test]
+fn login_provider_items_include_oauth_only_providers_without_anonymous_packages() {
+    with_isolated_config_dir(|| {
+        let manifests = vec![command_package_manifest("llama-cpp", "local", false)];
+        let oauth = vec![rpi_extensions::OAuthProviderInfo {
+            plugin: "oauth-plugin".into(),
+            id: "acme-oauth".into(),
+            manifest: serde_json::json!({"displayName": "Acme OAuth"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        }];
+        let items = login_provider_items_with_oauth(&manifests, &oauth);
+        let acme = items
+            .iter()
+            .find(|item| item.value == "acme-oauth")
+            .expect("OAuth-only provider should be login-capable");
+        assert!(acme
+            .description
+            .as_deref()
+            .is_some_and(|text| text.contains("OAuth 登录")));
+        assert!(!items.iter().any(|item| item.value == "llama-cpp"));
+    });
+}
+
+#[test]
 fn provider_commands_include_packages_without_keys_and_save_their_model_identity() {
     with_isolated_config_dir(|| {
         let mut router = command_package_manifest("openrouter", "openrouter/auto", true);
@@ -2474,6 +2524,8 @@ fn test_autocomplete_slash_suggestions_render() {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2565,6 +2617,8 @@ fn test_select_list_swap_restores_editor() {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2659,6 +2713,8 @@ fn test_message_history_browse_restores_draft() {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2756,6 +2812,8 @@ fn test_accept_top_suggestion_replaces_prefix() {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -2839,6 +2897,8 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),

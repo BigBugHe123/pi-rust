@@ -649,6 +649,12 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
 // Channel + helpers
 // ===========================================================================
 
+#[derive(Clone, Copy, Debug)]
+enum ProviderOAuthPurpose {
+    Login,
+    Logout,
+}
+
 /// Message type for communication between the key/callback threads and the
 /// main async loop.
 enum TuiMessage {
@@ -689,7 +695,27 @@ enum TuiMessage {
     /// mailbox) signal the main loop, which awaits
     /// `reload_extension_resources` on the async runtime.
     ReloadExtensions,
-    /// Result returned after Ctrl+G edits a temporary file in an external
+    /// Request an OAuth action. The action itself runs off the main loop because
+    /// provider callbacks are synchronous FFI calls and may wait for user
+    /// interaction (for example, a browser/device-code exchange).
+    ProviderOAuthAction {
+        provider: String,
+        action: String,
+        input: serde_json::Value,
+        purpose: ProviderOAuthPurpose,
+        flow_id: u64,
+    },
+    /// Result of one provider-owned OAuth action.
+    ProviderOAuthResult {
+        provider: String,
+        action: String,
+        result: Result<serde_json::Value, String>,
+        purpose: ProviderOAuthPurpose,
+        flow_id: u64,
+    },
+    /// Request provider-aware logout. OAuth credentials are revoked before the
+    /// local auth entry is removed; API-key credentials are removed directly.
+    LogoutProvider(String),
     /// editor. Handling it on the async loop keeps editor mutation single-
     /// threaded with the rest of the TUI state.
     ExternalEditorResult(Result<String, String>),
@@ -1189,6 +1215,8 @@ pub async fn interactive_tui(
         active_selector: std::sync::Mutex::new(None),
         provider_form: std::sync::Mutex::new(None),
         active_provider_input: std::sync::Mutex::new(None),
+        provider_auth_flow_id: std::sync::atomic::AtomicU64::new(0),
+        provider_auth_generation: std::sync::atomic::AtomicU64::new(0),
         active_provider_select: std::sync::Mutex::new(None),
         active_extension_editor: std::sync::Mutex::new(None),
         active_extension_input: std::sync::Mutex::new(None),
@@ -1801,6 +1829,20 @@ pub async fn interactive_tui(
                             continue;
                         }
                     }
+                    if let Some(input) = state_for_key.active_provider_input.lock().unwrap().clone()
+                    {
+                        input.handle_paste(&text);
+                        tui_for_key.request_render_reusing_scroll_content();
+                        continue;
+                    }
+                    if state_for_key
+                        .provider_auth_flow_id
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        != 0
+                    {
+                        tui_for_key.request_render_reusing_scroll_content();
+                        continue;
+                    }
                     if let Some(images) = images_from_pasted_paths(&text) {
                         for image in images {
                             state_for_key.queue_image(image);
@@ -1898,6 +1940,37 @@ pub async fn interactive_tui(
                     input.handle_key(key);
                 } else if let Some(select) = active_select {
                     select.handle_key(key);
+                }
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
+            // Provider login inputs use the same input slot without creating an
+            // Add-provider form state. Route them before the normal editor so
+            // masked API keys and OAuth exchange values actually receive keys.
+            if let Some(provider_input) =
+                state_for_key.active_provider_input.lock().unwrap().clone()
+            {
+                provider_input.handle_key(key);
+                tui_for_key.request_render_reusing_scroll_content();
+                continue;
+            }
+
+            // OAuth begin/exchange/revoke owns the input slot even while the
+            // provider call is running. Do not let keys leak into the prompt.
+            if state_for_key
+                .provider_auth_flow_id
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+                    finish_provider_login(
+                        &state_for_key,
+                        &ctx_for_key.editor_container,
+                        &editor_for_key,
+                        &tui_for_key,
+                    );
+                    add_note_message(&state_for_key.chat_container, "OAuth flow cancelled.");
                 }
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
@@ -3020,6 +3093,151 @@ pub async fn interactive_tui(
                 )
                 .await;
                 tui.request_render(false);
+            }
+            Some(TuiMessage::ProviderOAuthAction {
+                provider,
+                action,
+                input,
+                purpose,
+                flow_id,
+            }) => {
+                let (snapshot, keepalive) = {
+                    let session = ctx
+                        .reload_context
+                        .extension_session
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    (session.snapshot_arc(), session.keepalive())
+                };
+                let tx = ctx.tx.clone();
+                let provider_result = provider.clone();
+                let action_result = action.clone();
+                tokio::spawn(async move {
+                    let result = match snapshot {
+                        Some(snapshot) => {
+                            let provider_call = provider.clone();
+                            let action_call = action.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let _keepalive = keepalive;
+                                rpi_extensions::request_oauth(
+                                    &snapshot,
+                                    &provider_call,
+                                    &action_call,
+                                    input,
+                                )
+                                .map_err(|error| error.to_string())
+                            })
+                            .await
+                            .map_err(|error| format!("OAuth worker failed: {error}"))
+                            .and_then(|result| result)
+                        }
+                        None => Err("no OAuth extensions are loaded".to_string()),
+                    };
+                    let _ = tx.send(TuiMessage::ProviderOAuthResult {
+                        provider: provider_result,
+                        action: action_result,
+                        result,
+                        purpose,
+                        flow_id,
+                    });
+                });
+            }
+            Some(TuiMessage::ProviderOAuthResult {
+                provider,
+                action,
+                result,
+                purpose,
+                flow_id,
+            }) => {
+                if state
+                    .provider_auth_flow_id
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != flow_id
+                {
+                    continue;
+                }
+                handle_provider_oauth_result(
+                    &state,
+                    &editor_container,
+                    &editor,
+                    &tui,
+                    &ctx.tx,
+                    &provider,
+                    &action,
+                    result,
+                    purpose,
+                    flow_id,
+                );
+            }
+            Some(TuiMessage::LogoutProvider(provider)) => {
+                let auth = match crate::config::read_auth() {
+                    Ok(auth) => auth,
+                    Err(error) => {
+                        add_error_message(
+                            &chat_container,
+                            &format!("Could not read saved credentials: {error}"),
+                        );
+                        tui.request_render(false);
+                        continue;
+                    }
+                };
+                let credential = auth.get(&provider).cloned();
+                match credential {
+                    Some(crate::config::Credential::Oauth {
+                        access, refresh, ..
+                    }) => {
+                        show_provider_auth_status(
+                            &state,
+                            &editor_container,
+                            &editor,
+                            &tui,
+                            &format!("Revoking OAuth credentials for {provider}…"),
+                        );
+                        let flow_id = state
+                            .provider_auth_generation
+                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                            .wrapping_add(1);
+                        state
+                            .provider_auth_flow_id
+                            .store(flow_id, std::sync::atomic::Ordering::Release);
+                        let _ = ctx.tx.send(TuiMessage::ProviderOAuthAction {
+                            provider,
+                            action: "revoke".to_string(),
+                            input: serde_json::json!({
+                                "credential": {"access": access, "refresh": refresh}
+                            }),
+                            purpose: ProviderOAuthPurpose::Logout,
+                            flow_id,
+                        });
+                    }
+                    Some(crate::config::Credential::ApiKey { .. }) => {
+                        match crate::config::delete_credential(&provider) {
+                            Ok(true) => {
+                                add_note_message(
+                                    &chat_container,
+                                    &format!("Removed saved credentials for {provider}; reloading providers…"),
+                                );
+                                let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
+                            }
+                            Ok(false) => add_note_message(
+                                &chat_container,
+                                &format!("No saved credentials found for {provider}."),
+                            ),
+                            Err(error) => add_error_message(
+                                &chat_container,
+                                &format!("Could not remove {provider} credentials: {error}"),
+                            ),
+                        }
+                        tui.request_render(false);
+                    }
+                    None => {
+                        add_note_message(
+                            &chat_container,
+                            &format!("No saved credentials found for {provider}."),
+                        );
+                        tui.request_render(false);
+                    }
+                }
             }
             Some(TuiMessage::ReloadExtensions) => {
                 // B5d: drive the shared reload routine on the async runtime,

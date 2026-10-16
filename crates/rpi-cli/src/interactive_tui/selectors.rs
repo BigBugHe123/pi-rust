@@ -586,6 +586,107 @@ pub(super) fn open_provider_selector(
     );
 }
 
+/// Pick a provider for `/login`, then run its OAuth or API-key flow.
+pub(super) fn open_login_provider_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    extension_session: &crate::session::ExtensionSessionCell,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+) {
+    let manifests = current_provider_manifests(extension_session);
+    let oauth_providers = current_oauth_providers(extension_session);
+    let items = login_provider_items_with_oauth(&manifests, &oauth_providers);
+    if items.is_empty() {
+        add_note_message(
+            &state.chat_container,
+            "No login-capable providers are loaded. Configure a provider or install an extension first.",
+        );
+        tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let tx_sel = tx.clone();
+    let extension_session_sel = extension_session.clone();
+    list.on_select(Arc::new(move |item| {
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+        begin_provider_login(
+            &state_sel,
+            &ec_sel,
+            &editor_sel,
+            &tui_sel,
+            &tx_sel,
+            &extension_session_sel,
+            &item.value,
+        );
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+    open_searchable_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        Some("Log in to provider"),
+        Some("Type to filter providers · Enter selects · Esc cancels"),
+        list,
+        SelectorKind::Provider,
+    );
+}
+pub(super) fn open_logout_provider_selector(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+) {
+    let items = stored_credential_items();
+    if items.is_empty() {
+        add_note_message(
+            &state.chat_container,
+            "No saved provider credentials found.",
+        );
+        tui.request_render(false);
+        return;
+    }
+    let list = Arc::new(SelectList::new(items, 10));
+    let state_sel = state.clone();
+    let ec_sel = editor_container.clone();
+    let editor_sel = editor.clone();
+    let tui_sel = tui.clone();
+    let tx_sel = tx.clone();
+    list.on_select(Arc::new(move |item| {
+        let _ = tx_sel.send(TuiMessage::LogoutProvider(item.value.clone()));
+        close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
+    }));
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+    open_searchable_selector(
+        state,
+        editor_container,
+        editor,
+        tui,
+        Some("Log out provider"),
+        Some("Type to filter providers · Enter removes · Esc cancels"),
+        list,
+        SelectorKind::Provider,
+    );
+}
 /// Open the "remove provider" picker: lists only the providers defined in
 /// `models.json` (built-ins cannot be removed), and deletes the chosen one.
 pub(super) fn open_provider_remove_selector(

@@ -2378,18 +2378,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rpi-example-provider-deepseek"
-version = "0.3.24"
-dependencies = [
- "rpi-ai",
- "rpi-extensions",
- "rpi-plugin-sdk",
- "rpi-provider-runtime",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "rpi-extensions"
 version = "0.3.24"
 dependencies = [

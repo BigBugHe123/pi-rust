@@ -463,26 +463,94 @@ impl SlashCommand for LoginCommand {
         "/login"
     }
     fn description(&self) -> &'static str {
-        "Save an Anthropic API key"
+        "Log in to a provider (selector, API key, or OAuth)"
     }
     fn execute(&self, ctx: &CommandContext, args: &str) {
-        let key = args.trim();
-        if key.is_empty() {
-            add_note_message(&ctx.chat, "Usage: /login <api-key>");
-        } else {
-            let result = crate::config::upsert_credential(
-                "anthropic",
-                crate::config::Credential::ApiKey {
-                    key: Some(key.to_string()),
-                    env: None,
-                },
+        let args = args.trim();
+        if args.is_empty() {
+            open_login_provider_selector(
+                &ctx.state,
+                &ctx.editor_container,
+                &ctx.editor,
+                &ctx.tui,
+                &ctx.state.extension_session,
+                &ctx.tx,
             );
-            match result {
-                Ok(()) => add_note_message(&ctx.chat, "Saved Anthropic credentials."),
-                Err(error) => {
-                    add_error_message(&ctx.chat, &format!("Could not save credentials: {error}"))
+            return;
+        }
+
+        let manifests = current_provider_manifests(&ctx.state.extension_session);
+        let oauth_providers = current_oauth_providers(&ctx.state.extension_session);
+        // Provider ids are taken from the catalog so case-insensitive input is
+        // persisted under the canonical id. A single argument preserves the
+        // historical `/login <key>` shortcut for Anthropic.
+        let mut parts = args.splitn(2, char::is_whitespace);
+        let first = parts.next().unwrap_or_default();
+        let login_items = login_provider_items_with_oauth(&manifests, &oauth_providers);
+        let (provider, key) = match parts.next().map(str::trim).filter(|key| !key.is_empty()) {
+            Some(key) => match login_items
+                .iter()
+                .find(|item| item.value.eq_ignore_ascii_case(first))
+            {
+                Some(item)
+                    if oauth_providers
+                        .iter()
+                        .any(|oauth| oauth.id.eq_ignore_ascii_case(&item.value)) =>
+                {
+                    add_error_message(
+                        &ctx.chat,
+                        &format!(
+                            "Provider '{first}' uses OAuth. Use /login to start its interactive login."
+                        ),
+                    );
+                    ctx.tui.request_render(false);
+                    return;
                 }
+                Some(item) => (item.value.clone(), key.to_string()),
+                None => {
+                    add_error_message(
+                        &ctx.chat,
+                        &format!(
+                            "Unknown provider '{first}'. Use /login to choose a provider, or /login <api-key> for the Anthropic shortcut."
+                        ),
+                    );
+                    ctx.tui.request_render(false);
+                    return;
+                }
+            },
+            None => {
+                if login_items
+                    .iter()
+                    .any(|item| item.value.eq_ignore_ascii_case(first))
+                {
+                    add_error_message(
+                        &ctx.chat,
+                        &format!("Missing API key for provider '{first}'."),
+                    );
+                    ctx.tui.request_render(false);
+                    return;
+                }
+                ("anthropic".to_string(), args.to_string())
             }
+        };
+        match crate::config::upsert_credential(
+            &provider,
+            crate::config::Credential::ApiKey {
+                key: Some(key.to_string()),
+                env: None,
+            },
+        ) {
+            Ok(()) => {
+                add_note_message(
+                    &ctx.chat,
+                    &format!("Saved credentials for {provider}; reloading providers…"),
+                );
+                let _ = ctx.tx.send(TuiMessage::ReloadExtensions);
+            }
+            Err(error) => add_error_message(
+                &ctx.chat,
+                &format!("Could not save {provider} credentials: {error}"),
+            ),
         }
         ctx.tui.request_render(false);
     }
@@ -494,16 +562,27 @@ impl SlashCommand for LogoutCommand {
         "/logout"
     }
     fn description(&self) -> &'static str {
-        "Remove saved Anthropic credentials"
+        "Remove saved provider credentials"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        match crate::config::delete_credential("anthropic") {
-            Ok(true) => add_note_message(&ctx.chat, "Removed saved Anthropic credentials."),
-            Ok(false) => add_note_message(&ctx.chat, "No saved Anthropic credentials found."),
-            Err(error) => {
-                add_error_message(&ctx.chat, &format!("Could not remove credentials: {error}"))
-            }
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let provider = args.trim();
+        if provider.is_empty() {
+            open_logout_provider_selector(
+                &ctx.state,
+                &ctx.editor_container,
+                &ctx.editor,
+                &ctx.tui,
+                &ctx.tx,
+            );
+            return;
         }
+        let provider_id = crate::config::read_auth()
+            .unwrap_or_default()
+            .keys()
+            .find(|id| id.eq_ignore_ascii_case(provider))
+            .cloned()
+            .unwrap_or_else(|| provider.to_string());
+        let _ = ctx.tx.send(TuiMessage::LogoutProvider(provider_id));
         ctx.tui.request_render(false);
     }
 }

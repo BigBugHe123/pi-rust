@@ -470,8 +470,7 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
 
 完整规范：[Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)。创建推理扩展时优先复制
-[DeepSeek 模板](https://github.com/bigfish1913/pi-rust/tree/feature-stream-porider/examples/provider-deepseek)，
-通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
+正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
 
 ### 方式与目录
 
@@ -533,18 +532,23 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
 覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
 真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
-本仓库 DeepSeek 教学模板仅验证文本 / 思考流。生产统一包位于独立
-[rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+正式统一包位于独立的 [rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
 保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
 
-在仓库根目录运行模板的离线验证：
+在 rpi-package 仓库运行正式 package 的离线验证：
 
 ```sh
-cargo build -p rpi-example-provider-deepseek
-cargo test -p rpi-example-provider-deepseek --test streaming
-# 生产包在 rpi-package 仓库执行：cargo build -p rpi-providers && cargo test -p rpi-providers
-# CLI 集成需设置 RPI_TEST_PROVIDER_LIBRARY 和 RPI_TEST_PROVIDER_PACKAGE，见完整规范
+cd /path/to/rpi-package
+cargo build -p rpi-providers
+cargo test -p rpi-providers --test streaming
+cargo test -p rpi-providers --test host
+```
+
+在 pi-rust 仓库运行 CLI 集成测试时设置 `RPI_TEST_PROVIDER_LIBRARY` 和
+`RPI_TEST_PROVIDER_PACKAGE`，再执行：
+
+```sh
 cargo test -p rpi-cli --test provider_packages
 ```
 
-新增 package 还必须构建并测试自身动态库，不能仅凭模板通过就声称接入完成。
+新增 package 还必须构建并测试自身动态库，不能仅凭宿主测试通过就声称接入完成。
