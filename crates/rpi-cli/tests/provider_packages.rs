@@ -247,6 +247,51 @@ fn auth_check_honors_anonymous_packages_and_logout_keeps_environment_keys() {
 }
 
 #[test]
+fn deepseek_example_is_discovered_as_an_extension_with_its_own_auth_policy() {
+    let Some(library) = library("rpi_example_provider_deepseek") else {
+        eprintln!("SKIP: build rpi-example-provider-deepseek first");
+        return;
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let output = command(&temp, &library)
+        .args(["--list-models", "deepseek-extension"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let catalog = String::from_utf8_lossy(&output.stdout);
+    assert!(catalog.contains("deepseek-extension") && catalog.contains("deepseek-flash"));
+    assert_auth_output(
+        auth_command(&temp, &library, "deepseek-extension")
+            .env("OPENAI_API_KEY", "secret-value-other-provider")
+            .output()
+            .unwrap(),
+        false,
+        "none",
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "deepseek-extension")
+            .env("DEEPSEEK_API_KEY", "secret-value-deepseek")
+            .output()
+            .unwrap(),
+        true,
+        "DEEPSEEK_API_KEY",
+    );
+    assert_auth_output(
+        auth_command(&temp, &library, "deepseek-extension")
+            .env("DEEPSEEK_API_KEY", "secret-value-deepseek")
+            .arg("--no-extensions")
+            .output()
+            .unwrap(),
+        false,
+        "none",
+    );
+}
+
+#[test]
 fn package_catalog_is_available_without_credentials_and_respects_no_extensions() {
     let Some(library) = library("rpi_provider_openrouter") else {
         eprintln!("SKIP: build rpi-provider-openrouter first");

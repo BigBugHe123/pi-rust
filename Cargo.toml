@@ -14,6 +14,7 @@ members = [
     "examples/tools",
     "examples/tui",
     "examples/plugin-stub",
+    "examples/provider-deepseek",
     "packages/provider-runtime",
     "packages/provider-openrouter",
     "packages/provider-llama-cpp",

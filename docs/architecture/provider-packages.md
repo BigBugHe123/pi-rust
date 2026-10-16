@@ -107,6 +107,10 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 
 ## 验证
 
+可运行的 DeepSeek 流式扩展示例见 [examples/provider-deepseek](../../examples/provider-deepseek/README.md)。
+它使用独立的 `deepseek-extension` ID，提供真实动态库加载、本地分段 SSE、取消和 HTTP 错误测试，
+以及需要显式启用的真实 DeepSeek API smoke test。
+
 ```sh
 cargo build -p rpi-provider-openrouter -p rpi-provider-llama-cpp -p rpi-provider-proxy
 cargo test -p rpi-cli --test provider_packages
