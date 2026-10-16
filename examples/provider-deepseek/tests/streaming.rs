@@ -322,7 +322,11 @@ async fn live_deepseek_extension_stream() {
         timeout: Some(Duration::from_secs(45)),
         ..Default::default()
     };
-    let mut stream = provider.stream_simple(&model, &context(), &options).await;
+    let context = Context::new(vec![Message::User(UserMessage::new(
+        "Write ten numbered short English sentences about the weather, one sentence per line. No introduction. This is a streaming transport test.",
+        0,
+    ))]);
+    let mut stream = provider.stream_simple(&model, &context, &options).await;
     let mut deltas = 0;
     while let Some(event) = tokio::time::timeout(Duration::from_secs(60), stream.next())
         .await
@@ -344,6 +348,9 @@ async fn live_deepseek_extension_stream() {
         message.stop_reason,
         StopReason::Stop | StopReason::Length
     ));
-    assert!(deltas > 0 && !Content::text_only(&message.content, "").is_empty());
+    assert!(
+        deltas > 1 && !Content::text_only(&message.content, "").is_empty(),
+        "live smoke test needs multiple text deltas to validate incremental delivery"
+    );
     eprintln!("\nprovider={} text_delta_events={deltas}", message.provider);
 }

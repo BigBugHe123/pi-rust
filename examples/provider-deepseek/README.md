@@ -36,7 +36,7 @@ $env:DEEPSEEK_API_KEY = '<你的 DeepSeek key>'
 cargo test -p rpi-example-provider-deepseek --test streaming live_deepseek_extension_stream -- --ignored --exact --nocapture
 ```
 
-该测试使用真实动态库和真实 API，正文每次 TextDelta 到达时就打印，最后打印 provider ID 和 TextDelta 事件数。
+该测试使用真实动态库和真实 API，请求十句短文，要求收到至少两个正文增量；每次 TextDelta 到达时就打印，最后打印 provider ID 和 TextDelta 事件数。
 它最多请求 1024 个输出 token，不重试；正常的自动测试不会运行它。
 
 ## 3. 在 rpi 中交互验证
