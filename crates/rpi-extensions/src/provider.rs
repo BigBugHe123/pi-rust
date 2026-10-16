@@ -71,6 +71,7 @@ pub struct PluggableProvider {
     _keepalive: Arc<PluginKeepalive>,
     /// Captured at build time — `spawn_blocking` works from the async context.
     runtime: Handle,
+    models: Vec<Model>,
 }
 
 impl PluggableProvider {
@@ -80,11 +81,16 @@ impl PluggableProvider {
         keepalive: Arc<PluginKeepalive>,
         runtime: Handle,
     ) -> Arc<Self> {
+        let models = snapshot
+            .provider_manifest(&record.provider_id)
+            .map(|manifest| manifest.models.clone())
+            .unwrap_or_default();
         Arc::new(Self {
             record,
             snapshot,
             _keepalive: keepalive,
             runtime,
+            models,
         })
     }
 
@@ -122,14 +128,7 @@ impl Provider for PluggableProvider {
     }
 
     fn models(&self) -> &[Model] {
-        // v1: the registrar carries no model list (the SDK `ProviderRequestFn`
-        // signature has no models channel — a plugin resolves models itself).
-        // The host injects this provider into `AgentHarnessOptions.models`, so
-        // the harness finds it by id when a catalog model's `provider` field
-        // matches; whether such a model exists is a catalog/config concern.
-        // Returning empty here means the provider advertises no models of its
-        // own (mirrors a provider that only serves foreign-configured models).
-        &[]
+        &self.models
     }
 
     async fn stream_simple(
@@ -395,6 +394,7 @@ fn options_json(opts: &SimpleStreamOptions) -> serde_json::Value {
         "reasoning": opts.reasoning.map(|r| format!("{r:?}")),
         "maxTokens": opts.max_tokens,
         "temperature": opts.temperature,
+        "thinkingBudgets": opts.thinking_budgets,
     })
 }
 

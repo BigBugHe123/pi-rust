@@ -1,0 +1,20 @@
+[package]
+name = "rpi-provider-openrouter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Optional openrouter provider package for rpi"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rpi-ai = { workspace = true, features = ["providers"] }
+rpi-plugin-sdk = { workspace = true }
+rpi-provider-runtime = { path = "../provider-runtime", version = "0.3.24" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }

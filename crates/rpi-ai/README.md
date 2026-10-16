@@ -45,8 +45,9 @@ it is the default.
 - `provider` — the `Provider` trait seam, `ProviderHooks`, `SimpleStreamOptions`,
   and the optional `DeferredProvider` capability for long-poll APIs.
 - `providers` — concrete implementations: `faux` (always), `anthropic`,
-  `openai_completions`, `openai_responses`, `openrouter`, `deepseek`,
-  `llama_cpp`, `proxy` (behind `providers`).
+  `openai_completions`, `openai_responses`, `deepseek` (behind `providers`).
+  OpenRouter, llama.cpp and Proxy live in the optional packages under
+  `packages/provider-*`; see the [migration guide](../../docs/architecture/provider-packages.md).
 
 ## The `Provider` trait
 

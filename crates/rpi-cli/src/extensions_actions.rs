@@ -39,7 +39,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use rpi_ai::types::ThinkingLevel;
 use rpi_extensions::RuntimeActionHost;
@@ -69,7 +69,7 @@ pub struct HarnessActionHost {
     harness: Arc<OnceLock<Arc<AgentHarness>>>,
     /// The auth-filtered catalog (the same list the TUI `/model` selector
     /// shows). `set_model(id)` resolves an id against this.
-    catalog: Vec<rpi_ai::Model>,
+    catalog: RwLock<Vec<rpi_ai::Model>>,
     /// The session cwd — `new_session`/`fork`/`switch_session` need it to
     /// locate the session dir.
     cwd: PathBuf,
@@ -103,7 +103,7 @@ impl HarnessActionHost {
         (
             Self {
                 harness: Arc::clone(&harness),
-                catalog,
+                catalog: RwLock::new(catalog),
                 cwd,
                 cli_flags,
                 tool_context,
@@ -111,6 +111,13 @@ impl HarnessActionHost {
             },
             harness,
         )
+    }
+
+    pub fn set_catalog(&self, catalog: Vec<rpi_ai::Model>) {
+        *self
+            .catalog
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = catalog;
     }
 
     /// Fill the harness cell. Call exactly once, immediately after
@@ -136,12 +143,13 @@ impl HarnessActionHost {
     /// Resolve `id` (case-insensitive exact, then substring) against the
     /// catalog. Mirrors the resolver's exact-id-first fallback.
     fn resolve_model(&self, id: &str) -> Option<rpi_ai::Model> {
-        self.catalog
+        let catalog = self.catalog.read().ok()?;
+        catalog
             .iter()
             .find(|m| m.id.eq_ignore_ascii_case(id))
             .cloned()
             .or_else(|| {
-                self.catalog
+                catalog
                     .iter()
                     .find(|m| m.id.to_ascii_lowercase().contains(&id.to_ascii_lowercase()))
                     .cloned()
@@ -340,6 +348,9 @@ fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
+    fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
+        self.set_catalog(models);
+    }
     async fn get_cli_flag(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let name = arg_str(&args, "name")?;
         Ok(serde_json::json!({

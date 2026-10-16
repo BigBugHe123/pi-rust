@@ -21,8 +21,8 @@ use std::path::Path;
 use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
-use crate::provider::{resolve_for_cwd, ResolveError};
-use crate::session::{build, BuildError};
+use crate::provider::{resolve_with_extensions, ResolveError};
+use crate::session::{build_prepared, prepare_extensions, BuildError};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
 /// for most error paths; v1 distinguishes usage errors with the conventional
@@ -194,7 +194,7 @@ async fn run_inner() -> i32 {
     // command, so it must work for a newly installed user who has not
     // authenticated yet.
     if let Some(search) = parsed.list_models.as_deref() {
-        return list_models(search).await;
+        return list_models(search, &parsed, &cwd).await;
     }
 
     // Build before provider resolution so compiler errors do not require
@@ -240,14 +240,18 @@ async fn run_inner() -> i32 {
 
     // ---- provider + model resolution ----
     let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
-    let resolved = match resolve_for_cwd(
-        parsed.provider.as_deref(),
-        parsed.model.as_deref(),
-        parsed.thinking,
-        parsed.api_key.as_deref(),
-        parsed.base_url.as_deref(),
+    let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            print_build_error(&error);
+            return EXIT_RUNTIME;
+        }
+    };
+    let resolved = match resolve_with_extensions(
+        &parsed,
         &cwd,
         project_trusted,
+        &prepared.extension_session,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -294,7 +298,7 @@ async fn run_inner() -> i32 {
 
     // ---- harness build ----
     let (harness, event_rx, mut reload_context) =
-        match build(&resolved, &parsed, &cwd, project_trusted).await {
+        match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
             Ok(triple) => triple,
             Err(e) => {
                 print_build_error(&e);
@@ -642,14 +646,35 @@ fn emit_startup_warnings(parsed: &Args) {
 
 /// Print the merged model catalog, optionally filtered by a case-insensitive
 /// fuzzy-ish substring over provider, id, and display name.
-async fn list_models(search: &str) -> i32 {
-    let catalog = match crate::provider::catalog_all() {
+async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
+    let trusted = crate::session::resolve_project_trust(args, cwd);
+    let prepared = match prepare_extensions(args, cwd, trusted) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            print_build_error(&error);
+            return EXIT_RUNTIME;
+        }
+    };
+    let mut catalog = match crate::provider::catalog_all() {
         Ok(models) => models,
         Err(error) => {
             eprintln!("warning: could not load models.json: {error}");
             Vec::new()
         }
     };
+    for provider in rpi_extensions::PluggableProvider::from_session(
+        &prepared.extension_session,
+        tokio::runtime::Handle::current(),
+    ) {
+        for model in provider.models() {
+            if !catalog
+                .iter()
+                .any(|known| known.provider == model.provider && known.id == model.id)
+            {
+                catalog.push(model.clone());
+            }
+        }
+    }
     let needle = search.trim().to_ascii_lowercase();
     let mut models: Vec<_> = catalog
         .into_iter()

@@ -459,3 +459,23 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 4. 实现领域逻辑与边界测试，再连接 loader/ABI。
 5. 使用 `rpi dev --no-watch` 与 `rpi install <crate> --build --force` 做真实 smoke test。
 6. 不声称未验证的 Pi capability 已完全兼容；明确记录降级行为。
+
+## Provider package 目录声明
+
+Provider 插件可在现有 `declare` 中提供 `providers` 数组，每项包含 `id`、完整
+`rpi_ai::Model` 数组 `models`、可选的 `apiKeyEnv` 和默认 `true` 的 `requiresAuth`。
+目录只在同一插件成功注册对应 provider 后生效，同名冲突时目录与第一份实现一起保留。
+宿主在选择模型前仅加载一次插件，因此安装后的模型可直接用于 `--provider`、
+`--model` 和无凭据的 `--list-models`；`--no-extensions` 同时禁用实现和目录。
+
+核心保留 OpenAI、Anthropic、DeepSeek 与 Faux。OpenRouter、llama.cpp、Proxy 在
+`packages/provider-*`，使用 `rpi-provider-runtime::export_provider!` 桥接流式请求和取消。
+`/reload` 会重新绑定 runtime、凭据、端点和 `/model` 目录；当前 provider 无法重新加载时
+保留原会话并返回错误。凭据仍按 provider id 隔离，匿名运行必须显式声明。
+
+开发时在仓库根目录运行：
+
+```sh
+rpi package link openrouter --path packages/provider-openrouter --debug
+rpi --list-models openrouter
+```

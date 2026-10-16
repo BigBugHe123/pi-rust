@@ -21,6 +21,23 @@ use rpi_plugin_sdk::{
 
 use crate::tool::PluginToolHandle;
 
+/// A provider package's catalog and authentication policy, supplied through
+/// `declare({"providers":[...]})`. Credentials are always resolved by the host.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderManifest {
+    pub id: String,
+    pub models: Vec<rpi_ai::Model>,
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default = "requires_auth_default")]
+    pub requires_auth: bool,
+}
+
+fn requires_auth_default() -> bool {
+    true
+}
+
 // ---------------------------------------------------------------------------
 // Registered-item records
 // ---------------------------------------------------------------------------
@@ -339,6 +356,7 @@ pub struct ExtensionRegistry {
     /// [`PluggableProvider`](crate::PluggableProvider). First-registration-wins on
     /// `provider_id`.
     providers: Vec<RegisteredProvider>,
+    provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     /// Provider-owned OAuth implementations. First-registration-wins on the
     /// manifest `id` field.
     oauth_providers: Vec<RegisteredOAuthProvider>,
@@ -382,6 +400,7 @@ impl ExtensionRegistry {
             resources_discover: Vec::new(),
             before_agent_start: Vec::new(),
             providers: Vec::new(),
+            provider_manifests: std::collections::BTreeMap::new(),
             oauth_providers: Vec::new(),
             renderers: Vec::new(),
             priority: DEFAULT_PRIORITY,
@@ -523,6 +542,25 @@ impl ExtensionRegistry {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
             return false;
         };
+        if let Some(providers) = value.get("providers") {
+            let Ok(manifests) = serde_json::from_value::<Vec<ProviderManifest>>(providers.clone())
+            else {
+                return false;
+            };
+            if manifests.iter().any(|manifest| {
+                manifest.id.trim().is_empty()
+                    || manifest
+                        .models
+                        .iter()
+                        .any(|model| model.id.trim().is_empty() || model.provider != manifest.id)
+            }) {
+                return false;
+            }
+            for manifest in manifests {
+                self.provider_manifests
+                    .insert(manifest.id.clone(), manifest);
+            }
+        }
         let priority = value
             .get("priority")
             .and_then(|v| v.as_i64())
@@ -707,6 +745,7 @@ impl ExtensionRegistry {
             resources_discover: self.resources_discover.clone(),
             before_agent_start: self.before_agent_start.clone(),
             providers: self.providers.clone(),
+            provider_manifests: self.provider_manifests.clone(),
             oauth_providers: self.oauth_providers.clone(),
             renderers: self.renderers.clone(),
             owns_stdio: self.owns_stdio,
@@ -793,6 +832,10 @@ impl ExtensionRegistry {
             {
                 continue;
             }
+            if let Some(manifest) = other.provider_manifests.remove(&p.provider_id) {
+                self.provider_manifests
+                    .insert(p.provider_id.clone(), manifest);
+            }
             self.providers.push(p);
         }
         for oauth in other.oauth_providers.drain(..) {
@@ -857,6 +900,7 @@ pub struct RegistrySnapshot {
     resources_discover: Vec<ResourcesDiscoverHandler>,
     before_agent_start: Vec<BeforeAgentStartHandler>,
     providers: Vec<RegisteredProvider>,
+    provider_manifests: std::collections::BTreeMap<String, ProviderManifest>,
     oauth_providers: Vec<RegisteredOAuthProvider>,
     renderers: Vec<RegisteredRenderer>,
     /// A plugin's `{"ownsStdio":true}` claim (merged OR across plugins). The
@@ -933,6 +977,15 @@ impl RegistrySnapshot {
     /// plugin registered a provider.
     pub fn providers(&self) -> &[RegisteredProvider] {
         &self.providers
+    }
+
+    /// Only declarations backed by a successfully registered provider are used.
+    pub fn provider_manifest(&self, id: &str) -> Option<&ProviderManifest> {
+        self.providers
+            .iter()
+            .any(|provider| provider.provider_id == id)
+            .then(|| self.provider_manifests.get(id))
+            .flatten()
     }
 
     /// All registered renderers (B5c), registration order, across all three
@@ -1210,5 +1263,67 @@ mod tests {
         assert!(reg.register_oauth_provider(make(r#"{"id":"acme"}"#)));
         assert!(reg.register_oauth_provider(make(r#"{"displayName":"missing-id"}"#)));
         assert_eq!(reg.snapshot().oauth_providers().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod provider_manifest_tests {
+    use super::*;
+    use rpi_plugin_sdk::{StbString, StbStringRef};
+    extern "C" fn request(_: StbStringRef, _: *mut StbString, _: *mut std::ffi::c_void) -> i32 {
+        1
+    }
+    fn record() -> RegisteredProvider {
+        RegisteredProvider {
+            provider_id: "package".into(),
+            base_url: "http://localhost".into(),
+            api_style: "openai-completions".into(),
+            request_fn: request,
+            stream_fn: None,
+            plugin_free_string: rpi_plugin_sdk::callbacks::free_string,
+            user_data: std::ptr::null_mut(),
+        }
+    }
+    fn declaration(id: &str, model_id: &str) -> String {
+        serde_json::json!({"providers":[{"id":id,"models":[rpi_ai::Model::new(model_id, model_id,
+            rpi_ai::Api::OpenaiCompletions,"package","http://localhost")]}]})
+        .to_string()
+    }
+    #[test]
+    fn catalog_requires_registration_and_stays_with_the_winning_provider() {
+        let mut first = ExtensionRegistry::new();
+        assert!(first.apply_declaration_json(&declaration("package", "first")));
+        assert!(first.snapshot().provider_manifest("package").is_none());
+        first.register_provider(record());
+        let manifest = first
+            .snapshot()
+            .provider_manifest("package")
+            .unwrap()
+            .clone();
+        assert!(
+            manifest.requires_auth,
+            "packages require authentication by default"
+        );
+        assert_eq!(manifest.models[0].id, "first");
+        let mut second = ExtensionRegistry::new();
+        second.register_provider(record());
+        assert!(second.apply_declaration_json(&declaration("package", "second")));
+        first.absorb(second);
+        assert_eq!(
+            first
+                .snapshot()
+                .provider_manifest("package")
+                .unwrap()
+                .models[0]
+                .id,
+            "first"
+        );
+    }
+    #[test]
+    fn a_package_cannot_attach_a_catalog_to_another_providers_identity() {
+        let mut registry = ExtensionRegistry::new();
+        registry.register_provider(record());
+        assert!(!registry.apply_declaration_json(&declaration("other", "wrong")));
+        assert!(registry.snapshot().provider_manifest("package").is_none());
     }
 }

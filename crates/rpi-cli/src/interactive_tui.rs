@@ -257,7 +257,7 @@ struct CommandContext {
     editor: Arc<Editor>,
     editor_container: Arc<Container>,
     lane: Arc<dyn AgentLane>,
-    model_catalog: Arc<Vec<rpi_ai::Model>>,
+    model_catalog: Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
     cwd: std::path::PathBuf,
     /// Loaded resources for /context; refreshed after successful /reload.
     resources: Arc<Mutex<rpi_harness::types::AgentHarnessResources>>,
@@ -1251,7 +1251,7 @@ pub async fn interactive_tui(
 
     // Capture the model catalog + cwd for the selector builders + the key loop
     // (the callbacks fire on blocking threads and need owned data).
-    let model_catalog_arc = Arc::new(model_catalog.clone());
+    let model_catalog_arc = reload_context.catalog.clone();
 
     // ---- Layout root (built ONCE; mirrors TS fullscreenLayoutRoot) ----
     // root = VStack[ scrollview(basis:0 grow:1 shrink:1 min:1), dock(shrink:1) ]
@@ -2203,7 +2203,13 @@ pub async fn interactive_tui(
                 // Cycle within the `/scoped-models` set (settings.json) when
                 // configured; otherwise the full catalog, restricted to the
                 // current provider (the lane cannot route another provider).
-                let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                let scope = scoped_catalog(
+                    &ctx_for_key
+                        .model_catalog
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    &current,
+                );
                 let scope = same_provider_catalog(&scope, &current);
                 if let Some(next) = cycle_next_model(&scope, &current) {
                     state_for_key.set_current_model(&next);
@@ -2224,7 +2230,13 @@ pub async fn interactive_tui(
                 rpi_tui::keybindings::keys::MODEL_CYCLE_BACKWARD,
             ) {
                 let current = state_for_key.current_model_id();
-                let scope = scoped_catalog(&ctx_for_key.model_catalog, &current);
+                let scope = scoped_catalog(
+                    &ctx_for_key
+                        .model_catalog
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner()),
+                    &current,
+                );
                 let scope = same_provider_catalog(&scope, &current);
                 if let Some(prev) = cycle_prev_model(&scope, &current) {
                     state_for_key.set_current_model(&prev);
@@ -2245,7 +2257,10 @@ pub async fn interactive_tui(
                 rpi_tui::keybindings::keys::THINKING_CYCLE,
             ) {
                 let lane = lane_for_key.clone();
-                let catalog = model_catalog_for_key.clone();
+                let catalog = model_catalog_for_key
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
                 let state = state_for_key.clone();
                 tokio::spawn(async move {
                     let Ok(current_model) = lane.get_model().await else {

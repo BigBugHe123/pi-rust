@@ -88,6 +88,13 @@ global plugins.
 Still unmeasured and worth adding: tool-loop throughput, memory growth over a
 long session, compaction cost, and interactive TUI frame cost.
 
+## Provider packages
+
+Provider boundary cleanup now keeps Anthropic, OpenAI and DeepSeek in core,
+with OpenRouter, llama.cpp and Proxy supplied as optional native packages.
+See [Provider packages](docs/architecture/provider-packages.md) for installation,
+catalog registration, credential isolation and migration details.
+
 ## Later
 
 - **Sandboxing.** Plugin code and `bash` currently run with the user's full

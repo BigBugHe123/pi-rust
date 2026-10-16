@@ -87,9 +87,9 @@ pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
     assert_active, current_platform, platform_allows, BeforeAgentStartHandler, ExtensionRegistry,
-    ExtensionTool, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider, RegisteredProvider,
-    RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut, RegistryEntry,
-    RegistrySnapshot, ResourcesDiscoverHandler, DEFAULT_PRIORITY,
+    ExtensionTool, ProviderManifest, RegisteredFlag, RegisteredHandler, RegisteredOAuthProvider,
+    RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegisteredShortcut,
+    RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler, DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;

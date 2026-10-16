@@ -133,7 +133,12 @@ impl SlashCommand for ModelCommand {
             // upstream only switches on an EXACT match; a term that matches
             // nothing falls through to the selector with the query prefilled
             // instead of erroring out (`showModelSelector(searchTerm)`).
-            if let Some(model) = find_model_selector_match(&ctx.model_catalog, term) {
+            if let Some(model) = find_model_selector_match(
+                &ctx.model_catalog
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner()),
+                term,
+            ) {
                 let model_id = model.id.clone();
                 ctx.state.set_current_model(&model);
                 let lane = ctx.lane.clone();
@@ -157,7 +162,9 @@ impl SlashCommand for ModelCommand {
             &ctx.editor_container,
             &ctx.editor,
             &ctx.tui,
-            &ctx.model_catalog,
+            &ctx.model_catalog
+                .read()
+                .unwrap_or_else(|error| error.into_inner()),
             &ctx.lane,
             &current_id,
             &ctx.chat,
@@ -243,7 +250,9 @@ impl SlashCommand for ThinkingCommand {
             &ctx.editor,
             &ctx.tui,
             &ctx.lane,
-            &ctx.model_catalog,
+            &ctx.model_catalog
+                .read()
+                .unwrap_or_else(|error| error.into_inner()),
             &current_id,
             &ctx.chat,
         );
@@ -607,7 +616,9 @@ impl SlashCommand for SettingsCommand {
             &ctx.editor,
             &ctx.tui,
             &ctx.lane,
-            &ctx.model_catalog,
+            &ctx.model_catalog
+                .read()
+                .unwrap_or_else(|error| error.into_inner()),
             &current_id,
             &ctx.chat,
         );
@@ -628,7 +639,9 @@ impl SlashCommand for ScopedModelsCommand {
             &ctx.editor_container,
             &ctx.editor,
             &ctx.tui,
-            &ctx.model_catalog,
+            &ctx.model_catalog
+                .read()
+                .unwrap_or_else(|error| error.into_inner()),
             &ctx.chat,
         );
     }

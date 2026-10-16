@@ -47,7 +47,6 @@ pub mod fs_watch;
 pub mod install;
 pub mod interactive_tui;
 pub mod key_trace;
-pub mod llama_command;
 pub mod model_registry;
 pub mod modes;
 pub mod packages;
