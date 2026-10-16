@@ -179,7 +179,7 @@ impl SlashCommand for ProviderCommand {
         "/provider"
     }
     fn description(&self) -> &'static str {
-        "Add, remove, or set the default provider"
+        "Switch provider now, or add/remove provider configuration"
     }
     fn execute(&self, ctx: &CommandContext, args: &str) {
         let term = args.trim();
@@ -196,23 +196,10 @@ impl SlashCommand for ProviderCommand {
             return;
         }
         if !term.is_empty() {
-            match set_default_provider(
-                term,
-                &current_provider_manifests(&ctx.reload_context.extension_session),
-            ) {
-                Ok(note) => add_note_message(&ctx.chat, &note),
-                Err(error) => add_error_message(&ctx.chat, &error),
-            }
-            ctx.tui.request_render(false);
+            let _ = ctx.tx.send(TuiMessage::SwitchProvider(term.to_string()));
             return;
         }
-        open_provider_selector(
-            &ctx.state,
-            &ctx.editor_container,
-            &ctx.editor,
-            &ctx.tui,
-            &ctx.reload_context.extension_session,
-        );
+        let _ = ctx.tx.send(TuiMessage::OpenProviderSelector);
     }
 }
 

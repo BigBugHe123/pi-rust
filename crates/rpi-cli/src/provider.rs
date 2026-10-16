@@ -677,6 +677,13 @@ fn resolve_with_factories(
         }
     }
 
+    let providers = factories::combine_provider_runtimes(providers);
+    let provider = providers
+        .iter()
+        .find(|provider| provider.id() == selected_provider)
+        .expect("selected provider is registered")
+        .clone();
+
     // Only credential-free descriptors leave the resolver. The private binding
     // owns the authoritative endpoint and all request headers.
     model = execution

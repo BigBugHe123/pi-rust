@@ -76,7 +76,8 @@ serde_json::json!({
 - 没有声明的旧插件仍可搭配 `models.json` 工作；新 package 应提供声明，保证安装后可发现。
 
 `--list-models` 展示完整目录，不要求凭据；`--no-extensions` 同时禁用扩展实现和声明。
-`/provider` 展示目录与认证状态，选择默认值后重启生效；`/model` 用于当前会话切换。
+`/provider` 展示完整目录与认证状态，选择或 `/provider <id>` 会即时切换当前会话并保存默认值。
+切换只使用会话中已认证的模型；失败时保留当前模型与原默认值。`/model` 用于选择具体模型。
 `/provider remove <id>` 删除配置；卸载 package 使用 `rpi package unlink <name>`。
 
 ## 4. 推荐实现骨架
@@ -197,7 +198,7 @@ rpi auth check --provider vendor-example --extension /path/to/provider.dll --jso
 
 ## 7. 重载与兼容
 
-启动时先发现扩展和目录，再合并配置、解析认证并绑定协议实例。provider ID 对应的扩展
+启动时先发现扩展和目录，再合并配置、解析认证并绑定协议实例。provider ID 与 API 同时匹配的扩展
 factory 优先于内置 API factory，两者使用同一 `ConfiguredProvider` 和私有绑定路径。
 
 涉及当前或原有 provider package 的 `/reload` 会重建运行时、执行绑定和公开目录；

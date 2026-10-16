@@ -622,16 +622,13 @@ pub(super) fn current_provider_manifests(
 /// credentials. Label each with its model count, origin, protocol and key policy.
 pub(super) fn provider_selector_items(
     manifests: &[rpi_extensions::ProviderManifest],
+    current_provider: Option<&str>,
 ) -> Vec<SelectItem> {
     let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
     let models_cfg = crate::config::load_models_config().unwrap_or_default();
     let auth = crate::config::read_auth().unwrap_or_default();
     let execution_catalog =
         crate::provider::execution_catalog_with_manifests(manifests).unwrap_or_default();
-    let current = crate::settings::load_settings()
-        .ok()
-        .and_then(|s| s.default_provider)
-        .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER_ID.to_string());
 
     let mut providers: Vec<(String, usize)> = Vec::new();
     for model in &catalog {
@@ -645,7 +642,8 @@ pub(super) fn provider_selector_items(
         .into_iter()
         .map(|(id, count)| {
             let label = provider_display_name(&id);
-            let marker = if id.eq_ignore_ascii_case(&current) {
+            let marker = if current_provider.is_some_and(|current| id.eq_ignore_ascii_case(current))
+            {
                 " (current)"
             } else {
                 ""
@@ -734,40 +732,83 @@ fn provider_origin_protocol(
     }
 }
 
-/// Persist the default provider (and, when the current saved model does not
-/// belong to it, a matching default model) so the next launch resolves to that
-/// provider. Returns a note describing what was saved.
-pub(super) fn set_default_provider(
+/// Switch through the authenticated session catalog. Do not advertise success
+/// or persist defaults until the live lane accepted the model.
+pub(super) async fn switch_provider(
     input: &str,
     manifests: &[rpi_extensions::ProviderManifest],
-) -> Result<String, String> {
+    available: &[rpi_ai::Model],
+    lane: &Arc<dyn AgentLane>,
+) -> Result<(rpi_ai::Model, String), String> {
     let catalog =
         crate::provider::catalog_with_manifests(manifests).map_err(|error| error.to_string())?;
     let provider_id = canonicalize_provider_input(input, &catalog)?;
-
-    let mut settings = crate::settings::load_settings().unwrap_or_default();
-    let keeps_existing_model = settings.default_model.as_deref().is_some_and(|existing| {
-        catalog.iter().any(|m| {
-            m.provider.eq_ignore_ascii_case(&provider_id) && m.id.eq_ignore_ascii_case(existing)
-        })
-    });
-    if !keeps_existing_model {
-        settings.default_model = catalog
-            .iter()
-            .find(|m| m.provider.eq_ignore_ascii_case(&provider_id))
-            .map(|m| m.id.clone());
+    let candidates: Vec<_> = available
+        .iter()
+        .filter(|model| model.provider == provider_id)
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "Provider \"{provider_id}\" has no authenticated model loaded in this session. Check rpi auth check --provider {provider_id}, then /reload and retry. The current provider is unchanged."
+        ));
     }
+    let mut settings = crate::settings::load_settings().map_err(|error| error.to_string())?;
+    let config = crate::config::load_models_config().map_err(|error| error.to_string())?;
+    let configured = config.providers.get(&provider_id);
+    let matches_api = |model: &&rpi_ai::Model| {
+        configured
+            .and_then(|config| config.api.as_deref())
+            .map_or(true, |api| model.api.as_str() == api)
+    };
+    let current = lane.get_model().await.map_err(|error| error.to_string())?;
+    let saved: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|model| {
+            settings.default_provider.as_deref() == Some(provider_id.as_str())
+                && settings
+                    .default_model
+                    .as_deref()
+                    .is_some_and(|id| model.id.eq_ignore_ascii_case(id))
+        })
+        .collect();
+    let model = candidates
+        .iter()
+        .copied()
+        .find(|model| {
+            model.provider == current.provider
+                && model.api == current.api
+                && model.id.eq_ignore_ascii_case(&current.id)
+        })
+        .or_else(|| saved.iter().copied().find(matches_api))
+        .or_else(|| saved.first().copied())
+        .or_else(|| {
+            configured.and_then(|config| {
+                config.models.first().and_then(|first| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(matches_api)
+                        .find(|model| model.id.eq_ignore_ascii_case(&first.id))
+                })
+            })
+        })
+        .unwrap_or(candidates[0])
+        .clone();
+    lane.set_model(model.clone())
+        .await
+        .map_err(|error| error.to_string())?;
     settings.default_provider = Some(provider_id.clone());
-    crate::settings::save_settings(&settings).map_err(|error| error.to_string())?;
-
-    Ok(match &settings.default_model {
-        Some(model_id) if !model_id.is_empty() => format!(
-            "Default provider set to {provider_id} (model {model_id}) — takes effect after restart. The current session keeps its startup provider."
-        ),
-        _ => format!(
-            "Default provider set to {provider_id} — takes effect after restart. The current session keeps its startup provider."
-        ),
-    })
+    settings.default_model = Some(model.id.clone());
+    let saved = match crate::settings::save_settings(&settings) {
+        Ok(()) => "Default saved.".to_string(),
+        Err(error) => format!("Changed for this session, but could not save the default: {error}"),
+    };
+    let note = format!(
+        "Provider switched to {provider_id} (model {}) — applies to the next message. {saved}",
+        model.id
+    );
+    Ok((model, note))
 }
 
 /// Persist a specific default provider + model pair (used when `/model` picks a

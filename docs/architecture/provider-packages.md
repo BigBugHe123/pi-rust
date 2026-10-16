@@ -77,8 +77,12 @@ serde_json::json!({
 
 ## Factory 与执行绑定
 
-内置协议和原生扩展实现同一个宿主侧 `ProviderFactory` 契约。注册表优先查找 provider ID 对应的扩展 factory，
+内置协议和原生扩展实现同一个宿主侧 `ProviderFactory` 契约。注册表优先查找 provider ID 与 API 同时匹配的扩展 factory，
 再查找 API 协议对应的内置 factory；两者均由同一个 `ConfiguredProvider` 包装。
+扩展只处理其注册的 API；同名 provider 的其他已配置协议仍使用对应的内置 factory，
+例如安装 DeepSeek Completions 扩展后，原有 Responses 配置保持走 Responses。
+同一 provider ID 的多个协议绑定合并为一个公开运行时，按 provider / API / model ID
+选择内部绑定，避免 harness 按 provider ID 查找时误用另一个协议。
 factory 负责提供协议实现，不读取环境变量、不决定凭据优先级；认证统一由宿主解析并绑定。
 
 解析阶段将每个模型分成两种视图：
@@ -107,8 +111,10 @@ factory 负责提供协议实现，不读取环境变量、不决定凭据优先
 启动顺序是：加载扩展一次 → 收集 package 目录和 runtime factories → 合并用户模型配置 →
 按 provider id 解析凭据 → 选择模型并绑定 runtime → 创建 harness。
 `--list-models` 可在无凭据时显示 package 模型；`--no-extensions` 禁用这些声明和实现。
-TUI 的 `/provider` 同样显示已加载的 package、模型数和认证状态，未配置 key 的 package 也可选为默认。
-`/provider <id>` 保存默认 provider 和匹配的模型，重启后生效；`/model` 仍用于当前会话切换。
+TUI 的 `/provider` 同样显示已加载的 package、模型数和认证状态，未配置 key 的 package 也会显示，但不能切换到未在当前会话加载的模型。
+`/provider <id>` 与菜单选择即时更新当前 lane 和底部模型显示，成功后保存默认 provider / model。
+缺少可用认证、未知 ID 或 lane 切换失败时，保留原模型与默认值，并显示错误。
+`/model` 选择具体模型；正在生成时的 provider 切换按输入顺序在当前回复结束后处理。
 `/provider remove <id>` 只移除 `models.json` 配置，不卸载 package；卸载使用 `rpi package unlink <name>`。
 `/model openrouter/auto` 和完整的 `openrouter/openrouter/auto` 均可定位该模型，跨 provider 重名时需完整限定。
 扩展目录仍遵守项目信任、`--project-only` 和显式扩展路径规则。

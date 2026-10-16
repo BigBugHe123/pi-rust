@@ -510,18 +510,20 @@ const ADD_PROVIDER_VALUE: &str = "__add_provider__";
 /// Sentinel value for the "Remove provider" row in the `/provider` picker.
 const REMOVE_PROVIDER_VALUE: &str = "__remove_provider__";
 
-/// Open the `/provider` selector: pick a provider and persist it as the saved
-/// default (takes effect on the next launch — provider identity, auth, and the
-/// provider runtime are resolved once at startup, unlike `/model`'s live
-/// switch).
+/// Pick a provider for the current session; the async loop applies and saves it.
 pub(super) fn open_provider_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     extension_session: &crate::session::ExtensionSessionCell,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    current_provider: Option<&str>,
 ) {
-    let mut items = provider_selector_items(&current_provider_manifests(extension_session));
+    let mut items = provider_selector_items(
+        &current_provider_manifests(extension_session),
+        current_provider,
+    );
     if items.is_empty() {
         add_note_message(
             &state.chat_container,
@@ -547,8 +549,7 @@ pub(super) fn open_provider_selector(
     let ec_sel = editor_container.clone();
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
-    let chat_sel = state.chat_container.clone();
-    let extension_session = extension_session.clone();
+    let tx_sel = tx.clone();
     list.on_select(Arc::new(move |item| {
         if item.value == ADD_PROVIDER_VALUE {
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -560,10 +561,7 @@ pub(super) fn open_provider_selector(
             open_provider_remove_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         }
-        match set_default_provider(&item.value, &current_provider_manifests(&extension_session)) {
-            Ok(note) => add_note_message(&chat_sel, &note),
-            Err(error) => add_error_message(&chat_sel, &error),
-        }
+        let _ = tx_sel.send(TuiMessage::SwitchProvider(item.value.clone()));
         close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
     }));
     let state_cancel = state.clone();

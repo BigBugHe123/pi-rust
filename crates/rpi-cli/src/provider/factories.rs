@@ -62,6 +62,7 @@ impl ProviderFactory for ExtensionFactory {
 pub(super) struct RuntimeFactories {
     protocols: BTreeMap<String, Arc<dyn ProviderFactory>>,
     providers: BTreeMap<String, Arc<dyn ProviderFactory>>,
+    provider_apis: BTreeMap<String, String>,
     pub manifests: Vec<ProviderManifest>,
 }
 
@@ -83,6 +84,7 @@ impl Default for RuntimeFactories {
         Self {
             protocols,
             providers: BTreeMap::new(),
+            provider_apis: BTreeMap::new(),
             manifests: Vec::new(),
         }
     }
@@ -91,7 +93,12 @@ impl Default for RuntimeFactories {
 impl RuntimeFactories {
     pub fn from_session(session: &ExtensionSession) -> Self {
         let mut factories = Self::default();
-        if session.snapshot().is_some() {
+        if let Some(snapshot) = session.snapshot() {
+            factories.provider_apis = snapshot
+                .providers()
+                .iter()
+                .map(|provider| (provider.provider_id.clone(), provider.api_style.clone()))
+                .collect();
             factories.providers = rpi_extensions::PluggableProvider::from_session(
                 session,
                 tokio::runtime::Handle::current(),
@@ -120,6 +127,11 @@ impl RuntimeFactories {
         let factory = self
             .providers
             .get(provider_id)
+            .filter(|_| {
+                self.provider_apis
+                    .get(provider_id)
+                    .map_or(true, |declared| declared == api.as_str())
+            })
             .or_else(|| self.protocols.get(api.as_str()))?;
         let binding = Arc::new(ExecutionBinding::new(provider_id, models, auth));
         let inner = factory.create(provider_id, binding.models().to_vec(), settings);
@@ -138,6 +150,90 @@ struct ConfiguredProvider {
     binding: Arc<ExecutionBinding>,
 }
 
+/// The harness resolves providers by ID. Keep each ID unique even when a
+/// configured account and an extension expose different wire protocols.
+pub(super) fn combine_provider_runtimes(
+    providers: Vec<Arc<dyn Provider>>,
+) -> Vec<Arc<dyn Provider>> {
+    let mut groups: Vec<Vec<Arc<dyn Provider>>> = Vec::new();
+    for provider in providers {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group[0].id() == provider.id())
+        {
+            group.push(provider);
+        } else {
+            groups.push(vec![provider]);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|mut routes| {
+            if routes.len() == 1 {
+                return routes.pop().unwrap();
+            }
+            Arc::new(RoutedProvider {
+                id: routes[0].id().into(),
+                models: routes
+                    .iter()
+                    .flat_map(|route| route.models().to_vec())
+                    .collect(),
+                routes,
+            }) as Arc<dyn Provider>
+        })
+        .collect()
+}
+
+struct RoutedProvider {
+    id: String,
+    models: Vec<Model>,
+    routes: Vec<Arc<dyn Provider>>,
+}
+
+#[async_trait::async_trait]
+impl Provider for RoutedProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn models(&self) -> &[Model] {
+        &self.models
+    }
+    async fn stream_simple(
+        &self,
+        model: &Model,
+        context: &Context,
+        options: &SimpleStreamOptions,
+    ) -> AssistantMessageEventStream {
+        let route = self.routes.iter().find(|route| {
+            route.models().iter().any(|candidate| {
+                candidate.provider == model.provider
+                    && candidate.api == model.api
+                    && candidate.id.eq_ignore_ascii_case(&model.id)
+            })
+        });
+        match route {
+            Some(route) => route.stream_simple(model, context, options).await,
+            None => unbound_model_error(model, &self.id),
+        }
+    }
+}
+
+fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessageEventStream {
+    let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
+    producer.push(rpi_ai::AssistantMessageEvent::Error {
+        reason: rpi_ai::types::ErrorReason::Error,
+        error: rpi_ai::types::AssistantMessage::terminal(
+            model.api.clone(),
+            provider_id,
+            model.id.clone(),
+            rpi_ai::types::StopReason::Error,
+            "model is not registered in this provider execution binding",
+            0,
+        ),
+    });
+    stream
+}
+
 #[async_trait::async_trait]
 impl Provider for ConfiguredProvider {
     fn id(&self) -> &str {
@@ -153,20 +249,7 @@ impl Provider for ConfiguredProvider {
         options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
         let Some((model, options)) = self.binding.prepare(model, options) else {
-            let (mut producer, stream) =
-                rpi_ai::event_stream::create_assistant_message_event_stream();
-            producer.push(rpi_ai::AssistantMessageEvent::Error {
-                reason: rpi_ai::types::ErrorReason::Error,
-                error: rpi_ai::types::AssistantMessage::terminal(
-                    model.api.clone(),
-                    self.id.clone(),
-                    model.id.clone(),
-                    rpi_ai::types::StopReason::Error,
-                    "model is not registered in this provider execution binding",
-                    0,
-                ),
-            });
-            return stream;
+            return unbound_model_error(model, &self.id);
         };
         self.inner.stream_simple(&model, context, &options).await
     }
@@ -224,6 +307,162 @@ mod tests {
             });
             stream
         }
+    }
+
+    #[tokio::test]
+    async fn one_provider_routes_duplicate_model_ids_by_api_with_private_credentials() {
+        let calls = Calls::default();
+        let mut factories = RuntimeFactories::default();
+        for api in [Api::OpenaiCompletions, Api::OpenaiResponses] {
+            factories.protocols.insert(
+                api.as_str().into(),
+                Arc::new(RecordingFactory(calls.clone())),
+            );
+        }
+        let mut runtimes = Vec::new();
+        for (api, token) in [
+            (Api::OpenaiCompletions, "completions-token"),
+            (Api::OpenaiResponses, "responses-token"),
+        ] {
+            let mut model = Model::new(
+                "same-model",
+                "Same model",
+                api.clone(),
+                "deepseek",
+                &format!("https://configured.example/{}", api.as_str()),
+            );
+            model.headers = Some(BTreeMap::from([("x-route".into(), token.into())]));
+            runtimes.push(
+                factories
+                    .configure(
+                        "deepseek",
+                        &api,
+                        vec![model],
+                        RequestAuth::ApiKey(token.into()),
+                        &settings::Settings::default(),
+                    )
+                    .unwrap()
+                    .0,
+            );
+        }
+        let providers = combine_provider_runtimes(runtimes);
+        assert_eq!(providers.len(), 1);
+        let provider = &providers[0];
+        assert_eq!(provider.models().len(), 2);
+        assert!(provider
+            .models()
+            .iter()
+            .all(|model| model.headers.is_none()));
+        // This is the same ID-only lookup used by the harness after /provider.
+        for model in provider.models() {
+            let selected = providers
+                .iter()
+                .find(|provider| provider.id() == model.provider)
+                .unwrap();
+            let mut requested = model.clone();
+            requested.id = requested.id.to_uppercase();
+            requested.base_url = "https://untrusted.example".into();
+            selected
+                .stream_simple(
+                    &requested,
+                    &Context::new(vec![]),
+                    &SimpleStreamOptions::default(),
+                )
+                .await
+                .result()
+                .await
+                .unwrap();
+        }
+        let recorded = calls.lock().unwrap();
+        assert_eq!(recorded.len(), 2);
+        for (call, (api, token)) in recorded.iter().zip([
+            (Api::OpenaiCompletions, "completions-token"),
+            (Api::OpenaiResponses, "responses-token"),
+        ]) {
+            assert_eq!(call.0.api, api);
+            assert_eq!(
+                call.0.base_url,
+                format!("https://configured.example/{}", api.as_str())
+            );
+            assert_eq!(call.0.headers.as_ref().unwrap()["x-route"], token);
+            assert_eq!(call.1.api_key.as_deref(), Some(token));
+        }
+        drop(recorded);
+        for (provider_id, api, id) in [
+            ("other", Api::OpenaiCompletions, "same-model"),
+            ("deepseek", Api::AnthropicMessages, "same-model"),
+            ("deepseek", Api::OpenaiResponses, "unknown-model"),
+        ] {
+            let requested = Model::new(id, id, api, provider_id, "https://untrusted.example");
+            let result = provider
+                .stream_simple(
+                    &requested,
+                    &Context::new(vec![]),
+                    &SimpleStreamOptions::default(),
+                )
+                .await
+                .result()
+                .await
+                .unwrap();
+            assert_eq!(result.stop_reason, StopReason::Error);
+        }
+        assert_eq!(calls.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn extension_factory_only_handles_its_registered_wire_api() {
+        let extension_calls = Calls::default();
+        let protocol_calls = Calls::default();
+        let mut factories = RuntimeFactories::default();
+        factories.providers.insert(
+            "deepseek".into(),
+            Arc::new(RecordingFactory(extension_calls.clone())),
+        );
+        factories
+            .provider_apis
+            .insert("deepseek".into(), "openai-completions".into());
+        factories.protocols.insert(
+            "openai-responses".into(),
+            Arc::new(RecordingFactory(protocol_calls.clone())),
+        );
+        for api in [Api::OpenaiCompletions, Api::OpenaiResponses] {
+            let model = Model::new(
+                "same-model",
+                "Same model",
+                api.clone(),
+                "deepseek",
+                "https://configured.example/v1",
+            );
+            let (provider, _) = factories
+                .configure(
+                    "deepseek",
+                    &api,
+                    vec![model],
+                    RequestAuth::None,
+                    &settings::Settings::default(),
+                )
+                .unwrap();
+            provider
+                .stream_simple(
+                    &provider.models()[0],
+                    &Context::new(vec![]),
+                    &SimpleStreamOptions::default(),
+                )
+                .await
+                .result()
+                .await
+                .unwrap();
+        }
+        assert_eq!(extension_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            extension_calls.lock().unwrap()[0].0.api,
+            Api::OpenaiCompletions
+        );
+        assert_eq!(protocol_calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            protocol_calls.lock().unwrap()[0].0.api,
+            Api::OpenaiResponses
+        );
     }
 
     #[tokio::test]

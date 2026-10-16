@@ -653,6 +653,9 @@ fn start_user_bash(ctx: &CommandContext, command: &str, exclude_from_context: bo
 /// main async loop.
 enum TuiMessage {
     UserInput(String, Vec<rpi_ai::types::ImageContent>),
+    /// Provider changes are serialized with prompts, after the current run.
+    SwitchProvider(String),
+    OpenProviderSelector,
     OpenTree,
     NavigateTree(String),
     Exit,
@@ -2716,6 +2719,34 @@ pub async fn interactive_tui(
             break;
         }
         match rx.recv().await {
+            Some(TuiMessage::OpenProviderSelector) => {
+                let current = lane.get_model().await.ok();
+                open_provider_selector(
+                    &state,
+                    &editor_container,
+                    &editor,
+                    &tui,
+                    &ctx.reload_context.extension_session,
+                    &ctx.tx,
+                    current.as_ref().map(|model| model.provider.as_str()),
+                );
+            }
+            Some(TuiMessage::SwitchProvider(input)) => {
+                let manifests = current_provider_manifests(&ctx.reload_context.extension_session);
+                let available = ctx
+                    .model_catalog
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                match switch_provider(&input, &manifests, &available, &lane).await {
+                    Ok((model, note)) => {
+                        state.set_current_model(&model);
+                        add_note_message(&chat_container, &note);
+                    }
+                    Err(error) => add_error_message(&chat_container, &error),
+                }
+                tui.request_render(false);
+            }
             Some(TuiMessage::UserInput(prompt, prompt_images)) => {
                 // Clear the editor so the next prompt starts fresh (the submit
                 // handler runs on the blocking key thread and can't mutate the

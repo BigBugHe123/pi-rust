@@ -515,7 +515,8 @@ OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负�
 
 `auth check`、`/provider` 与实际请求使用同一认证解析。`auth check` 只检查本地状态，
 不访问服务端或刷新 token；退出码为就绪 0、缺少凭据 1、配置错误 2。
-`/provider` 保存默认值后重启生效，`/model` 切换当前会话；`/provider remove` 删除配置，
+`/provider <id>` 与列表选择会即时切换当前会话并保存默认模型；缺少认证或切换失败时
+保留原会话与默认值。`/model` 选择具体模型；`/provider remove` 删除配置，
 卸载 package 使用 `rpi package unlink`。API-key logout 不会清除环境变量或 models.json。
 
 涉及 provider package 的 `/reload` 会重新绑定 runtime、凭据、端点与公开目录；

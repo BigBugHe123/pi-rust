@@ -2028,10 +2028,33 @@ fn with_isolated_config_dir<T>(body: impl FnOnce() -> T) -> T {
     result
 }
 
+// Existing catalog/persistence cases use a real lane and an explicitly supplied
+// available catalog. Separate cases below exercise missing auth and lane failure.
+fn switch_provider_for_test(
+    input: &str,
+    manifests: &[rpi_extensions::ProviderManifest],
+) -> Result<String, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let harness = AgentHarness::create(Default::default()).await.unwrap();
+            let lane = harness.lane("main");
+            let available = crate::provider::catalog_with_manifests(manifests).unwrap();
+            let result = switch_provider(input, manifests, &available, &lane).await;
+            if let Ok((model, _)) = &result {
+                assert_eq!(lane.get_model().await.unwrap(), *model);
+            }
+            harness.close().await.unwrap();
+            result.map(|(_, note)| note)
+        })
+}
+
 #[test]
 fn provider_selector_items_cover_builtin_providers() {
     with_isolated_config_dir(|| {
-        let items = provider_selector_items(&[]);
+        let items = provider_selector_items(&[], None);
         let ids: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
         assert!(
             ids.contains(&"anthropic"),
@@ -2054,7 +2077,7 @@ fn provider_selector_items_cover_builtin_providers() {
 #[test]
 fn set_default_provider_persists_provider_and_a_matching_model() {
     with_isolated_config_dir(|| {
-        let note = set_default_provider("openai", &[]).unwrap();
+        let note = switch_provider_for_test("openai", &[]).unwrap();
         assert!(
             note.contains("openai"),
             "note should name the provider: {note}"
@@ -2068,7 +2091,89 @@ fn set_default_provider_persists_provider_and_a_matching_model() {
         );
 
         // Unknown provider → error, and nothing is persisted.
-        assert!(set_default_provider("does-not-exist", &[]).is_err());
+        assert!(switch_provider_for_test("does-not-exist", &[]).is_err());
+    });
+}
+
+#[test]
+fn provider_switch_applies_live_and_keeps_configured_protocol_for_duplicate_model_ids() {
+    with_isolated_config_dir(|| {
+        let cfg = serde_json::from_value(serde_json::json!({"providers":{"deepseek":{
+            "api":"openai-responses", "baseUrl":"http://fixture.invalid/v1", "apiKey":"fixture",
+            "models":[{"id":"deepseek-flash"}]
+        }}}))
+        .unwrap();
+        crate::config::save_models_config(&cfg).unwrap();
+        let manifest = command_package_manifest("deepseek", "deepseek-flash", true);
+        let response_model = crate::provider::catalog_with_manifests(&[manifest.clone()])
+            .unwrap()
+            .into_iter()
+            .find(|model| model.provider == "deepseek" && model.api == rpi_ai::Api::OpenaiResponses)
+            .unwrap();
+        let available = vec![manifest.models[0].clone(), response_model];
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let lane = harness.lane("main");
+                let (model, note) = switch_provider("DEEPSEEK", &[manifest], &available, &lane)
+                    .await
+                    .unwrap();
+                assert_eq!(model.provider, "deepseek");
+                assert_eq!(model.api, rpi_ai::Api::OpenaiResponses);
+                assert_eq!(lane.get_model().await.unwrap(), model);
+                assert!(
+                    note.contains("Provider switched to deepseek") && !note.contains("restart")
+                );
+                let saved = crate::settings::load_settings().unwrap();
+                assert_eq!(saved.default_provider.as_deref(), Some("deepseek"));
+                assert_eq!(saved.default_model.as_deref(), Some("deepseek-flash"));
+                // A known but unavailable provider and an unknown id preserve the lane/default.
+                for id in ["openai", "unknown-provider"] {
+                    assert!(switch_provider(id, &[], &[], &lane).await.is_err());
+                    assert_eq!(lane.get_model().await.unwrap(), model);
+                    assert_eq!(
+                        crate::settings::load_settings().unwrap().default_provider,
+                        saved.default_provider
+                    );
+                }
+                harness.close().await.unwrap();
+                assert!(switch_provider("deepseek", &[], &available, &lane)
+                    .await
+                    .is_err());
+                assert_eq!(
+                    crate::settings::load_settings().unwrap().default_provider,
+                    saved.default_provider
+                );
+            });
+    });
+}
+
+#[test]
+fn provider_selector_marks_the_live_provider_instead_of_the_saved_default() {
+    with_isolated_config_dir(|| {
+        let mut settings = crate::settings::Settings::default();
+        settings.default_provider = Some("anthropic".into());
+        crate::settings::save_settings(&settings).unwrap();
+        let items = provider_selector_items(&[], Some("openai"));
+        assert!(items
+            .iter()
+            .find(|item| item.value == "openai")
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("(current)"));
+        assert!(!items
+            .iter()
+            .find(|item| item.value == "anthropic")
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("(current)"));
     });
 }
 
@@ -2101,7 +2206,7 @@ fn provider_commands_include_packages_without_keys_and_save_their_model_identity
             router,
             command_package_manifest("llama-cpp", "local", false),
         ];
-        let items = provider_selector_items(&manifests);
+        let items = provider_selector_items(&manifests, None);
         let router = items
             .iter()
             .find(|item| item.value == "openrouter")
@@ -2114,18 +2219,18 @@ fn provider_commands_include_packages_without_keys_and_save_their_model_identity
             .contains("未配置 key"));
         let local = items.iter().find(|item| item.value == "llama-cpp").unwrap();
         assert!(local.description.as_deref().unwrap().contains("无需 key"));
-        set_default_provider("OPENROUTER", &manifests).unwrap();
+        switch_provider_for_test("OPENROUTER", &manifests).unwrap();
         let saved = crate::settings::load_settings().unwrap();
         assert_eq!(saved.default_provider.as_deref(), Some("openrouter"));
         assert_eq!(saved.default_model.as_deref(), Some("openrouter/auto"));
 
         // After unload, stale provider selections fail without replacing settings.
-        assert!(set_default_provider("openrouter", &[]).is_err());
+        assert!(switch_provider_for_test("openrouter", &[]).is_err());
         assert_eq!(
             crate::settings::load_settings().unwrap().default_provider,
             saved.default_provider
         );
-        assert!(!provider_selector_items(&[])
+        assert!(!provider_selector_items(&[], None)
             .iter()
             .any(|item| item.value == "openrouter"));
     });
@@ -2151,13 +2256,13 @@ fn provider_commands_respect_package_model_overrides_and_config_removal() {
         assert_eq!(models.len(), 1);
         assert_eq!(models[0].name, "Override");
         assert_eq!(models[0].base_url, "http://override.example/v1");
-        set_default_provider("openrouter", &manifests).unwrap();
+        switch_provider_for_test("openrouter", &manifests).unwrap();
         remove_provider("openrouter").unwrap();
         // Removing models.json configuration leaves the installed package available.
-        assert!(provider_selector_items(&manifests)
+        assert!(provider_selector_items(&manifests, None)
             .iter()
             .any(|item| item.value == "openrouter"));
-        set_default_provider("openrouter", &manifests).unwrap();
+        switch_provider_for_test("openrouter", &manifests).unwrap();
     });
 }
 
@@ -2184,7 +2289,7 @@ fn provider_package_key_status_uses_its_declared_environment() {
         let manifest = command_package_manifest("openrouter", "openrouter/auto", true);
         let previous = std::env::var_os("RPI_TEST_PROVIDER_COMMAND_KEY");
         std::env::set_var("RPI_TEST_PROVIDER_COMMAND_KEY", "package-key");
-        let items = provider_selector_items(&[manifest]);
+        let items = provider_selector_items(&[manifest], None);
         match previous {
             Some(value) => std::env::set_var("RPI_TEST_PROVIDER_COMMAND_KEY", value),
             None => std::env::remove_var("RPI_TEST_PROVIDER_COMMAND_KEY"),
