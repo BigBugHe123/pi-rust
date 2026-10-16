@@ -71,12 +71,17 @@ serde_json::json!({
 启动顺序是：加载扩展一次 → 收集 package 目录和 runtime factories → 合并用户模型配置 →
 按 provider id 解析凭据 → 选择模型并绑定 runtime → 创建 harness。
 `--list-models` 可在无凭据时显示 package 模型；`--no-extensions` 禁用这些声明和实现。
+TUI 的 `/provider` 同样显示已加载的 package、模型数和认证状态，未配置 key 的 package 也可选为默认。
+`/provider <id>` 保存默认 provider 和匹配的模型，重启后生效；`/model` 仍用于当前会话切换。
+`/provider remove <id>` 只移除 `models.json` 配置，不卸载 package；卸载使用 `rpi package unlink <name>`。
+`/model openrouter/auto` 和完整的 `openrouter/openrouter/auto` 均可定位该模型，跨 provider 重名时需完整限定。
 扩展目录仍遵守项目信任、`--project-only` 和显式扩展路径规则。
 
 凭据顺序保持 `--api-key`（仅选中的 provider）→ `auth.json` → `models.json` → provider 自己的环境变量。
 匿名运行必须由 package 明确声明，OpenAI 默认认证检查不会因此放宽，其他 package 不会继承 `OPENAI_API_KEY`。
 
 `/reload` 重新绑定 fresh plugin runtime、认证后的目录和当前模型，同时更新 `/model` 选择器和插件的 `set_model`。
+`/provider` 每次打开时读取重载后的 package 声明。
 如果当前模型所属的 package 消失或无法重新解析，reload 返回错误并保留原会话，先切换模型再移除该 package。
 取消立即结束宿主请求；插件桥接会取消自己的网络任务，DLL 引用保持到同步请求真正退出。
 

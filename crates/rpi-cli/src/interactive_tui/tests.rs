@@ -2031,7 +2031,7 @@ fn with_isolated_config_dir<T>(body: impl FnOnce() -> T) -> T {
 #[test]
 fn provider_selector_items_cover_builtin_providers() {
     with_isolated_config_dir(|| {
-        let items = provider_selector_items();
+        let items = provider_selector_items(&[]);
         let ids: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
         assert!(
             ids.contains(&"anthropic"),
@@ -2054,7 +2054,7 @@ fn provider_selector_items_cover_builtin_providers() {
 #[test]
 fn set_default_provider_persists_provider_and_a_matching_model() {
     with_isolated_config_dir(|| {
-        let note = set_default_provider("openai").unwrap();
+        let note = set_default_provider("openai", &[]).unwrap();
         assert!(
             note.contains("openai"),
             "note should name the provider: {note}"
@@ -2068,8 +2068,151 @@ fn set_default_provider_persists_provider_and_a_matching_model() {
         );
 
         // Unknown provider → error, and nothing is persisted.
-        assert!(set_default_provider("does-not-exist").is_err());
+        assert!(set_default_provider("does-not-exist", &[]).is_err());
     });
+}
+
+fn command_package_manifest(
+    id: &str,
+    model: &str,
+    requires_auth: bool,
+) -> rpi_extensions::ProviderManifest {
+    rpi_extensions::ProviderManifest {
+        id: id.into(),
+        models: vec![rpi_ai::Model::new(
+            model,
+            model,
+            rpi_ai::Api::OpenaiCompletions,
+            id,
+            "http://localhost:8080/v1",
+        )],
+        api_key_env: Some("RPI_TEST_PROVIDER_COMMAND_KEY".into()),
+        requires_auth,
+    }
+}
+
+#[test]
+fn provider_commands_include_packages_without_keys_and_save_their_model_identity() {
+    with_isolated_config_dir(|| {
+        let mut router = command_package_manifest("openrouter", "openrouter/auto", true);
+        // An absent variable is deterministic and cannot inherit an OpenAI key.
+        router.api_key_env = None;
+        let manifests = vec![
+            router,
+            command_package_manifest("llama-cpp", "local", false),
+        ];
+        let items = provider_selector_items(&manifests);
+        let router = items
+            .iter()
+            .find(|item| item.value == "openrouter")
+            .unwrap();
+        assert!(router.description.as_deref().unwrap().contains("package"));
+        assert!(router
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("未配置 key"));
+        let local = items.iter().find(|item| item.value == "llama-cpp").unwrap();
+        assert!(local.description.as_deref().unwrap().contains("无需 key"));
+        set_default_provider("OPENROUTER", &manifests).unwrap();
+        let saved = crate::settings::load_settings().unwrap();
+        assert_eq!(saved.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(saved.default_model.as_deref(), Some("openrouter/auto"));
+
+        // After unload, stale provider selections fail without replacing settings.
+        assert!(set_default_provider("openrouter", &[]).is_err());
+        assert_eq!(
+            crate::settings::load_settings().unwrap().default_provider,
+            saved.default_provider
+        );
+        assert!(!provider_selector_items(&[])
+            .iter()
+            .any(|item| item.value == "openrouter"));
+    });
+}
+
+#[test]
+fn provider_commands_respect_package_model_overrides_and_config_removal() {
+    with_isolated_config_dir(|| {
+        let manifests = vec![command_package_manifest(
+            "openrouter",
+            "openrouter/auto",
+            true,
+        )];
+        let cfg = serde_json::from_value(serde_json::json!({"providers": {"openrouter": {
+            "baseUrl": "http://override.example/v1", "models": [{"id": "openrouter/auto", "name": "Override"}]
+        }}})).unwrap();
+        crate::config::save_models_config(&cfg).unwrap();
+        let catalog = crate::provider::catalog_with_manifests(&manifests).unwrap();
+        let models: Vec<_> = catalog
+            .iter()
+            .filter(|model| model.provider == "openrouter")
+            .collect();
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].name, "Override");
+        assert_eq!(models[0].base_url, "http://override.example/v1");
+        set_default_provider("openrouter", &manifests).unwrap();
+        remove_provider("openrouter").unwrap();
+        // Removing models.json configuration leaves the installed package available.
+        assert!(provider_selector_items(&manifests)
+            .iter()
+            .any(|item| item.value == "openrouter"));
+        set_default_provider("openrouter", &manifests).unwrap();
+    });
+}
+
+#[test]
+fn provider_package_key_status_uses_its_declared_environment() {
+    with_isolated_config_dir(|| {
+        let manifest = command_package_manifest("openrouter", "openrouter/auto", true);
+        let previous = std::env::var_os("RPI_TEST_PROVIDER_COMMAND_KEY");
+        std::env::set_var("RPI_TEST_PROVIDER_COMMAND_KEY", "package-key");
+        let items = provider_selector_items(&[manifest]);
+        match previous {
+            Some(value) => std::env::set_var("RPI_TEST_PROVIDER_COMMAND_KEY", value),
+            None => std::env::remove_var("RPI_TEST_PROVIDER_COMMAND_KEY"),
+        }
+        let router = items
+            .iter()
+            .find(|item| item.value == "openrouter")
+            .unwrap();
+        assert!(router
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("已配置 key"));
+    });
+}
+
+#[test]
+fn model_selector_accepts_package_ids_with_slashes_without_hiding_ambiguity() {
+    let router = command_package_manifest("openrouter", "openrouter/auto", true)
+        .models
+        .remove(0);
+    assert_eq!(
+        find_model_selector_match(&[router.clone()], "openrouter/auto")
+            .unwrap()
+            .id,
+        "openrouter/auto"
+    );
+    assert_eq!(
+        find_model_selector_match(&[router.clone()], "openrouter/openrouter/auto")
+            .unwrap()
+            .id,
+        "openrouter/auto"
+    );
+    let mut other = router.clone();
+    other.provider = "another-router".into();
+    assert!(find_model_selector_match(&[router.clone(), other], "openrouter/auto").is_none());
+    let qualified = command_package_manifest("openrouter", "auto", true)
+        .models
+        .remove(0);
+    assert_eq!(
+        find_model_selector_match(&[router, qualified], "openrouter/auto")
+            .unwrap()
+            .id,
+        "auto"
+    );
 }
 
 #[test]

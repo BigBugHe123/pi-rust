@@ -11,7 +11,7 @@ pub(super) struct RuntimeFactories {
 
 impl RuntimeFactories {
     pub fn from_session(session: &ExtensionSession) -> Self {
-        let Some(snapshot) = session.snapshot() else {
+        let Some(_) = session.snapshot() else {
             return Self::default();
         };
         let providers = rpi_extensions::PluggableProvider::from_session(
@@ -21,11 +21,7 @@ impl RuntimeFactories {
         .into_iter()
         .map(|provider| (provider.id().to_string(), provider))
         .collect();
-        let manifests = snapshot
-            .providers()
-            .iter()
-            .filter_map(|provider| snapshot.provider_manifest(&provider.provider_id).cloned())
-            .collect();
+        let manifests = manifests_from_session(session);
         Self {
             providers,
             manifests,

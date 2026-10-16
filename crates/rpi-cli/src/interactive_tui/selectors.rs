@@ -519,8 +519,9 @@ pub(super) fn open_provider_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
+    extension_session: &crate::session::ExtensionSessionCell,
 ) {
-    let mut items = provider_selector_items();
+    let mut items = provider_selector_items(&current_provider_manifests(extension_session));
     if items.is_empty() {
         add_note_message(
             &state.chat_container,
@@ -536,7 +537,7 @@ pub(super) fn open_provider_selector(
             .with_search_text("add new provider"),
     );
     items.push(
-        SelectItem::new(REMOVE_PROVIDER_VALUE, "− Remove provider")
+        SelectItem::new(REMOVE_PROVIDER_VALUE, "− Remove provider configuration")
             .with_description("Delete a models.json provider")
             .with_search_text("remove delete provider"),
     );
@@ -547,6 +548,7 @@ pub(super) fn open_provider_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = state.chat_container.clone();
+    let extension_session = extension_session.clone();
     list.on_select(Arc::new(move |item| {
         if item.value == ADD_PROVIDER_VALUE {
             close_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
@@ -558,7 +560,7 @@ pub(super) fn open_provider_selector(
             open_provider_remove_selector(&state_sel, &ec_sel, &editor_sel, &tui_sel);
             return;
         }
-        match set_default_provider(&item.value) {
+        match set_default_provider(&item.value, &current_provider_manifests(&extension_session)) {
             Ok(note) => add_note_message(&chat_sel, &note),
             Err(error) => add_error_message(&chat_sel, &error),
         }

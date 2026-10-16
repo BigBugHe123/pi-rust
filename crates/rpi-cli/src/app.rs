@@ -655,26 +655,14 @@ async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
             return EXIT_RUNTIME;
         }
     };
-    let mut catalog = match crate::provider::catalog_all() {
+    let manifests = crate::provider::manifests_from_session(&prepared.extension_session);
+    let catalog = match crate::provider::catalog_with_manifests(&manifests) {
         Ok(models) => models,
         Err(error) => {
             eprintln!("warning: could not load models.json: {error}");
             Vec::new()
         }
     };
-    for provider in rpi_extensions::PluggableProvider::from_session(
-        &prepared.extension_session,
-        tokio::runtime::Handle::current(),
-    ) {
-        for model in provider.models() {
-            if !catalog
-                .iter()
-                .any(|known| known.provider == model.provider && known.id == model.id)
-            {
-                catalog.push(model.clone());
-            }
-        }
-    }
     let needle = search.trim().to_ascii_lowercase();
     let mut models: Vec<_> = catalog
         .into_iter()

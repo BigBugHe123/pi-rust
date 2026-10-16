@@ -282,6 +282,15 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
             .unwrap()
             .iter()
             .any(|model| model.id == "second"));
+        // `/provider` reads the current session declarations and combines them
+        // with models.json without requiring a provider runtime or credentials.
+        let manifests =
+            rpi_cli::provider::manifests_from_session(&context.extension_session.lock().unwrap());
+        let discovery = rpi_cli::provider::catalog_with_manifests(&manifests).unwrap();
+        assert!(manifests.iter().any(|manifest| manifest.id == "proxy"));
+        assert!(discovery.iter().any(|model| model.provider == "proxy"
+            && model.id == "second"
+            && model.base_url == "http://localhost:9012/v1"));
         let model = harness.lane("main").get_model().await.unwrap();
         assert_eq!(model.base_url, "http://localhost:9012/v1");
         let provider = context

@@ -597,16 +597,33 @@ pub(super) fn find_model_selector_match(
     });
     match (matches.next(), matches.next()) {
         (Some(model), None) => Some(model.clone()),
+        (None, None) if provider.is_some() => {
+            let mut bare = catalog
+                .iter()
+                .filter(|model| model.id.eq_ignore_ascii_case(input));
+            match (bare.next(), bare.next()) {
+                (Some(model), None) => Some(model.clone()),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
 
-/// Build `/provider` selector items: every provider present in the merged
-/// catalog (built-in + models.json), labelled with its model count, origin
-/// (built-in vs configured), wire protocol, and whether a key is configured.
-/// Catalog order (provider id) keeps this deterministic.
-pub(super) fn provider_selector_items() -> Vec<SelectItem> {
-    let catalog = crate::provider::catalog_all().unwrap_or_default();
+/// Read declarations from the live session so `/reload` updates `/provider` too.
+pub(super) fn current_provider_manifests(
+    session: &crate::session::ExtensionSessionCell,
+) -> Vec<rpi_extensions::ProviderManifest> {
+    let session = session.lock().unwrap_or_else(|error| error.into_inner());
+    crate::provider::manifests_from_session(&session)
+}
+
+/// Build `/provider` rows from the full catalog, including packages without
+/// credentials. Label each with its model count, origin, protocol and key policy.
+pub(super) fn provider_selector_items(
+    manifests: &[rpi_extensions::ProviderManifest],
+) -> Vec<SelectItem> {
+    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
     let models_cfg = crate::config::load_models_config().unwrap_or_default();
     let auth = crate::config::read_auth().unwrap_or_default();
     let current = crate::settings::load_settings()
@@ -631,8 +648,11 @@ pub(super) fn provider_selector_items() -> Vec<SelectItem> {
             } else {
                 ""
             };
-            let (origin, protocol) = provider_origin_protocol(&id, &models_cfg);
-            let key_status = if provider_has_key(&id, &models_cfg, &auth) {
+            let manifest = manifests.iter().find(|manifest| manifest.id == id);
+            let (origin, protocol) = provider_origin_protocol(&id, &models_cfg, manifest);
+            let key_status = if manifest.is_some_and(|manifest| !manifest.requires_auth) {
+                "无需 key"
+            } else if provider_has_key(&id, &models_cfg, &auth, manifest) {
                 "已配置 key"
             } else {
                 "未配置 key"
@@ -669,7 +689,21 @@ pub(super) fn removable_provider_items() -> Vec<SelectItem> {
 fn provider_origin_protocol(
     id: &str,
     cfg: &crate::config::ModelsConfig,
+    manifest: Option<&rpi_extensions::ProviderManifest>,
 ) -> (&'static str, &'static str) {
+    if let Some(manifest) = manifest {
+        let api = cfg
+            .providers
+            .get(id)
+            .and_then(|provider| provider.api.as_deref())
+            .or_else(|| manifest.models.first().map(|model| model.api.as_str()));
+        let protocol = match api {
+            Some("anthropic-messages") => "Anthropic 兼容",
+            Some("openai-completions" | "openai-responses") => "OpenAI 兼容",
+            _ => "自定义协议",
+        };
+        return ("package", protocol);
+    }
     match id.to_ascii_lowercase().as_str() {
         "anthropic" => ("内置", "Anthropic"),
         "openai" => ("内置", "OpenAI"),
@@ -695,9 +729,17 @@ fn provider_has_key(
     id: &str,
     cfg: &crate::config::ModelsConfig,
     auth: &crate::config::AuthStore,
+    manifest: Option<&rpi_extensions::ProviderManifest>,
 ) -> bool {
-    if auth.contains_key(id) {
-        return true;
+    if let Some(crate::config::Credential::ApiKey {
+        key: Some(key),
+        env,
+    }) = auth.get(id)
+    {
+        if crate::config::resolve_config_value(key, env.as_ref()).is_some_and(|key| !key.is_empty())
+        {
+            return true;
+        }
     }
     if let Some(provider_cfg) = cfg.providers.get(id) {
         if let Some(raw) = provider_cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
@@ -708,6 +750,13 @@ fn provider_has_key(
                 return true;
             }
         }
+    }
+    if let Some(manifest) = manifest {
+        return manifest
+            .api_key_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .is_some_and(|key| !key.is_empty());
     }
     match id.to_ascii_lowercase().as_str() {
         "anthropic" => std::env::var("ANTHROPIC_API_KEY")
@@ -723,8 +772,12 @@ fn provider_has_key(
 /// Persist the default provider (and, when the current saved model does not
 /// belong to it, a matching default model) so the next launch resolves to that
 /// provider. Returns a note describing what was saved.
-pub(super) fn set_default_provider(input: &str) -> Result<String, String> {
-    let catalog = crate::provider::catalog_all().map_err(|error| error.to_string())?;
+pub(super) fn set_default_provider(
+    input: &str,
+    manifests: &[rpi_extensions::ProviderManifest],
+) -> Result<String, String> {
+    let catalog =
+        crate::provider::catalog_with_manifests(manifests).map_err(|error| error.to_string())?;
     let provider_id = canonicalize_provider_input(input, &catalog)?;
 
     let mut settings = crate::settings::load_settings().unwrap_or_default();
@@ -1082,7 +1135,7 @@ pub(super) fn remove_provider(input: &str) -> Result<String, String> {
     let id = input.trim();
     if cfg.providers.shift_remove(id).is_none() {
         return Err(format!(
-            "Unknown or built-in provider \"{id}\". Only providers defined in models.json can be removed."
+            "Provider \"{id}\" has no models.json configuration to remove. To remove an installed package, use rpi package unlink <name>."
         ));
     }
     crate::config::save_models_config(&cfg).map_err(|error| error.to_string())?;
@@ -1095,7 +1148,7 @@ pub(super) fn remove_provider(input: &str) -> Result<String, String> {
         settings.default_model = None;
         let _ = crate::settings::save_settings(&settings);
     }
-    Ok(format!("Removed provider \"{id}\" — restart rpi to apply."))
+    Ok(format!("Removed models.json configuration for provider \"{id}\" — restart rpi to apply. Installed provider packages remain available; use rpi package unlink to remove a package."))
 }
 
 /// Write the completed form into `models.json` as a new provider with one

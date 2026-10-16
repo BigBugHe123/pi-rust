@@ -196,14 +196,23 @@ impl SlashCommand for ProviderCommand {
             return;
         }
         if !term.is_empty() {
-            match set_default_provider(term) {
+            match set_default_provider(
+                term,
+                &current_provider_manifests(&ctx.reload_context.extension_session),
+            ) {
                 Ok(note) => add_note_message(&ctx.chat, &note),
                 Err(error) => add_error_message(&ctx.chat, &error),
             }
             ctx.tui.request_render(false);
             return;
         }
-        open_provider_selector(&ctx.state, &ctx.editor_container, &ctx.editor, &ctx.tui);
+        open_provider_selector(
+            &ctx.state,
+            &ctx.editor_container,
+            &ctx.editor,
+            &ctx.tui,
+            &ctx.reload_context.extension_session,
+        );
     }
 }
 
