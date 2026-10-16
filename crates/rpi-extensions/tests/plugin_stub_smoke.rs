@@ -573,6 +573,14 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
         1,
         "exactly one terminal event: {cancel_tags:?}"
     );
+    // The aborted terminal is delivered before the blocking plugin must finish.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while stub_cancel_observed(&stub_path) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the plugin eventually observes the cancellation latch");
     assert!(
         stub_cancel_observed(&stub_path) == 1,
         "the plugin must have observed the cancellation through its control surface"

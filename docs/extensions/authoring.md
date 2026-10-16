@@ -60,7 +60,8 @@ serde_json = "1"
 
 宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
 通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
-SDK 在注册前检查 `abi_version` 和 `struct_size`；不兼容时返回非零状态，宿主报告加载失败。
+SDK 在注册前检查 `abi_version` 和 `struct_size`；旧宿主缺少的尾部可选槽位补成
+`None`，插件可据此降级。版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
 
 ```rust
 rpi_plugin_sdk::export_plugin!(|api| {
@@ -217,8 +218,8 @@ if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) 
 ```
 
 - `is_cancelled(user_data, chunk_kind)` 非阻塞轮询：`Content`（0）是模型输出，
-  `Structural`（1）是 `start`/`*_end`/`usage` 这类收尾帧。取消后宿主只接受结构帧、
-  拒收内容帧，所以插件能把已展示的消息收尾。
+  `Structural`（1）是 `start`/`*_end`/`usage` 这类收尾帧。取消后宿主确认结构帧、
+  拒收内容帧；已发出终态后的收尾帧会被丢弃，不再更新已结束的消息。
 - `wait_cancelled_ms(user_data, timeout_ms)` 是阻塞版，供无法轮询的循环使用；
   已取消时立即返回，不会睡满超时。
 
@@ -226,6 +227,9 @@ if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) 
 取消后宿主会 latch 控制面、停止转发内容 delta，并**立即**发出
 `Error { reason: Aborted }` 终态，不再等一次没人要的完整生成。`emit` 对内容帧返回
 非 0 也算同一信号。
+
+取消终态保留已经转发的内容、模型标识和用量。尚未退出的插件持有 DLL 引用直到请求
+返回；它之后写入 `out` 的成功结果不会覆盖已发出的取消终态。
 
 轮询是可选的：不轮询就照常把整段推完，宿主仍会停止转发内容帧并立刻结束该轮；轮询则
 能在最早一个可检查点退出、省掉剩余生成。`control` 为 `null`（不支持控制面的宿主）时

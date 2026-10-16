@@ -1163,15 +1163,15 @@ pub enum ProviderChunkKind {
     /// A cancelled request has no one left to deliver it to.
     Content = 0,
     /// A structural or accounting chunk (`start`, `*_start`, `*_end`, `usage`).
-    /// Still accepted while the request winds down: the host needs those to
-    /// close the message it already showed, and they are bounded in number.
+    /// Still acknowledged while the request winds down. A host that already
+    /// emitted its aborted terminal discards these cleanup chunks.
     Structural = 1,
 }
 
 /// The plugin's synchronous control surface over the host, passed to a **v2**
 /// streaming request fn.
 ///
-/// Both fields are plain fn pointers plus a `u32` at the end, so the struct is
+/// The fields are plain fn pointers plus an opaque pointer, so the struct is
 /// `Copy` and needs no deallocation. The host owns it for the duration of the
 /// request and it must not be retained.
 ///
@@ -1249,8 +1249,8 @@ pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: 
 /// - `emit` + `emit_user_data` — the host's per-chunk callback. `emit` is `None`
 ///   only if the host cannot accept chunks; a plugin then degrades to buffering
 ///   and returning the message through `out`. While the caller is cancelled the
-///   host still accepts structural chunks and rejects content chunks (nonzero
-///   rc), so a plugin can finish the message it already showed and then stop.
+///   host acknowledges structural cleanup chunks and rejects content chunks
+///   (nonzero rc). Cleanup chunks are discarded after the aborted terminal.
 /// - `control` — pointer to the host's [`ProviderStreamControl`], present on
 ///   **every** call. It is `null` only against a host that cannot describe its
 ///   control surface; a plugin then treats the request as not cancellable and
@@ -1464,8 +1464,8 @@ pub struct PluginApi {
     /// every earlier field keeps its offset — a plugin compiled against a shorter
     /// [`PluginApi`] stays valid without an ABI version bump.
     ///
-    /// Nullable: a host that predates this slot leaves it `None`; a plugin that
-    /// wants streaming but cannot find the slot should fall back to
+    /// Nullable: `register_entrypoint` fills slots absent from an older host's
+    /// vtable with `None`; a plugin that cannot find the slot should fall back to
     /// `register_provider` (one-shot) rather than refuse to load.
     ///
     /// `provider_id`/`base_url`/`api_style` mirror `register_provider` and are
@@ -1556,8 +1556,10 @@ macro_rules! export_plugin {
 ///
 /// # Safety
 ///
-/// `api` must be a valid, properly aligned pointer to a [`PluginApi`] that
-/// remains valid for the duration of `body`.
+/// `api` must point to a properly aligned, readable ABI header followed by
+/// `struct_size` readable bytes of the host's initialized vtable. It may be a
+/// shorter, older layout of [`PluginApi`]. The mandatory prefix through
+/// `user_data` must be present, and optional trailing slots must be complete.
 pub unsafe fn register_entrypoint(
     api: *const PluginApi,
     body: impl FnOnce(&PluginApi) -> i32,
@@ -1574,15 +1576,33 @@ pub unsafe fn register_entrypoint(
         // and skips loading this plugin.
         return 1;
     }
-    if (struct_size as usize) < core::mem::size_of::<PluginApi>() {
-        // Host predates a field the plugin expects; degrade gracefully.
+    let host_size = struct_size as usize;
+    let known_size = core::mem::size_of::<PluginApi>();
+    let required_size = core::mem::offset_of!(PluginApi, declare);
+    // All trailing fields are nullable function-pointer slots. Do not accept a
+    // truncated mandatory prefix or a partial function pointer.
+    if host_size < required_size
+        || (host_size < known_size
+            && (host_size - required_size) % core::mem::size_of::<*const ()>() != 0)
+    {
         return 3;
     }
-    // SAFETY: the caller keeps the correctly sized vtable live through body.
-    let api = unsafe { &*api };
+    let mut normalized = core::mem::MaybeUninit::<PluginApi>::zeroed();
+    // SAFETY: copy only bytes the host advertises and this SDK knows. The
+    // mandatory prefix contains every non-null function pointer; all missing
+    // trailing fields are Option<extern "C" fn>, whose zero representation is
+    // None. No reference to the larger PluginApi is formed over the old layout.
+    let api = unsafe {
+        core::ptr::copy_nonoverlapping(
+            api.cast::<u8>(),
+            normalized.as_mut_ptr().cast::<u8>(),
+            host_size.min(known_size),
+        );
+        normalized.assume_init()
+    };
     // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
     // the process, so convert a panic into a status code the host can report.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&api))) {
         Ok(code) => code,
         Err(_) => REGISTER_PANIC_STATUS,
     }
@@ -1992,9 +2012,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_entrypoint_version_mismatch_refuses() {
-        let api = PluginApi {
+    fn entrypoint_test_api() -> PluginApi {
+        PluginApi {
             abi_version: RPI_PLUGIN_ABI_VERSION_UNIFIED,
             struct_size: core::mem::size_of::<PluginApi>() as u32,
             free_string: test_free,
@@ -2015,7 +2034,12 @@ mod tests {
             register_before_agent_start: None,
             register_oauth_provider: None,
             register_streaming_provider: None,
-        };
+        }
+    }
+
+    #[test]
+    fn register_entrypoint_version_mismatch_refuses() {
+        let api = entrypoint_test_api();
         assert_eq!(RPI_PLUGIN_ABI_VERSION_UNIFIED, 4);
 
         // A future version is rejected by the pre-dereference check.
@@ -2038,5 +2062,80 @@ mod tests {
         let rc = unsafe { register_entrypoint(core::ptr::null(), |_| 0) };
         assert_ne!(rc, 0);
         let _ = reset_freed();
+    }
+
+    #[test]
+    fn register_entrypoint_accepts_short_vtables_without_reading_missing_slots() {
+        extern "C" fn declare(_: StbStringRef) -> i32 {
+            7
+        }
+        extern "C" fn provider(
+            _: StbStringRef,
+            _: StbStringRef,
+            _: StbStringRef,
+            _: ProviderRequestFn,
+            _: FreeStringFn,
+            _: *mut c_void,
+        ) -> i32 {
+            0
+        }
+        for size in [
+            core::mem::offset_of!(PluginApi, declare),
+            core::mem::offset_of!(PluginApi, register_before_agent_start),
+            core::mem::offset_of!(PluginApi, register_oauth_provider),
+            core::mem::offset_of!(PluginApi, register_streaming_provider),
+        ] {
+            let mut api = entrypoint_test_api();
+            api.struct_size = size as u32;
+            api.register_provider = Some(provider);
+            api.declare = Some(declare);
+            // Allocate exactly the old layout's size, with pointer alignment.
+            let mut old = vec![0usize; size / core::mem::size_of::<usize>()];
+            // SAFETY: both buffers are valid for size bytes; the old layout is
+            // a fully initialized prefix ending at a complete field boundary.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&api as *const PluginApi).cast::<u8>(),
+                    old.as_mut_ptr().cast::<u8>(),
+                    size,
+                );
+            }
+            let mut called = false;
+            let rc = unsafe {
+                register_entrypoint(old.as_ptr().cast(), |api| {
+                    called = true;
+                    assert_eq!(api.struct_size, size as u32);
+                    assert!(api.register_streaming_provider.is_none());
+                    assert!(
+                        api.register_provider.is_some(),
+                        "one-shot fallback remains available"
+                    );
+                    if size > core::mem::offset_of!(PluginApi, declare) {
+                        assert_eq!((api.declare.unwrap())(StbStringRef::from_str("{}")), 7);
+                    } else {
+                        assert!(api.declare.is_none());
+                    }
+                    0
+                })
+            };
+            assert_eq!(rc, 0);
+            assert!(
+                called,
+                "the plugin registration body must run on an older host"
+            );
+        }
+    }
+
+    #[test]
+    fn register_entrypoint_rejects_incomplete_mandatory_fields_or_slots() {
+        for size in [
+            core::mem::offset_of!(PluginApi, declare) - 1,
+            core::mem::offset_of!(PluginApi, register_streaming_provider) + 1,
+        ] {
+            let mut api = entrypoint_test_api();
+            api.struct_size = size as u32;
+            let rc = unsafe { register_entrypoint(&api, |_| panic!("incomplete ABI layout")) };
+            assert_eq!(rc, 3);
+        }
     }
 }

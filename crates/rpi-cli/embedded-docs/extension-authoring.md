@@ -60,7 +60,8 @@ serde_json = "1"
 
 宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
 通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
-SDK 在注册前检查 `abi_version` 和 `struct_size`；不兼容时返回非零状态，宿主报告加载失败。
+SDK 在注册前检查 `abi_version` 和 `struct_size`；旧宿主缺少的尾部可选槽位补成
+`None`，插件可据此降级。版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
 
 ```rust
 rpi_plugin_sdk::export_plugin!(|api| {
@@ -304,7 +305,9 @@ if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) 
 
 - `is_cancelled(user_data, chunk_kind)`：非阻塞轮询。传 `Content`（0）表示
   “模型输出”，传 `Structural`（1）表示 `start`/`*_end`/`usage` 这类收尾帧。
-  取消后宿主只接受结构帧、拒收内容帧，所以你能把已经展示出去的消息收尾。
+  取消后宿主确认结构帧、拒收内容帧；已发出终态后的收尾帧会被丢弃。
+  取消终态保留已转发的内容、模型标识和用量。插件持有 DLL 引用直到请求返回，
+  后续写入 `out` 的成功结果不会覆盖取消终态。
 - `wait_cancelled_ms(user_data, timeout_ms)`：阻塞版，供无法轮询的循环使用；
   已取消时会立即返回，不会睡满超时。
 
