@@ -2,24 +2,38 @@
 
 新增接入请遵循 [Provider 接入规范](../extensions/provider-integration.md)；本文说明当前架构与迁移行为。
 
-核心保留 Anthropic Messages、OpenAI Chat Completions / Responses、DeepSeek，以及离线测试用的 Faux。
-OpenRouter、llama.cpp 和 Proxy 的供应商配置、模型目录及专用管理功能放到独立 package。
+核心保留 Anthropic Messages、OpenAI Chat Completions / Responses，以及离线测试用的 Faux。
+DeepSeek、OpenRouter、llama.cpp 和 Proxy 的供应商配置、模型目录及专用管理功能放到独立 package。
 它们复用核心协议实现，保留流式工具调用、用量统计、重试和取消行为。
 
 ## 当前拆分
 
 | package | 能力 | 默认认证 |
 | --- | --- | --- |
+| [`rpi-provider-deepseek`](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek) | DeepSeek 模型目录、思考开关与工具续轮；位于独立 rpi-package 仓库 | `DEEPSEEK_API_KEY` |
 | `rpi-provider-openrouter` | OpenRouter 目录、请求头和 OpenAI-compatible 推理 | `OPENROUTER_API_KEY` |
 | `rpi-provider-llama-cpp` | 本地推理、健康检查、模型查询，以及 `rpi-llama` 管理程序 | 可匿名；可选 `LLAMA_CPP_API_KEY` |
 | `rpi-provider-proxy` | 自定义 OpenAI-compatible 代理 | 可匿名；可选 `PROXY_API_KEY` |
 | `rpi-provider-runtime` | package 共用的同步 ABI / 异步 Provider 桥接库 | 不解析宿主凭据 |
 
-这些 package 是 workspace 的独立成员，CLI 不依赖它们。构建默认 CLI 不会把这些适配器链接进可执行文件。
+OpenRouter、llama.cpp、Proxy 和桥接库是本仓库 workspace 的独立成员；DeepSeek 位于独立 `rpi-package` 项目。
+CLI 不依赖这些供应商 package，构建默认 CLI 不会把适配器链接进可执行文件。
 原 `rpi_ai::providers::{openrouter,llama_cpp,proxy}` 的库调用方需要改用对应的独立 crate。
-DeepSeek 和其他已有 `models.json` 网关继续可以复用 OpenAI-compatible 协议，不强制安装 package。
+已有 `models.json` 网关继续可以显式配置通用 OpenAI-compatible 协议。DeepSeek 完整的模型目录、专属环境变量与思考 / 工具续轮策略由独立 package 提供。
 
 ## 安装和配置
+
+DeepSeek 在独立 package 项目中安装（使用本分支构建的宿主）：
+
+```sh
+rpi package link deepseek --path /path/to/rpi-package/packages/rpi-provider-deepseek --debug
+rpi auth login --provider deepseek
+rpi --provider deepseek --model deepseek-flash
+```
+
+保留 `deepseek` ID，无需迁移已有 auth.json。单独设置 `DEEPSEEK_API_KEY` 只有在加载包的声明后才生效；
+不安装包时也可在 models.json 显式写 `apiKey: "$DEEPSEEK_API_KEY"`，但通用协议不会自动补上包的思考 / 工具策略。
+
 
 在本仓库根目录开发、验证：
 
@@ -93,8 +107,11 @@ factory 负责提供协议实现，不读取环境变量、不决定凭据优先
 当前 package 被移除时，重载会在切换前失败并保留旧会话，避免把同名配置静默转交给另一个协议实现。
 完整重载仍包含多个对象的更新，单一代次快照的原子切换属于后续生命周期改进。
 
-核心 `DeepSeekProvider::new` 保留现有入口，推理已委托通用 Chat Completions 流式实现，
-统一文本 / 思考事件、错误、用量和取消路径，并使用传入模型配置的端点。
+`rpi_ai::providers::deepseek::DeepSeekProvider` 已移除。Rust 调用方改用独立
+`rpi_provider_deepseek::DeepSeekProvider::new`；CLI 用户安装 package 后仍使用 `deepseek` ID，
+已有同 ID 的 auth.json / models.json 配置可以复用。package 顺序提供默认模型，核心不再保留 DeepSeek 默认项。
+通用 Chat Completions 的 `requiresReasoningContent` 兼容选项支持独立回传历史思考；DeepSeek package
+启用该能力并处理思考开关与 effort 映射，核心协议不判断 DeepSeek 身份。
 
 启动顺序是：加载扩展一次 → 收集 package 目录和 runtime factories → 合并用户模型配置 →
 按 provider id 解析凭据 → 选择模型并绑定 runtime → 创建 harness。
@@ -124,7 +141,7 @@ rpi auth check --provider openrouter --extension /path/to/provider.dll --json
 不输出凭据内容；`--no-extensions` 禁用 package 认证声明。auth 和启动使用相同的扩展发现、项目信任与显式路径规则。
 退出码为：就绪 `0`，缺少凭据 `1`，配置读取失败 `2`。API-key logout 只删除存储的 key，不清除环境变量或 models.json。
 
-核心只保留 Anthropic、OpenAI、DeepSeek 的环境变量回退和默认模型优先项。其他供应商不再隐式识别
+核心只保留 Anthropic、OpenAI 的环境变量回退和默认模型优先项。DeepSeek 等供应商不再隐式识别
 环境变量：安装带 `apiKeyEnv` 声明的 package，或在 models.json 显式填写 `apiKey: "$VENDOR_API_KEY"`。
 已有 auth.json 和显式 apiKey 配置无需迁移，package 默认模型由其目录提供。
 

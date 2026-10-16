@@ -840,7 +840,7 @@ pub fn openai_provider_api_key(provider_id: &str, cfg: &ProviderConfig) -> Optio
 /// provider's credential.
 fn native_provider_api_key_env_var(provider_id: &str) -> Option<&'static str> {
     match provider_id {
-        "openai" | "deepseek" => crate::credentials::builtin_api_key_env(provider_id),
+        "openai" => crate::credentials::builtin_api_key_env(provider_id),
         _ => None,
     }
 }
@@ -1426,11 +1426,8 @@ mod tests {
             native_provider_api_key_env_var("openai"),
             Some("OPENAI_API_KEY")
         );
-        assert_eq!(
-            native_provider_api_key_env_var("deepseek"),
-            Some("DEEPSEEK_API_KEY")
-        );
         for provider in [
+            "deepseek",
             "openrouter",
             "google",
             "groq",

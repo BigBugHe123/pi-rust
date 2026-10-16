@@ -4,7 +4,8 @@
 
 该示例使用独立的 `deepseek-extension` provider ID，通过真实 DLL / so / dylib 注册流式回调，
 复用 `rpi-provider-runtime` 的 ABI 桥接和 OpenAI-compatible SSE 解析。
-它不会替换核心的 `deepseek` provider，也不会成为默认 CLI 的依赖。
+它是 ABI 教学样例，不会成为默认 CLI 的依赖。正式 `deepseek` provider 已迁出核心，位于
+[独立 rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek)。
 
 默认模型使用 `deepseek-flash`，认证声明为 `DEEPSEEK_API_KEY`。
 模型名与 `reasoning_content` 字段参照 [DeepSeek 首次调用](https://api-docs.deepseek.com/)
@@ -57,5 +58,5 @@ cargo run -p rpi-cli -- --provider deepseek-extension --model deepseek-flash --n
 测试后可用 `rpi package unlink deepseek-extension` 卸载。
 
 这是文本 / 思考流式验证示例，交互命令明确使用 `--no-tools`。
-生产用途的 DeepSeek 思考模式工具循环还需要适配 `reasoning_content` 的多轮回传，
-详见官方思考模式文档；本示例不声明已完成该能力。
+本示例不声明完整工具循环；生产 package 已适配 `reasoning_content` 多轮回传并提供对应测试，
+详见独立 package 的 README 和官方思考模式文档。

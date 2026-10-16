@@ -2,8 +2,9 @@
 
 本文约定当前 provider package 的实现、认证与验收要求。架构背景见
 [Provider packages](../architecture/provider-packages.md)，底层 ABI 见
-[扩展开发](authoring.md)。完整可运行模板是
-[DeepSeek 扩展示例](../../examples/provider-deepseek/README.md)。
+[扩展开发](authoring.md)。生产 DeepSeek package 见
+[独立 package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-provider-deepseek)。
+本仓库保留 ABI 教学用的 [DeepSeek 扩展示例](../../examples/provider-deepseek/README.md)。
 
 ## 1. 选择接入方式
 
@@ -14,7 +15,7 @@
 | 新协议或现有协议无法表达的请求 / 响应差异 | package 实现 `rpi_ai::Provider`，经统一 ABI 接入 |
 | 浏览器登录、device-code、token 刷新或撤销 | 另外注册 OAuth provider；推理与认证是两项独立能力 |
 
-核心保留 OpenAI、Anthropic、DeepSeek 与离线测试用的 Faux。新增供应商适配默认放入
+核心保留 OpenAI、Anthropic 与离线测试用的 Faux；DeepSeek 已迁到独立 `rpi-package` 项目。新增供应商适配默认放入
 独立 package，不给 CLI 增加供应商分支或默认依赖。协议兼容不等于支持该供应商的所有
 功能；README 必须列出已验证能力和限制。
 
@@ -127,7 +128,7 @@ Provider 负责“怎样请求模型”，auth 负责“以谁的凭据请求”
 宿主按 provider ID 解析默认凭据：选中 provider 的 `--api-key` → `auth.json` 的有效 key
 或未过期 OAuth token → `models.json` 的 `apiKey` → package 声明的环境变量 → 显式允许的匿名。
 空白值、无法解析的引用与过期 token 不算可用凭据；显式认证请求头也参与就绪判断。
-只有内置 Anthropic、OpenAI、DeepSeek 保留自己的默认环境变量规则；新 provider 不会因为
+只有内置 Anthropic、OpenAI 保留自己的默认环境变量规则；DeepSeek 也通过 package 声明认证，新 provider 不会因为
 使用 `openai-completions` 而继承 `OPENAI_API_KEY`，也不会根据 ID 自动推导环境变量名。
 
 package 必须使用请求传入的 `model` 和 `options`，不得自行从环境变量或另一 provider 的
@@ -228,5 +229,5 @@ cargo test --workspace
 这些命令验证已有模板；新增 package 必须加入自身的动态库加载与协议测试，不能只跑模板。
 真实 API 测试应默认 ignored，通过环境变量注入 key 后显式运行，并限制超时、重试与用量；
 不把 key 写入代码、快照或测试输出。具体命令见 [DeepSeek 示例](../../examples/provider-deepseek/README.md)。
-该示例只验证文本 / 思考流，交互使用 `--no-tools`；DeepSeek 思考模式的完整工具循环还需要
-`reasoning_content` 多轮回传适配，不能据此宣称已支持。
+本仓库教学示例只验证文本 / 思考流，交互使用 `--no-tools`，不能据此宣称完整工具循环。
+独立生产 package 使用 `requiresReasoningContent` 保留历史思考，并提供工具续轮的动态库集成测试。

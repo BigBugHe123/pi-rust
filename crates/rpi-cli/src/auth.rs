@@ -418,7 +418,6 @@ Environment:
   ANTHROPIC_API_KEY      Fallback API key (x-api-key) when no stored credential.
   ANTHROPIC_AUTH_TOKEN   Fallback bearer token (Authorization: Bearer).
   OPENAI_API_KEY         Fallback bearer token for the built-in openai identity.
-  DEEPSEEK_API_KEY       Fallback key for the built-in deepseek identity.
   Other providers       Environment names come from installed package declarations.
 
 Notes:

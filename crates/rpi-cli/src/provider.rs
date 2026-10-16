@@ -94,11 +94,8 @@ pub const DEFAULT_MODEL_ID: &str = "claude-opus-4-8";
 
 /// Core provider defaults, checked before the first authenticated catalog entry.
 /// Other providers own their default catalog ordering through their package.
-const DEFAULT_MODELS_PER_PROVIDER: &[(&str, &str)] = &[
-    ("anthropic", DEFAULT_MODEL_ID),
-    ("openai", "gpt-5.5"),
-    ("deepseek", "deepseek-v4-pro"),
-];
+const DEFAULT_MODELS_PER_PROVIDER: &[(&str, &str)] =
+    &[("anthropic", DEFAULT_MODEL_ID), ("openai", "gpt-5.5")];
 
 /// The default thinking level when neither `--thinking` nor a `:level` suffix
 /// is present. Mirrors the TS `DEFAULT_THINKING_LEVEL` (`"medium"`, clamped to
@@ -3369,7 +3366,7 @@ mod tests {
     }
 
     #[test]
-    fn native_known_provider_default_beats_first_model_in_array() {
+    fn external_provider_uses_its_own_catalog_order_without_a_builtin_default() {
         let _env = TestEnv::new();
         std::fs::write(
             config::models_path().unwrap(),
@@ -3391,7 +3388,7 @@ mod tests {
 
         let resolved = resolve(None, None, None, None, None).unwrap();
         assert_eq!(resolved.model.provider, "deepseek");
-        assert_eq!(resolved.model.id, "deepseek-v4-pro");
+        assert_eq!(resolved.model.id, "deepseek-chat");
     }
 
     /// The `/model` selector catalog (`available_catalog`) is auth-filtered —

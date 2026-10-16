@@ -346,6 +346,18 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                 if !tool_calls.is_empty() {
                     value["tool_calls"] = Value::Array(tool_calls);
                 }
+                if compat(model).and_then(|compat| compat.requires_reasoning_content) == Some(true)
+                {
+                    let reasoning: String = message
+                        .content
+                        .iter()
+                        .filter_map(|content| match content {
+                            Content::Thinking(thinking) => Some(thinking.thinking.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    value["reasoning_content"] = Value::String(reasoning);
+                }
                 messages.push(value);
                 last_was_tool_result = false;
             }
@@ -1391,6 +1403,42 @@ mod tests {
         assert!(messages
             .iter()
             .all(|message| message["role"] != "assistant"));
+    }
+
+    #[test]
+    fn reasoning_content_replay_is_explicit_and_preserves_all_assistant_turns() {
+        let mut model = model();
+        let mut assistant =
+            AssistantMessage::empty(Api::OpenaiCompletions, "gateway", "gpt-test", 1);
+        assistant.content = vec![
+            Content::thinking("first reasoning"),
+            Content::thinking(" and continuation"),
+            Content::text("answer"),
+        ];
+        let mut plain = assistant.clone();
+        plain.content = vec![Content::text("plain answer")];
+        let ctx = Context::new(vec![
+            Message::Assistant(Box::new(assistant)),
+            Message::Assistant(Box::new(plain)),
+        ]);
+        let ordinary = build_request(&model, &ctx, &SimpleStreamOptions::default());
+        assert!(ordinary["messages"][0].get("reasoning_content").is_none());
+        assert!(!crate::model::prior_reasoning_is_replayed(&model));
+
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            OpenaiCompletionsCompat {
+                requires_reasoning_content: Some(true),
+                ..Default::default()
+            },
+        ));
+        let replayed = build_request(&model, &ctx, &SimpleStreamOptions::default());
+        assert_eq!(replayed["messages"][0]["content"], "answer");
+        assert_eq!(
+            replayed["messages"][0]["reasoning_content"],
+            "first reasoning and continuation"
+        );
+        assert_eq!(replayed["messages"][1]["reasoning_content"], "");
+        assert!(crate::model::prior_reasoning_is_replayed(&model));
     }
 
     #[test]

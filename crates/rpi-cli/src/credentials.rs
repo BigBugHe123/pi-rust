@@ -46,7 +46,6 @@ pub(crate) fn builtin_api_key_env(provider: &str) -> Option<&'static str> {
     match provider {
         "anthropic" => Some("ANTHROPIC_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
-        "deepseek" => Some("DEEPSEEK_API_KEY"),
         _ => None,
     }
 }
@@ -142,6 +141,33 @@ pub(crate) fn has_header_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepseek_environment_requires_an_explicit_package_declaration() {
+        let _guard = config::test_support::env_lock().lock().unwrap();
+        let previous = std::env::var_os("DEEPSEEK_API_KEY");
+        std::env::set_var("DEEPSEEK_API_KEY", "fixture-package-key");
+        let store = AuthStore::new();
+        let without_package = resolve("deepseek", None, &store, None);
+        let manifest = ProviderManifest {
+            id: "deepseek".into(),
+            models: vec![],
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            requires_auth: true,
+        };
+        let with_package = resolve("deepseek", None, &store, Some(&manifest));
+        match previous {
+            Some(value) => std::env::set_var("DEEPSEEK_API_KEY", value),
+            None => std::env::remove_var("DEEPSEEK_API_KEY"),
+        }
+        assert_eq!(without_package.source, CredentialSource::Missing);
+        assert!(without_package.key.is_none());
+        assert_eq!(
+            with_package.source,
+            CredentialSource::Environment("DEEPSEEK_API_KEY".into())
+        );
+        assert_eq!(with_package.key.as_deref(), Some("fixture-package-key"));
+    }
 
     #[test]
     fn package_policy_can_disable_a_builtin_environment_fallback() {
