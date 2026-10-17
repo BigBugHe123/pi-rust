@@ -196,7 +196,7 @@ pub struct PreparedExtensions {
     runtime: tokio::runtime::Handle,
     tool_context: rpi_extensions::ToolCallContext,
     action_host: Arc<crate::extensions_actions::HarnessActionHost>,
-    harness_cell: Arc<std::sync::OnceLock<Arc<AgentHarness>>>,
+    harness_cell: Arc<std::sync::OnceLock<rpi_harness::agent_harness::WeakAgentHarness>>,
     reload_mailbox: rpi_extensions::ReloadMailbox,
     ui_dialog_mailbox: rpi_extensions::UiDialogMailbox,
     ext_status_mailbox: rpi_extensions::ExtensionStatusMailbox,
@@ -1082,10 +1082,7 @@ pub async fn dispatch_session_event_async(
         (session.snapshot_arc(), session.keepalive())
     };
     match snapshot {
-        Some(snapshot) => {
-            let _keepalive = keepalive;
-            rpi_extensions::dispatch_lifecycle_event(&snapshot, tag).await
-        }
+        Some(snapshot) => rpi_extensions::dispatch_lifecycle_event(&snapshot, tag, keepalive).await,
         None => None,
     }
 }

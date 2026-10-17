@@ -5,25 +5,19 @@
 //! register trampolines — which run synchronously inside the selected register
 //! entrypoint
 //! and recover host state via the thread-local `CURRENT_HOST_API` —
-//! `runtime_action` is called **post-register**, from (a) a `spawn_blocking`
-//! pool thread mid-tool-drive, or (b) a foreign thread the plugin spawned
-//! itself. Neither has the thread-local set, and the host cannot predict which
-//! threads a plugin will call from. Thread-local is the wrong tool here.
+//! `runtime_action` is called post-register, either from a host tool driver or
+//! a foreign worker. `PluginApi::user_data` carries an opaque, non-reused handle
+//! resolved through a weak registry, never a dereferenceable bridge address.
+//! Expired registrations fail safely, including candidate reload rollback.
 //!
-//! The verified-correct recovery channel is [`PluginApi::user_data`]: it is
-//! `Send+Sync`, populated at vtable build, passed back unchanged on every call,
-//! and the SDK designates it "the host's opaque context". Today every register
-//! trampoline ignores `user_data` (the register path uses the thread-local), so
-//! repurposing `user_data` for the action bridge breaks nothing.
+//! Synchronous tool callbacks inherit a host-owned invocation via a scoped
+//! thread-local; workers forward the invocation handle and capability injected
+//! into `__rpi`. ChildAgent rejects registration-only, cancelled and child
+//! invocations. A cached registration cannot override a child's driver scope.
 //!
-//! [`ActionBridge`] holds a [`tokio::runtime::Handle`] **captured at build
-//! time** (the host is on the runtime when it constructs the bridge) — the fix
-//! for the foreign-thread case: `Handle::spawn` works from any thread, no
-//! ambient runtime needed. The real [`trampoline_runtime_action`] derefs
-//! `user_data` as `&ActionBridge`, drives the host's async dispatch on the
-//! runtime via a `std::sync::mpsc::sync_channel(1)`, and parks the plugin thread
-//! on `rx.recv()` (STD — not `tokio::oneshot`, whose `recv` needs a runtime the
-//! plugin's foreign thread lacks).
+//! [`ActionBridge`] captures a Tokio [`Handle`] at construction. Dispatch can
+//! therefore spawn from foreign threads and return over a standard synchronous
+//! channel without depending on the plugin thread having a Tokio runtime.
 //!
 //! ## Cycle-free leaf DAG
 //!
@@ -37,7 +31,26 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock, Weak};
+
+// Opaque, non-reused IDs, never addresses. A copied PluginApi may outlive its
+// registration (e.g. a failed reload); resolving it must not dereference freed memory.
+static BRIDGES: OnceLock<Mutex<HashMap<usize, Weak<ActionBridge>>>> = OnceLock::new();
+fn bridges() -> &'static Mutex<HashMap<usize, Weak<ActionBridge>>> {
+    BRIDGES.get_or_init(Mutex::default)
+}
+thread_local! {
+    static CURRENT_INVOCATION: std::cell::RefCell<Option<Arc<ActionBridge>>> = const { std::cell::RefCell::new(None) };
+}
+pub(crate) struct InvocationGuard {
+    previous: Option<Arc<ActionBridge>>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+impl Drop for InvocationGuard {
+    fn drop(&mut self) {
+        CURRENT_INVOCATION.with(|slot| *slot.borrow_mut() = self.previous.take());
+    }
+}
 
 use rpi_plugin_sdk::{RuntimeActionId, StbString, StbStringRef};
 use tokio::runtime::Handle;
@@ -364,6 +377,8 @@ impl UiDialogMailbox {
 pub trait RuntimeActionHost: Send + Sync {
     /// Refresh the host-side model selector after provider packages reload.
     fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
+    /// Invalidate child handles owned by an unloading/reloaded plugin.
+    fn cancel_child_agents(&self, _owner: u64) {}
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits
@@ -426,6 +441,23 @@ pub trait RuntimeActionHost: Send + Sync {
         Err("ask_user requires an interactive UI".to_string())
     }
 
+    /// Safe, effective runtime metadata; never serialize credential bindings.
+    async fn get_execution_context(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("execution context is not supported by this host".into())
+    }
+
+    /// Independent child lifecycle. `owner` is supplied by the bridge, NOT JSON.
+    async fn child_agent(
+        &self,
+        _owner: u64,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        Err("ChildAgent is not supported by this host".into())
+    }
+
     /// `GetSessionBranch` — current main branch entries, oldest-first.
     async fn get_session_branch(
         &self,
@@ -457,13 +489,14 @@ pub trait RuntimeActionHost: Send + Sync {
 /// handing them the NEW bridge pointer; the guard only catches the race window
 /// where an old call is still parked on `rx.recv()`.)
 ///
-/// Held behind `Arc` (pointer-stable for the bridge's lifetime via
-/// [`Arc::as_ptr`]); `rpi-cli` keeps one clone for the session lifetime so the
-/// pointer a plugin stored during register stays valid post-register. (The
-/// transient `HostApi` built per `load_one` holds a clone only during register
-/// — when it drops after `take_registry`, the master `Arc` in `rpi-cli` keeps
-/// the allocation alive.)
+/// Held behind `Arc`. FFI callers carry only an opaque registry handle; each
+/// dispatch upgrades its weak entry before accessing the bridge. A tool driver
+/// owns its invocation bridge through its last foreign callback. Failed reloads
+/// and dropped candidate sessions cannot leave dereferenceable dangling pointers.
 pub struct ActionBridge {
+    /// Some(child) only for a live host-created tool invocation.
+    invocation: Option<(bool, String, tokio_util::sync::CancellationToken)>,
+    execution_context: Option<serde_json::Value>,
     stdio: crate::StdioLifecycle,
     plugin_identity: Option<(u64, String)>,
     component_owners: Arc<std::sync::Mutex<Vec<u64>>>,
@@ -491,10 +524,64 @@ pub struct ActionBridge {
 }
 
 impl ActionBridge {
+    /// Stable opaque context, valid only while this bridge is retained.
+    pub fn user_data(self: &Arc<Self>) -> *mut c_void {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+        let mut registry = bridges().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((&id, _)) = registry
+            .iter()
+            .find(|(_, weak)| weak.as_ptr() == Arc::as_ptr(self))
+        {
+            return id as *mut c_void;
+        }
+        let id = NEXT
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("runtime handle space exhausted");
+        registry.insert(id, Arc::downgrade(self));
+        id as *mut c_void
+    }
+    pub(crate) fn resolve_handle(id: usize) -> Option<Arc<Self>> {
+        bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .and_then(Weak::upgrade)
+    }
+    pub(crate) fn for_invocation(
+        &self,
+        child: bool,
+        signal: tokio_util::sync::CancellationToken,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            invocation: Some((child, uuid::Uuid::new_v4().to_string(), signal)),
+            execution_context: rpi_agent::tool_execution_scope::execution_context(),
+            stdio: self.stdio.clone(),
+            plugin_identity: self.plugin_identity.clone(),
+            component_owners: self.component_owners.clone(),
+            runtime: self.runtime.clone(),
+            host: self.host.clone(),
+            reload: self.reload.clone(),
+            ui_dialog: self.ui_dialog.clone(),
+            ext_status: self.ext_status.clone(),
+            editor_text: self.editor_text.clone(),
+            active: self.active.clone(),
+        })
+    }
+    pub(crate) fn invocation_key(&self) -> Option<&str> {
+        self.invocation.as_ref().map(|(_, key, _)| key.as_str())
+    }
+    pub(crate) fn enter_invocation(self: &Arc<Self>) -> InvocationGuard {
+        InvocationGuard {
+            previous: CURRENT_INVOCATION.with(|slot| slot.replace(Some(self.clone()))),
+            _thread_bound: std::marker::PhantomData,
+        }
+    }
     /// Build a bridge. The `Handle` MUST be captured from a thread running the
     /// target runtime (pi-cli builds the bridge on the async main thread).
     pub fn new(runtime: Handle, host: Arc<dyn RuntimeActionHost>) -> Arc<Self> {
         Arc::new(Self {
+            invocation: None,
+            execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
             component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -532,6 +619,8 @@ impl ActionBridge {
         ui_dialog: UiDialogMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
+            invocation: None,
+            execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
             component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -555,6 +644,8 @@ impl ActionBridge {
         editor_text: crate::editor_text::EditorTextMailbox,
     ) -> Arc<Self> {
         Arc::new(Self {
+            invocation: None,
+            execution_context: None,
             stdio: crate::StdioLifecycle::default(),
             plugin_identity: None,
             component_owners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -576,6 +667,8 @@ impl ActionBridge {
             .unwrap_or_else(|e| e.into_inner())
             .push(owner);
         Arc::new(Self {
+            invocation: None,
+            execution_context: None,
             component_owners: self.component_owners.clone(),
             stdio: self.stdio.clone(),
             plugin_identity: Some((owner, name.to_owned())),
@@ -635,6 +728,7 @@ impl ActionBridge {
         self.active.store(false, Ordering::SeqCst);
         for owner in owners.iter() {
             self.ext_status.remove_owner(*owner);
+            self.host.cancel_child_agents(*owner);
         }
     }
 
@@ -775,6 +869,8 @@ async fn dispatch(
         // like `SetStatus`/`UiDialog`. The TUI drains the queue each tick.
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
+        RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
+        RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
         }
@@ -784,8 +880,9 @@ async fn dispatch(
 /// The real `runtime_action` trampoline — replaces `stub_runtime_action` when a
 /// bridge is present (see [`HostApi::build_vtable`](crate::HostApi)).
 ///
-/// Recovers `&ActionBridge` from `user_data`, parses `args_json`, drives the
-/// host's async dispatch on the bridge's runtime via `Handle::spawn`, and parks
+/// Resolves an `Arc<ActionBridge>` from an opaque handle (or the active tool
+/// invocation), parses `args_json`, drives the host's async dispatch via
+/// `Handle::spawn`, and parks
 /// the plugin thread on a std `mpsc` `recv` (works from ANY thread — no ambient
 /// runtime needed, which is the load-bearing property for foreign plugin
 /// threads).
@@ -813,7 +910,7 @@ pub extern "C" fn trampoline_runtime_action(
         run_action(
             action_id,
             // Highest id this ABI defines — bump when adding an action.
-            u32::from(RuntimeActionId::UiComponent),
+            u32::from(RuntimeActionId::ChildAgent),
             args_json,
             out,
             user_data,
@@ -871,11 +968,20 @@ fn run_action(
     if user_data.is_null() {
         return -1;
     }
-    // SAFETY: the host guarantees `user_data` points at a live `ActionBridge`.
-    // `rpi-cli` builds one `Arc<ActionBridge>` per session and keeps it for the
-    // harness lifetime; `Arc::as_ptr` is pointer-stable while any clone lives.
-    // We only borrow for the duration of this call.
-    let bridge: &ActionBridge = unsafe { &*(user_data as *const ActionBridge) };
+    // Synchronous callbacks inherit the actual driver's invocation, not a
+    // plugin-global registration pointer. Worker threads pass its opaque ID.
+    let invocation = CURRENT_INVOCATION.with(|slot| slot.borrow().clone());
+    let invocation_thread = invocation.is_some();
+    let bridge = invocation.or_else(|| ActionBridge::resolve_handle(user_data as usize));
+    let Some(bridge) = bridge else {
+        if !out.is_null() {
+            // SAFETY: the ABI caller supplies a writable output slot.
+            unsafe {
+                *out = StbString::from_string("{\"error\":\"expired runtime handle\"}".into());
+            }
+        }
+        return 1;
+    };
 
     // B5d staleness guard: a `/reload` that swapped in a fresh bridge calls
     // `invalidate` on the old one. A plugin that still holds the old pointer
@@ -901,12 +1007,16 @@ fn run_action(
     // Parse args. An empty/invalid JSON blob collapses to `{}` — getters ignore
     // args; setters that require a field surface a clear error string.
     let args_str = unsafe { args_json.as_str() };
-    let args: serde_json::Value = if args_str.is_empty() {
+    let mut args: serde_json::Value = if args_str.is_empty() {
         serde_json::Value::Object(serde_json::Map::new())
     } else {
         serde_json::from_str(args_str)
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
     };
+
+    let runtime_key = args
+        .as_object_mut()
+        .and_then(|args| args.remove("__rpiRuntimeKey"));
 
     // Drive the host's async dispatch on the bridge's runtime. STD mpsc so the
     // plugin thread can recv from any thread (no ambient runtime). sync_channel
@@ -921,6 +1031,7 @@ fn run_action(
     let ext_status = bridge.ext_status.clone();
     let editor_text = bridge.editor_text.clone();
     let reload_cb = bridge.reload.clone();
+    let execution_context = bridge.execution_context.clone();
     if action == RuntimeActionId::StdioLifecycle {
         let result = bridge.stdio.handle(
             bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id),
@@ -939,6 +1050,44 @@ fn run_action(
             Err("stale plugin bridge".into())
         };
         let _ = tx.send(result);
+    } else if action == RuntimeActionId::ChildAgent {
+        // A registration handle cannot assert that it is a parent invocation.
+        // All child-originated invocations fail closed, regardless of tool name.
+        // Cancellation stops admission, not authenticated reclamation. The
+        // plugin's cancel/destroy path must still dispose its retained handles.
+        let cleanup = matches!(
+            args.get("op").and_then(serde_json::Value::as_str),
+            Some("poll" | "cancel" | "dispose")
+        );
+        let allowed = bridge
+            .invocation
+            .as_ref()
+            .is_some_and(|(child, key, signal)| {
+                !child
+                    && (cleanup || !signal.is_cancelled())
+                    && (invocation_thread
+                        || runtime_key.as_ref().and_then(serde_json::Value::as_str)
+                            == Some(key.as_str()))
+            });
+        if !allowed {
+            let _ = tx.send(Err("ChildAgent requires a live parent tool invocation; recursive child agents are not allowed".into()));
+        } else {
+            let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
+            let signal = bridge
+                .invocation
+                .as_ref()
+                .expect("authorized invocation")
+                .2
+                .clone();
+            bridge.runtime.spawn(async move {
+                let result = rpi_agent::tool_execution_scope::with_invocation_signal(
+                    signal,
+                    host.child_agent(owner, args),
+                )
+                .await;
+                let _ = tx.send(result);
+            });
+        }
     } else if action == RuntimeActionId::SetStatus {
         // Same reasoning as `UiDialog`: this action never touches the harness,
         // so it must not need a Tokio worker. A plugin calling it from inside a
@@ -964,7 +1113,7 @@ fn run_action(
         });
     } else {
         bridge.runtime.spawn(async move {
-            let r = if action == RuntimeActionId::Reload {
+            let mut r = if action == RuntimeActionId::Reload {
                 if let Some(cb) = reload_cb {
                     cb().await;
                     Ok(serde_json::Value::Null)
@@ -974,13 +1123,34 @@ fn run_action(
             } else {
                 dispatch(&host, &ui_dialog, &ext_status, &editor_text, action, args).await
             };
+            if action == RuntimeActionId::GetExecutionContext {
+                if let (Ok(context), Some(serde_json::Value::Object(fields))) =
+                    (&mut r, execution_context)
+                {
+                    if let Some(object) = context.as_object_mut() {
+                        object.extend(fields);
+                    }
+                }
+            }
             // If the plugin thread already moved on (dropped rx), discard — a
             // send error is NOT a host fault.
             let _ = tx.send(r);
         });
     }
 
-    let result = match rx.recv() {
+    // Event observers can call back synchronously from a Tokio worker. A task
+    // just spawned above may still occupy that worker's non-stealable LIFO
+    // slot. Yield the scheduler before blocking so dispatch can actually run.
+    // Foreign/plugin workers and current-thread mailbox-only calls keep the
+    // ordinary blocking receive.
+    let received = if Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        tokio::task::block_in_place(|| rx.recv())
+    } else {
+        rx.recv()
+    };
+    let result = match received {
         Ok(r) => r,
         Err(_) => {
             // Spawned task dropped the sender without sending: runtime shutdown
@@ -1113,6 +1283,83 @@ mod tests {
         saw: Mutex<Vec<RuntimeActionId>>,
     }
 
+    #[test]
+    fn runtime_action_from_a_tokio_worker_does_not_block_its_dispatch() {
+        const CHILD: &str = "RPI_RUNTIME_ACTION_WORKER_REGRESSION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                // Lifecycle observers run directly on a worker. Their runtime
+                // action spawns back onto that runtime, including its LIFO slot.
+                tokio::spawn(async {
+                    let host = Arc::new(MockHost {
+                        prompt: "worker callback".into(),
+                        saw: Mutex::new(Vec::new()),
+                    });
+                    let bridge = ActionBridge::new(Handle::current(), host);
+                    let mut out = StbString::empty();
+                    assert_eq!(
+                        trampoline_runtime_action(
+                            RuntimeActionId::GetSystemPrompt.into(),
+                            StbStringRef::from_str("{}"),
+                            &mut out,
+                            bridge.user_data(),
+                        ),
+                        0
+                    );
+                    // SAFETY: the action returned a live host-owned string.
+                    let text = unsafe {
+                        rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                            out,
+                            Some(crate::host_free_string),
+                        )
+                    }
+                    .to_string_lossy();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&text).unwrap()["prompt"],
+                        "worker callback"
+                    );
+                })
+                .await
+                .unwrap();
+            });
+            return;
+        }
+        // Isolate the old self-deadlock so a regression fails promptly instead
+        // of hanging the test runner or leaving a blocked runtime thread behind.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "actions::tests::runtime_action_from_a_tokio_worker_does_not_block_its_dispatch",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("runtime action blocked the worker needed by its own dispatch");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[async_trait::async_trait]
     impl RuntimeActionHost for MockHost {
         async fn send_message(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -1195,14 +1442,9 @@ mod tests {
         }
     }
 
-    /// NOTE: these tests use `flavor = "multi_thread"`. The trampoline parks the
-    /// caller on a std `mpsc::rx.recv()` (sync blocking) while the dispatch runs
-    /// via `Handle::spawn` on the runtime. Under a current-thread runtime the
-    /// test's own worker is the only thread that can poll the spawned task —
-    /// blocking it on `recv` self-deadlocks. In the real host the caller is a
-    /// plugin / `spawn_blocking` thread (never a runtime worker), so there is no
-    /// deadlock; multi_thread here mirrors that (another worker runs the spawn
-    /// while the test thread parks).
+    /// Async host actions need a multi-thread runtime when called synchronously
+    /// from inside it. The trampoline yields that worker with block_in_place;
+    /// foreign/plugin threads instead park on the ordinary channel receive.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn trampoline_round_trips_get_system_prompt() {
         let host = Arc::new(MockHost {
@@ -1213,7 +1455,7 @@ mod tests {
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let runtime = tokio::runtime::Handle::current();
         let bridge = ActionBridge::new(runtime, host_dyn);
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         // Build a StbStringRef for the args. `{}` — getters ignore it.
         let args_str = "{}";
@@ -1257,7 +1499,7 @@ mod tests {
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
         let mailbox = bridge.editor_text_mailbox();
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         let args_ref =
             StbStringRef::from_str(r#"{"text":"from voice","mode":"append","autoSendMs":2000}"#);
@@ -1325,7 +1567,7 @@ mod tests {
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let runtime = tokio::runtime::Handle::current();
         let bridge = ActionBridge::with_reload(runtime, host_dyn, reload);
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         let args_ref = StbStringRef::from_str("{}");
         let mut out = StbString::empty();
@@ -1359,7 +1601,7 @@ mod tests {
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let runtime = tokio::runtime::Handle::current();
         let bridge = ActionBridge::new(runtime, host_dyn);
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         // Invalidate (as a `/reload` would on the old bridge).
         bridge.invalidate();
@@ -1400,7 +1642,7 @@ mod tests {
         let host_for_assert = Arc::clone(&host);
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
@@ -1435,7 +1677,7 @@ mod tests {
         let host_for_assert = Arc::clone(&host);
         let host_dyn: Arc<dyn RuntimeActionHost> = host;
         let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         let mut v2_out = StbString::empty();
         assert_eq!(
@@ -1618,7 +1860,7 @@ mod tests {
             host,
             UiDialogMailbox::new(),
         );
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
@@ -1643,10 +1885,10 @@ mod tests {
         );
 
         // A genuinely unknown id is still rejected (no silent acceptance).
-        // 23 is one past the highest defined action.
+        // 25 is one past the highest defined action.
         let mut out = StbString::empty();
         assert_eq!(
-            trampoline_runtime_action(23, StbStringRef::from_str("{}"), &mut out, user_data),
+            trampoline_runtime_action(25, StbStringRef::from_str("{}"), &mut out, user_data),
             2
         );
         // SAFETY: this action returned a live host allocation, not previously freed.
@@ -1674,7 +1916,7 @@ mod tests {
                         r#"{"op":"register","id":"same","slot":"footer.after"}"#
                     ),
                     &mut out,
-                    Arc::as_ptr(plugin) as *mut c_void
+                    plugin.user_data()
                 ),
                 0
             );
@@ -1707,7 +1949,7 @@ mod tests {
             status.clone(),
             crate::editor_text::EditorTextMailbox::new(),
         );
-        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+        let user_data = bridge.user_data();
 
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
@@ -1755,8 +1997,19 @@ mod tests {
 
 impl Drop for ActionBridge {
     fn drop(&mut self) {
+        bridges()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, weak| !std::ptr::eq(weak.as_ptr(), self));
+        if self.invocation.is_some() {
+            return;
+        }
         if let Some((owner, _)) = &self.plugin_identity {
             self.ext_status.remove_owner(*owner);
+            self.host.cancel_child_agents(*owner);
         }
     }
 }
+
+#[cfg(test)]
+mod runtime_tests;

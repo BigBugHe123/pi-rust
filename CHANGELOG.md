@@ -13,6 +13,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Added
 
+- Expose safe live execution metadata and plugin-owned child-agent lifecycle
+  actions. Children use independent ephemeral sessions while inheriting the
+  current model/provider binding, project tools and approval UI; credentials
+  stay inside the host. Bound concurrency, output, turns, timeout and cleanup,
+  and cancel children when their parent run/session or owning plugin ends.
+
 - Stream custom plugin providers. A plugin registered with
   `register_streaming_provider` emits per-chunk envelopes on a host callback and
   the host maps them onto `AssistantMessageEvent`s as they arrive, so a plugin
@@ -28,6 +34,16 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- Bind child-agent actions to live tool invocations rather than a cached root
+  host: reject alias recursion and capability expansion, make expired/reverted
+  reload handles safe, and retain blocking tool drivers' owned parameters,
+  libraries and cleanup capacity until their final callback returns.
+- Keep cancelled parent invocations authorized for child cleanup only; propagate
+  invocation cancellation through queued starts and stream tool partials live.
+  Break the harness/provider/plugin ownership cycle with weak runtime bindings.
+  Back off pending tool polls, stop cancellation busy loops and reject late
+  success. Track provider and approval drivers against child cleanup capacity,
+  and retain provider/lifecycle DLLs inside the foreign callbacks themselves.
 - Report an aborted plugin provider as `ErrorReason::Aborted` rather than
   `ErrorReason::Error`, so a user-cancelled run is no longer indistinguishable
   from a provider failure.

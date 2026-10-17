@@ -54,7 +54,24 @@ use crate::registry::{RegisteredProvider, RegistrySnapshot};
 use crate::PluginKeepalive;
 
 #[cfg(test)]
+mod lifetime_tests;
+#[cfg(test)]
 mod stream_tests;
+
+/// Reserve child capacity before spawning the producer; move this ownership
+/// into the foreign driver so runtime shutdown cannot unload executing code.
+struct ProviderRequestLifetime {
+    _keepalive: Arc<PluginKeepalive>,
+    _background: Option<rpi_agent::tool_execution_scope::BackgroundToolGuard>,
+}
+impl ProviderRequestLifetime {
+    fn new(keepalive: Arc<PluginKeepalive>) -> Self {
+        Self {
+            _keepalive: keepalive,
+            _background: rpi_agent::tool_execution_scope::track_background_tool(),
+        }
+    }
+}
 
 /// A `Provider` backed by a plugin's sync `ProviderRequestFn`.
 ///
@@ -144,7 +161,7 @@ impl Provider for PluggableProvider {
         // keepalive lifetime).
         let record = self.record.clone();
         let runtime = self.runtime.clone();
-        let keepalive = Arc::clone(&self._keepalive);
+        let lifetime = ProviderRequestLifetime::new(Arc::clone(&self._keepalive));
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
         // `opts` is not `Clone`-free of lifetime — capture the fields the
@@ -164,15 +181,16 @@ impl Provider for PluggableProvider {
                 // producer forwards each one immediately, so the consumer sees
                 // deltas as they arrive instead of one terminal chunk.
                 let message = drive_streaming_plugin_provider(
-                    &snapshot, &record, stream_fn, runtime, keepalive, &model, &ctx, &opts,
+                    &snapshot, &record, stream_fn, runtime, lifetime, &model, &ctx, &opts,
                     &mut prod,
                 )
                 .await;
                 push_terminal(&mut prod, message);
             } else {
-                let _keepalive = keepalive;
-                let message =
-                    drive_plugin_provider(&snapshot, &record, runtime, &model, &ctx, &opts).await;
+                let message = drive_plugin_provider(
+                    &snapshot, &record, runtime, lifetime, &model, &ctx, &opts,
+                )
+                .await;
                 push_terminal(&mut prod, message);
             }
             // `prod` drops here, closing the mpsc sender so the consumer's
@@ -191,6 +209,7 @@ async fn drive_plugin_provider(
     snapshot: &Arc<RegistrySnapshot>,
     record: &RegisteredProvider,
     runtime: Handle,
+    lifetime: ProviderRequestLifetime,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
@@ -228,8 +247,10 @@ async fn drive_plugin_provider(
     // The join handle is awaited so a panic in the plugin (caught by
     // `catch_unwind` below) surfaces as an error, not a silent hang.
     let request_model_id = model_id.clone();
-    let join = runtime
-        .spawn_blocking(move || run_provider_request(&record, &request_json, &request_model_id));
+    let join = runtime.spawn_blocking(move || {
+        let _lifetime = lifetime;
+        run_provider_request(&record, &request_json, &request_model_id)
+    });
     let outcome = match join.await {
         Ok(inner) => inner,
         Err(join_err) => {
@@ -440,7 +461,7 @@ async fn drive_streaming_plugin_provider(
     record: &RegisteredProvider,
     stream_fn: rpi_plugin_sdk::ProviderStreamRequestFn,
     runtime: Handle,
-    keepalive: Arc<PluginKeepalive>,
+    lifetime: ProviderRequestLifetime,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
@@ -491,7 +512,7 @@ async fn drive_streaming_plugin_provider(
     let join = runtime.spawn_blocking(move || {
         // Cancellation detaches this task; keep the library and host-side
         // context alive until the FFI call and all plugin-owned frees finish.
-        let _keepalive = keepalive;
+        let _lifetime = lifetime;
         run_streaming_provider_request(
             &snapshot_owned,
             &record_owned,
@@ -1558,7 +1579,7 @@ mod tests {
                 &record,
                 stream_fn,
                 Handle::current(),
-                PluginKeepalive::empty(),
+                ProviderRequestLifetime::new(PluginKeepalive::empty()),
                 &model,
                 &ctx,
                 &opts,

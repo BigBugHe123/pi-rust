@@ -1,6 +1,6 @@
 //! Generic passive plugin panels. No plugin names or domain metrics live here.
 use super::*;
-use rpi_extensions::{ExtensionPanel, PanelAnchor, PanelLayout};
+use rpi_extensions::{ExtensionPanel, PanelAnchor, PanelHighlightColor, PanelLayout};
 use rpi_tui::ansi::visible_width;
 use rpi_tui::tui::OverlayHandle;
 use rpi_tui::{OverlayAnchor, OverlayOptions};
@@ -62,6 +62,31 @@ fn clean(s: &str) -> String {
         .filter(|c| !c.is_control())
         .collect()
 }
+fn highlighted(text: &str, spec: &ExtensionPanel) -> String {
+    let colors = current_theme().colors;
+    let mut result = String::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = spec
+            .highlights
+            .iter()
+            .filter(|h| !h.text.is_empty())
+            .filter_map(|h| rest.find(&h.text).map(|at| (at, h)))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, highlight)) = next else {
+            result.push_str(&colors.dim.fg(rest));
+            break;
+        };
+        result.push_str(&colors.dim.fg(&rest[..at]));
+        let color = match highlight.color {
+            PanelHighlightColor::Warning => colors.warning,
+            PanelHighlightColor::Error => colors.error,
+        };
+        result.push_str(&color.fg(&highlight.text));
+        rest = &rest[at + highlight.text.len()..];
+    }
+    result
+}
 impl Component for Panel {
     fn render(&self, available_width: usize) -> Vec<String> {
         let spec = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -73,7 +98,10 @@ impl Component for Panel {
         }
         let colors = current_theme().colors;
         let inner = width.saturating_sub(if spec.border { 4 } else { 0 });
-        let fit = |text: &str| rpi_tui::utils::truncate_to_width(&clean(text), inner, "");
+        let fit = |text: &str| {
+            let text = clean(text);
+            rpi_tui::utils::truncate_to_width(&highlighted(&text, &spec), inner, "")
+        };
         let mut content = Vec::new();
         if !spec.title.is_empty() {
             content.push(fit(&spec.title));
@@ -83,19 +111,19 @@ impl Component for Panel {
         if spec.border && spec.max_height >= 2 {
             rows.push(colors.dim.fg(&format!("┌{}┐", "─".repeat(width - 2))));
             for row in content.into_iter().take(spec.max_height - 2) {
-                rows.push(colors.dim.fg(&format!(
-                    "│ {row}{} │",
-                    " ".repeat(inner.saturating_sub(visible_width(&row)))
-                )));
+                rows.push(format!(
+                    "{}{}{}",
+                    colors.dim.fg("│ "),
+                    row,
+                    colors.dim.fg(&format!(
+                        "{} │",
+                        " ".repeat(inner.saturating_sub(visible_width(&row)))
+                    ))
+                ));
             }
             rows.push(colors.dim.fg(&format!("└{}┘", "─".repeat(width - 2))));
         } else {
-            rows.extend(
-                content
-                    .into_iter()
-                    .take(spec.max_height)
-                    .map(|row| colors.dim.fg(&row)),
-            );
+            rows.extend(content.into_iter().take(spec.max_height));
         }
         rows
     }
@@ -414,6 +442,39 @@ mod tests {
     }
 
     use super::*;
+    #[test]
+    fn text_highlights_use_theme_colors_and_clip_without_leaking_terminal_controls() {
+        let mailbox = rpi_extensions::ExtensionStatusMailbox::new();
+        mailbox
+            .component(
+                1,
+                serde_json::json!({"op":"register","id":"sample",
+            "slot":"footer.after","width":240,"maxHeight":1,"border":false}),
+            )
+            .unwrap();
+        mailbox.component(1, serde_json::json!({"op":"update","id":"sample",
+            "text":"正常 \u{1b}[2JTTFT 30.0s Err1",
+            "highlights":[{"text":"TTFT 30.0s","color":"warning"},{"text":"Err1","color":"error"}]})).unwrap();
+        let footer = FooterPanels(mailbox.clone());
+        let colors = current_theme().colors;
+        let line = footer.render(80).pop().unwrap();
+        assert_eq!(rpi_tui::strip_ansi(&line), "正常 TTFT 30.0s Err1");
+        assert!(!line.contains("\u{1b}[2J"));
+        assert!(line.contains(&colors.warning.fg("TTFT 30.0s")));
+        assert!(line.contains(&colors.error.fg("Err1")));
+        for width in 4..40 {
+            let rows = footer.render(width);
+            assert_eq!(rows.len(), 1);
+            assert!(visible_width(&rows[0]) <= width);
+        }
+        mailbox
+            .component(
+                1,
+                serde_json::json!({"op":"update","id":"sample","text":"Err0"}),
+            )
+            .unwrap();
+        assert_eq!(footer.render(80), vec![colors.dim.fg("Err0")]);
+    }
     #[test]
     fn footer_monitor_follows_usage_row_and_hides_without_taking_sidebar_space() {
         let mailbox = rpi_extensions::ExtensionStatusMailbox::new();

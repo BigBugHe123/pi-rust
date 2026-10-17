@@ -118,7 +118,7 @@ impl ExtensionStatusMailbox {
                 "minScreenWidth",
                 "border",
             ],
-            "update" => &["op", "id", "text", "title"],
+            "update" => &["op", "id", "text", "title", "highlights"],
             _ => &["op", "id"],
         };
         if args
@@ -178,22 +178,17 @@ impl ExtensionStatusMailbox {
                         }
                     }
                 } else if op == "update" {
-                    if args
-                        .as_object()
-                        .unwrap()
-                        .keys()
-                        .any(|k| !["op", "id", "text", "title"].contains(&k.as_str()))
-                    {
-                        return Err(
-                            "update accepts text and title; use configure for layout".into()
-                        );
-                    }
                     if let Some(v) = args.get("text") {
                         spec["lines"] = serde_json::json!(v
                             .as_str()
                             .ok_or("text must be a string")?
                             .split('\n')
                             .collect::<Vec<_>>());
+                        // Plain text updates clear previous styling.
+                        spec["highlights"] = serde_json::json!([]);
+                    }
+                    if let Some(v) = args.get("highlights") {
+                        spec["highlights"] = v.clone();
                     }
                     if let Some(v) = args.get("title") {
                         spec["title"] = v.as_str().ok_or("title must be a string")?.into();
@@ -297,6 +292,34 @@ impl ExtensionStatusMailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_highlights_are_validated_atomic_and_cleared_on_plain_updates() {
+        let m = ExtensionStatusMailbox::new();
+        m.component(1, serde_json::json!({"op":"register","id":"sample"}))
+            .unwrap();
+        let update = serde_json::json!({"op":"update","id":"sample","text":"Err1",
+            "highlights":[{"text":"Err1","color":"error"}]});
+        m.component(1, update.clone()).unwrap();
+        let before = m.panels();
+        for highlights in [
+            serde_json::json!([{"text":"", "color":"error"}]),
+            serde_json::json!([{"text":"\u{1b}[31m", "color":"error"}]),
+            serde_json::json!([{"text":"Err1", "color":"unknown"}]),
+            serde_json::json!(vec![serde_json::json!({"text":"Err1","color":"error"}); 33]),
+        ] {
+            let mut invalid = update.clone();
+            invalid["highlights"] = highlights;
+            assert!(m.component(1, invalid).is_err());
+            assert_eq!(m.panels(), before);
+        }
+        m.component(
+            1,
+            serde_json::json!({"op":"update","id":"sample","text":"OK"}),
+        )
+        .unwrap();
+        assert!(m.panels().values().next().unwrap().highlights.is_empty());
+    }
 
     #[test]
     fn components_keep_layout_content_visibility_and_owners_independent() {

@@ -52,6 +52,7 @@ pub struct PluginToolHandle {
     pub(crate) cancel_fn: ToolCancelFn,
     pub(crate) destroy_fn: ToolDestroyFn,
     pub(crate) plugin_free_string: FreeStringFn,
+    pub(crate) runtime_handle: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -369,6 +370,14 @@ extern "C" fn partial_cb_trampoline(partial: StbString, user_data: *mut c_void) 
     }
 }
 
+struct CancelOnDrop(Arc<AtomicBool>, CancellationToken);
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+        self.1.cancel();
+    }
+}
+
 #[async_trait]
 impl AgentTool for PluginToolAdapter {
     fn schema(&self) -> &Tool {
@@ -409,16 +418,43 @@ impl AgentTool for PluginToolAdapter {
         // (and by the drop guard, were one needed). SeqCst for cross-thread
         // visibility with the blocking driver.
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let invocation_signal = signal.child_token();
+        let _cancel_on_drop = CancelOnDrop(cancel_flag.clone(), invocation_signal.clone());
+        let background = rpi_agent::tool_execution_scope::track_background_tool();
+        let invocation = self
+            .handle
+            .runtime_handle
+            .and_then(crate::ActionBridge::resolve_handle)
+            .map(|bridge| {
+                bridge.for_invocation(
+                    rpi_agent::tool_execution_scope::is_child_execution(),
+                    invocation_signal,
+                )
+            });
 
         // 3. Prepare plugin execute() inputs. `params` is an owning JSON string
         //    the host produced → the plugin frees it via the host's free_string.
         //    `tool_call_id` is borrowed for the call. The host context is merged
         //    into the arguments here — after the model's arguments were parsed,
         //    before the plugin sees them, and never into the events or the log.
-        let params = inject_tool_context(params, &self.context);
+        let mut params = inject_tool_context(params, &self.context);
+        if invocation.is_some() && params.is_null() {
+            params = serde_json::json!({});
+        }
+        if let (Some(invocation), Some(object)) = (&invocation, params.as_object_mut()) {
+            let context = object
+                .entry(rpi_plugin_sdk::HOST_CONTEXT_KEY)
+                .or_insert_with(|| serde_json::json!({}));
+            // Always replace any model-supplied value with host-owned identity.
+            if !context.is_object() {
+                *context = serde_json::json!({});
+            }
+            context["runtimeHandle"] = serde_json::json!(invocation.user_data() as usize);
+            context["runtimeKey"] = serde_json::json!(invocation.invocation_key());
+        }
         let params_json = serde_json::to_string(&params).unwrap_or_else(|_| "null".to_string());
         let params_stb = StbString::from_string(params_json);
-        let id_ref = StbStringRef::from_str(tool_call_id);
+        let tool_call_id = tool_call_id.to_owned();
         let plugin_free = self.handle.plugin_free_string;
 
         let execute_fn = self.handle.execute_fn;
@@ -439,7 +475,14 @@ impl AgentTool for PluginToolAdapter {
             sender: partial_tx.clone(),
             plugin_free,
         };
+        let keepalive = self.keepalive.clone();
         runtime.spawn_blocking(move || {
+            // These owners must live through destroy AND terminal string frees,
+            // independently of the async caller's cancellation/drop.
+            let _keepalive = keepalive;
+            let _background = background;
+            let _invocation_guard = invocation.as_ref().map(|bridge| bridge.enter_invocation());
+            let id_ref = StbStringRef::from_str(&tool_call_id);
             // Drive: execute → poll loop → destroy exactly once. Every plugin
             // call is extern "C"; wrap in catch_unwind so a plugin panic cannot
             // unwind across FFI (abort-on-unwind).
@@ -495,6 +538,11 @@ impl AgentTool for PluginToolAdapter {
                 // SAFETY: poll transfers its live result to the registered
                 // producer deallocator. The SDK selects the arm and frees once.
                 let step = unsafe { take_step_result_with(step_result, plugin_free) };
+                if cancel_flag_drive.load(Ordering::SeqCst) {
+                    // poll may return success after cancellation was requested.
+                    let _ = catch_unwind(AssertUnwindSafe(|| (cancel_fn)(step_handle)));
+                    break Err(AgentError::Tool("plugin tool cancelled".into()));
+                }
                 match step {
                     Step::Pending(progress) => {
                         if !progress.is_empty() {
@@ -503,6 +551,9 @@ impl AgentTool for PluginToolAdapter {
                             let pr = json_to_result(&progress);
                             let _ = partial_tx.send(pr);
                         }
+                        // poll is a nonblocking ABI. Empty Pending must not spin
+                        // a dedicated CPU core while the plugin worker is idle.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
                         continue;
                     }
                     Step::Done(done) => {
@@ -529,11 +580,14 @@ impl AgentTool for PluginToolAdapter {
         let schema_name_err = schema_name_for_error.clone();
         tokio::pin!(done_rx);
         let mut cancelled = std::pin::pin!(signal.cancelled());
+        let mut cancel_observed = false;
         let result: Result<AgentToolResult, AgentError> = loop {
             tokio::select! {
+                Some(partial) = partial_rx.recv() => on_update(partial),
                 done = &mut done_rx => {
                     while let Ok(p) = partial_rx.try_recv() { on_update(p); }
                     break match done {
+                        Ok(Ok(_)) if signal.is_cancelled() => Err(AgentError::Tool("plugin tool cancelled".into())),
                         Ok(Ok(r)) => Ok(r),
                         Ok(Err(e)) => Err(e),
                         Err(_) => Err(AgentError::State(format!(
@@ -541,15 +595,13 @@ impl AgentTool for PluginToolAdapter {
                         ))),
                     };
                 }
-                _ = &mut cancelled => {
-                    // Set the flag once; the driver observes it and breaks. Keep
-                    // looping so we still poll done_rx to completion.
-                    let already = cancel_flag.swap(true, Ordering::SeqCst);
-                    if !already {
-                        while let Ok(p) = partial_rx.try_recv() { on_update(p); }
-                    }
-                    // Yield so we don't busy-spin against the driver.
-                    tokio::task::yield_now().await;
+                _ = &mut cancelled, if !cancel_observed => {
+                    // Consume cancellation once, then sleep on partials/done.
+                    // A permanently-ready cancellation future would busy-spin
+                    // while an uncooperative foreign poll/destroy is finishing.
+                    cancel_observed = true;
+                    cancel_flag.store(true, Ordering::SeqCst);
+                    while let Ok(p) = partial_rx.try_recv() { on_update(p); }
                 }
             }
         };
@@ -749,6 +801,7 @@ mod tests {
             cancel_fn: stub_cancel,
             destroy_fn: stub_destroy,
             plugin_free_string: stub_free,
+            runtime_handle: None,
         }
     }
 
@@ -865,6 +918,7 @@ mod tests {
             cancel_fn: slow_cancel,
             destroy_fn: slow_destroy,
             plugin_free_string: stub_free,
+            runtime_handle: None,
         };
         let adapter = PluginToolAdapter::new(tool, handle, PluginKeepalive::empty());
         let on_update: Arc<dyn Fn(ToolResultPartial) + Send + Sync> = Arc::new(|_| {});

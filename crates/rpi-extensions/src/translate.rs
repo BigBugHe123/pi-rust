@@ -19,6 +19,9 @@ use rpi_plugin_sdk::{EventTag, StablePluginEvent, StbString};
 use crate::host_free_string;
 use crate::registry::RegistrySnapshot;
 
+#[cfg(test)]
+mod lifetime_tests;
+
 /// Map a native [`AgentEvent`] to its pi `on()` [`EventTag`], or `None` if the
 /// host event has no stable-event counterpart. This is the **fold** described
 /// in the crate docs: the ten stable lifecycle variants map onto matching tags;
@@ -506,8 +509,10 @@ async fn dispatch_tool_call_event_with_timeout(
         let started = std::time::Instant::now();
         // Capture the whole RegisteredHandler rather than its raw user_data.
         // The callback's own keepalive also survives timeout/cancellation.
+        let background = rpi_agent::tool_execution_scope::track_background_tool();
         let mut task = tokio::task::spawn_blocking(move || {
             let _keepalive = keepalive;
+            let _background = background;
             call_tool_call_handler(h, id, name, payload)
         });
         let outcome = tokio::select! {
@@ -700,9 +705,12 @@ fn call_tool_call_handler(
 /// a handler aborted. A stale registry (swapped-out session) returns `None`.
 /// The **caller** decides what a veto means for the phase — e.g. a
 /// `BeforeTuiStart` veto aborts startup before the TUI initializes.
+/// `keepalive` must own this snapshot's libraries. Each blocking callback keeps
+/// its own clone even if the dispatch times out or its future is dropped.
 pub async fn dispatch_lifecycle_event(
     snapshot: &RegistrySnapshot,
     tag: EventTag,
+    keepalive: Arc<crate::PluginKeepalive>,
 ) -> Option<String> {
     // Staleness guard: a stale registry (swapped-out session) does nothing.
     if !crate::registry::assert_active(snapshot.active_flag()) {
@@ -734,9 +742,15 @@ pub async fn dispatch_lifecycle_event(
         let h_task = h;
         let tag_task = tag;
         let started = std::time::Instant::now();
+        let keepalive = keepalive.clone();
+        let background = rpi_agent::tool_execution_scope::track_background_tool();
         let outcome = tokio::time::timeout(
             timeout,
-            tokio::task::spawn_blocking(move || call_lifecycle_handler(h_task, tag_task)),
+            tokio::task::spawn_blocking(move || {
+                let _keepalive = keepalive;
+                let _background = background;
+                call_lifecycle_handler(h_task, tag_task)
+            }),
         )
         .await;
         let duration_ms = started.elapsed().as_millis() as u64;
@@ -1344,7 +1358,12 @@ mod tests {
             std::ptr::null_mut(),
         );
         let snap = Arc::new(reg.snapshot());
-        let result = dispatch_lifecycle_event(&snap, EventTag::BeforeTuiStart).await;
+        let result = dispatch_lifecycle_event(
+            &snap,
+            EventTag::BeforeTuiStart,
+            crate::PluginKeepalive::empty(),
+        )
+        .await;
         assert_eq!(
             result.as_deref(),
             Some("extension `veto-ext` vetoed BeforeTuiStart")
@@ -1369,9 +1388,13 @@ mod tests {
             std::ptr::null_mut(),
         );
         let snap = Arc::new(reg.snapshot());
-        assert!(dispatch_lifecycle_event(&snap, EventTag::SessionStart)
-            .await
-            .is_none());
+        assert!(dispatch_lifecycle_event(
+            &snap,
+            EventTag::SessionStart,
+            crate::PluginKeepalive::empty()
+        )
+        .await
+        .is_none());
     }
 
     fn tool_call_session(reg: &crate::ExtensionRegistry) -> crate::ExtensionSession {
@@ -1619,9 +1642,13 @@ mod tests {
     async fn dispatch_lifecycle_event_no_subscribers_is_none() {
         let reg = crate::registry::ExtensionRegistry::new();
         let snap = Arc::new(reg.snapshot());
-        assert!(dispatch_lifecycle_event(&snap, EventTag::BeforeTuiStart)
-            .await
-            .is_none());
+        assert!(dispatch_lifecycle_event(
+            &snap,
+            EventTag::BeforeTuiStart,
+            crate::PluginKeepalive::empty()
+        )
+        .await
+        .is_none());
     }
 
     /// A stale registry (swapped-out session) is a no-op — a veto from a stale
@@ -1637,9 +1664,13 @@ mod tests {
         );
         let snap = Arc::new(reg.snapshot());
         reg.invalidate();
-        assert!(dispatch_lifecycle_event(&snap, EventTag::BeforeTuiStart)
-            .await
-            .is_none());
+        assert!(dispatch_lifecycle_event(
+            &snap,
+            EventTag::BeforeTuiStart,
+            crate::PluginKeepalive::empty()
+        )
+        .await
+        .is_none());
     }
 
     /// The observe fan-out records one JSONL line per handler when the global
