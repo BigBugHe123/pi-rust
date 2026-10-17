@@ -34,6 +34,55 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [0.4.1] - 2026-10-17
 
+### Changed
+
+- Allow `rpi install` to upgrade an installed extension without `--force` and
+  skip an already-installed version. Require `--force` only to reinstall the
+  same version or downgrade, consistently across prebuilt, source and local
+  installs; apply the same version policy to `rpi package update`.
+- Synchronize the 0.4.0 installation channels and website release metadata.
+
+### Fixed
+
+- Rebuild terminal scrollback when wrapped row counts change, preventing stale
+  rows from remaining after content updates or terminal resizing.
+- Track the effective ANSI style state across wrapped lines instead of replaying
+  the entire style history, preventing escape-sequence growth in long styled
+  output while preserving colors and partial resets.
+
+## [0.4.0] - 2026-10-16
+
+### Added
+
+- Configure per-model USD cost rates, long-context pricing tiers and thinking-level
+  mappings in `models.json`; preserve those values when saving the configuration.
+- Prepare unified workspace Release PRs automatically after main CI succeeds.
+  Merging a Release PR publishes crates, five platform binaries, Homebrew/Scoop
+  and a retry-safe Microsoft winget submission.
+
+### Changed
+
+- Add `Model.cost_configured` (`costConfigured` in JSON) to distinguish unknown
+  prices from explicitly free models. `ModelDefinition` also adds `cost` and
+  `thinking_level_map`. Rust callers using exhaustive struct literals must supply
+  the new fields; `Model::new` provides its default. These API changes require the
+  0.4.0 release; the native extension SDK ABI remains unchanged.
+- Expose pricing availability in extension provider hooks and calculate request
+  costs using the configured model rates, including long-context tiers.
+
+### Fixed
+
+- Wait for buffered file appends to complete before returning, so immediate
+  reads and metadata queries always observe the appended bytes.
+- Release extension dialog state locks before submit callbacks, preventing
+  free-form answers and editor submissions from deadlocking the TUI.
+- Restore enhanced keyboard input on compatible macOS terminals so Shift+Enter
+  inserts a newline. Otty retains legacy input for CJK IME compatibility, with
+  `RPI_KITTY_KEYBOARD` available as an explicit override.
+- Wrap long Markdown code lines instead of clipping their tails with an ellipsis.
+- Keep different versions in separate publish queues and synchronize embedded
+  release notes before the Release PR becomes ready.
+
 ## [0.3.24] - 2026-10-15
 
 ### Added
