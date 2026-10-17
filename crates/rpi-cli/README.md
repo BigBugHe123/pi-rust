@@ -92,6 +92,10 @@ rpi dev                                        # build + watch a local extension
 
 `rpi install` defaults to the versioned `rpi-extension.json` prebuilt protocol: it resolves a non-yanked stable package version and repository through crates.io, loads the `<package>-v<version>` Release manifest, and verifies the archive and declared library before transactionally installing it into `~/.rpi/agent/extensions`. Explicit `--github owner/repo` installs use package-specific tags and also support unpublished extensions. Both repository forms consume the same protocol; they never infer library filenames or use repository-wide latest bundles. Missing prebuilt releases fail with an actionable error; `--build` and `--path` explicitly select Cargo compilation. Installed provenance preserves the source for update discovery, reinstalls and uninstall. Actual plugin ABI/API-size validation still happens when loading the library.
 
+`rpi install <name>` installs or upgrades an extension without `--force`. An already installed version is skipped; use `--force` to reinstall the same version or allow a downgrade. These rules also apply to explicit Cargo builds and local installs.
+
+`rpi package update` updates all linked project packages and globally installed registry/prebuilt extensions; `rpi package update <name>` selects one package. Updates retain the original Cargo build backend or explicit GitHub repository. Global development installs made with `--path` are excluded from registry updates.
+
 ## Remote mode
 
 ```bash

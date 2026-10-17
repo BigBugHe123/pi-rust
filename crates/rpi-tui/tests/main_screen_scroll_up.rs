@@ -1,6 +1,6 @@
 //! Regression test for main-screen mode: when a streamed message re-wraps
-//! *above* the visible viewport, the differential renderer must scroll up to
-//! the changed range instead of painting the transcript over the bottom dock.
+//! *above* the visible viewport, the renderer must rebuild scrollback instead
+//! of treating screen-scroll commands as access to saved history.
 //!
 //! The test drives `TuiAltScreen` through a tiny virtual terminal that models
 //! the main buffer (document + viewport) so we can assert what is actually
@@ -8,7 +8,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use rpi_tui::{Container, Focusable, Text, TuiAltScreen, TUI};
+use rpi_tui::{
+    AssistantBlock, AssistantMessageComponent, Container, Focusable, Text, TuiAltScreen, TUI,
+};
 
 /// Shared virtual-terminal state so the test can keep a handle to the same
 /// screen the `TuiAltScreen` writes into.
@@ -18,10 +20,13 @@ struct VtState {
     rows: usize,
     /// The full main-buffer document (grows as content is written).
     document: Vec<Vec<char>>,
+    italics: Vec<Vec<bool>>,
+    italic: bool,
     /// Document index currently at the top of the screen.
     viewport_top: usize,
     cursor_row: usize,
     cursor_col: usize,
+    scrollback_limit: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -35,9 +40,12 @@ impl VirtualTerminal {
             columns,
             rows,
             document: vec![vec![' '; columns]; rows],
+            italics: vec![vec![false; columns]; rows],
+            italic: false,
             viewport_top: 0,
             cursor_row: 0,
             cursor_col: 0,
+            scrollback_limit: None,
         };
         Self {
             state: Arc::new(Mutex::new(state)),
@@ -55,6 +63,7 @@ impl VirtualTerminal {
     fn ensure_row(&self, st: &mut VtState, index: usize) {
         while st.document.len() <= index {
             st.document.push(vec![' '; st.columns]);
+            st.italics.push(vec![false; st.columns]);
         }
     }
 
@@ -90,12 +99,14 @@ impl VirtualTerminal {
             if st.cursor_row >= st.rows {
                 st.cursor_row = st.rows - 1;
                 st.viewport_top += 1;
+                Self::limit_scrollback(&mut st);
             }
         }
         let index = st.viewport_top + st.cursor_row;
         self.ensure_row(&mut st, index);
         let col = st.cursor_col.min(st.columns - 1);
         st.document[index][col] = ch;
+        st.italics[index][col] = st.italic;
         st.cursor_col += 1;
     }
 
@@ -105,6 +116,16 @@ impl VirtualTerminal {
         if st.cursor_row >= st.rows {
             st.cursor_row = st.rows - 1;
             st.viewport_top += 1;
+            Self::limit_scrollback(&mut st);
+        }
+    }
+
+    fn limit_scrollback(st: &mut VtState) {
+        if let Some(limit) = st.scrollback_limit {
+            let excess = st.viewport_top.saturating_sub(limit);
+            st.document.drain(..excess);
+            st.italics.drain(..excess);
+            st.viewport_top -= excess;
         }
     }
 
@@ -114,7 +135,20 @@ impl VirtualTerminal {
 
     fn scroll_down(&self, n: usize) {
         let mut st = self.state.lock().unwrap();
-        st.viewport_top = st.viewport_top.saturating_sub(n);
+        // SD inserts blanks at the top of the live screen and discards its
+        // bottom rows. It does not bring saved scrollback back onto the screen.
+        let top = st.viewport_top;
+        let rows = st.rows;
+        self.ensure_row(&mut st, top + rows - 1);
+        let n = n.max(1).min(rows);
+        for row in (n..rows).rev() {
+            st.document[top + row] = st.document[top + row - n].clone();
+            st.italics[top + row] = st.italics[top + row - n].clone();
+        }
+        for row in 0..n {
+            st.document[top + row] = vec![' '; st.columns];
+            st.italics[top + row] = vec![false; st.columns];
+        }
     }
 
     fn feed(&self, data: &str) {
@@ -129,6 +163,22 @@ impl VirtualTerminal {
                         break;
                     }
                     match bytes[i] {
+                        b']' => {
+                            // OSC metadata (including hyperlink close) occupies
+                            // no cells and ends at BEL or ST.
+                            i += 1;
+                            while i < bytes.len() {
+                                if bytes[i] == 7 {
+                                    i += 1;
+                                    break;
+                                }
+                                if bytes[i] == 27 && bytes.get(i + 1) == Some(&b'\\') {
+                                    i += 2;
+                                    break;
+                                }
+                                i += 1;
+                            }
+                        }
                         b'[' => {
                             i += 1;
                             let start = i;
@@ -153,26 +203,12 @@ impl VirtualTerminal {
                                 b'A' => {
                                     let n = nums.first().copied().unwrap_or(1);
                                     let mut st = self.state.lock().unwrap();
-                                    if st.cursor_row >= n {
-                                        st.cursor_row -= n;
-                                    } else {
-                                        // Moving above the top reveals content above.
-                                        let over = n - st.cursor_row;
-                                        st.cursor_row = 0;
-                                        st.viewport_top = st.viewport_top.saturating_sub(over);
-                                    }
+                                    st.cursor_row = st.cursor_row.saturating_sub(n.max(1));
                                 }
                                 b'B' => {
                                     let n = nums.first().copied().unwrap_or(1);
                                     let mut st = self.state.lock().unwrap();
-                                    let next = st.cursor_row + n;
-                                    if next < st.rows {
-                                        st.cursor_row = next;
-                                    } else {
-                                        // Moving below the bottom scrolls up.
-                                        st.viewport_top += next - st.rows + 1;
-                                        st.cursor_row = st.rows - 1;
-                                    }
+                                    st.cursor_row = (st.cursor_row + n.max(1)).min(st.rows - 1);
                                 }
                                 b'C' => {
                                     let n = nums.first().copied().unwrap_or(1);
@@ -187,21 +223,57 @@ impl VirtualTerminal {
                                     st.cursor_col = col.min(st.columns - 1);
                                 }
                                 b'J' => {
-                                    // Clear screen (2J): blank the visible rows.
                                     let mut st = self.state.lock().unwrap();
+                                    if nums.first() == Some(&3) {
+                                        // Erase saved lines only; the live screen
+                                        // and cursor stay at their screen positions.
+                                        let top = st.viewport_top;
+                                        st.document.drain(..top);
+                                        st.italics.drain(..top);
+                                        st.viewport_top = 0;
+                                        continue;
+                                    }
+                                    // Clear screen (2J): blank the visible rows.
                                     let top = st.viewport_top;
                                     for row in top..top + st.rows {
                                         self.ensure_row(&mut st, row);
                                         st.document[row] = vec![' '; st.columns];
+                                        st.italics[row] = vec![false; st.columns];
                                     }
                                 }
                                 b'K' => {
-                                    // Clear to end of line (2K).
                                     let mut st = self.state.lock().unwrap();
                                     let index = st.viewport_top + st.cursor_row;
                                     self.ensure_row(&mut st, index);
-                                    for c in st.cursor_col..st.columns {
+                                    let start = if nums.first() == Some(&2) {
+                                        0
+                                    } else {
+                                        st.cursor_col
+                                    };
+                                    for c in start..st.columns {
                                         st.document[index][c] = ' ';
+                                        st.italics[index][c] = false;
+                                    }
+                                }
+                                b'm' => {
+                                    let mut st = self.state.lock().unwrap();
+                                    if params.is_empty() {
+                                        st.italic = false;
+                                    }
+                                    let mut index = 0;
+                                    while index < nums.len() {
+                                        match nums[index] {
+                                            0 | 23 => st.italic = false,
+                                            3 => st.italic = true,
+                                            38 | 48 if nums.get(index + 1) == Some(&5) => {
+                                                index += 2
+                                            }
+                                            38 | 48 if nums.get(index + 1) == Some(&2) => {
+                                                index += 4
+                                            }
+                                            _ => {}
+                                        }
+                                        index += 1;
                                     }
                                 }
                                 b'T' => {
@@ -281,6 +353,171 @@ impl rpi_tui::Terminal for VirtualTerminal {
     }
     fn set_progress(&self, _active: bool) {}
     fn flush(&self) {}
+}
+
+impl VirtualTerminal {
+    fn assert_text_italic(&self, text: &str, expected: bool) {
+        let st = self.state.lock().unwrap();
+        let needle: Vec<char> = text.chars().collect();
+        let (row, column) = st
+            .document
+            .iter()
+            .enumerate()
+            .find_map(|(row, chars)| {
+                chars
+                    .windows(needle.len())
+                    .position(|window| window == needle)
+                    .map(|col| (row, col))
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "missing text: {text}; screen: {:?}",
+                    st.document
+                        .iter()
+                        .map(|row| row.iter().collect::<String>())
+                        .collect::<Vec<_>>()
+                )
+            });
+        assert!(
+            st.italics[row][column..column + needle.len()]
+                .iter()
+                .all(|italic| *italic == expected),
+            "wrong italic style for {text:?}: {:?}",
+            &st.italics[row][column..column + needle.len()]
+        );
+    }
+}
+
+#[test]
+fn thinking_markdown_keeps_its_style_and_body_stays_plain_across_updates() {
+    let term = VirtualTerminal::new(100, 12);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let assistant = Arc::new(AssistantMessageComponent::default());
+    assistant.update_blocks(&[
+        AssistantBlock::Thinking("reason *emphasis* continue thinking".into()),
+        AssistantBlock::Text("the normal answer".into()),
+    ]);
+    tui.set_layout_root(Some(assistant.clone()));
+    tui.start_readerless();
+    term.assert_text_italic("continue thinking", true);
+    term.assert_text_italic("the normal answer", false);
+
+    assistant.update_blocks(&[
+        AssistantBlock::Thinking("reason *emphasis* continue thinking longer".into()),
+        AssistantBlock::Text("the normal answer updated".into()),
+    ]);
+    tui.request_render(false);
+    term.assert_text_italic("continue thinking longer", true);
+    term.assert_text_italic("the normal answer updated", false);
+}
+
+#[test]
+fn wrapped_markdown_retains_styles_when_only_continuation_rows_change() {
+    let term = VirtualTerminal::new(14, 20);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let assistant = Arc::new(AssistantMessageComponent::default());
+    assistant.update_blocks(&[
+        AssistantBlock::Thinking("reason".into()),
+        AssistantBlock::Text("*aaaaa bbbbb ccccc* ddddd".into()),
+    ]);
+    tui.set_layout_root(Some(assistant.clone()));
+    tui.start_readerless();
+    term.assert_text_italic("ccccc", true);
+    term.assert_text_italic("ddddd", false);
+    assistant.update_blocks(&[
+        AssistantBlock::Thinking("reason".into()),
+        AssistantBlock::Text("*aaaaa bbbbb zcccc* ddddd".into()),
+    ]);
+    tui.request_render(false);
+    term.assert_text_italic("zcccc", true);
+    term.assert_text_italic("ddddd", false);
+}
+
+#[test]
+fn changing_block_kinds_repaints_thinking_and_body_styles() {
+    let term = VirtualTerminal::new(100, 12);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let assistant = Arc::new(AssistantMessageComponent::default());
+    assistant.update_blocks(&[
+        AssistantBlock::Thinking("the first block".into()),
+        AssistantBlock::Text("the second block".into()),
+    ]);
+    tui.set_layout_root(Some(assistant.clone()));
+    tui.start_readerless();
+    term.assert_text_italic("the first block", true);
+    term.assert_text_italic("the second block", false);
+    assistant.update_blocks(&[
+        AssistantBlock::Text("the first block".into()),
+        AssistantBlock::Thinking("the second block".into()),
+    ]);
+    tui.request_render(false);
+    term.assert_text_italic("the first block", false);
+    term.assert_text_italic("the second block", true);
+    assistant.update_blocks(&[
+        AssistantBlock::Thinking("the first block".into()),
+        AssistantBlock::Text("the second block".into()),
+    ]);
+    tui.request_render(false);
+    term.assert_text_italic("the first block", true);
+    term.assert_text_italic("the second block", false);
+}
+
+#[test]
+fn screen_scroll_and_cursor_movement_cannot_retrieve_saved_history() {
+    let term = VirtualTerminal::new(20, 4);
+    term.feed("zero\r\none\r\ntwo\r\nthree\r\nfour\r\nfive");
+    let top = term.state.lock().unwrap().viewport_top;
+    assert_eq!(top, 2);
+    term.feed("\x1b[100A\x1b[100B");
+    assert_eq!(term.state.lock().unwrap().viewport_top, top);
+    term.feed("\x1b[H\x1b[1T");
+    assert_eq!(term.state.lock().unwrap().viewport_top, top);
+    let visible = term.visible();
+    assert!(visible[0].trim().is_empty());
+    assert_eq!(visible[1].trim(), "two");
+    assert_eq!(term.document_row(0).trim(), "zero");
+}
+
+#[test]
+fn repeated_history_edits_keep_the_beginning_in_bounded_scrollback() {
+    let term = VirtualTerminal::new(40, 8);
+    term.state.lock().unwrap().scrollback_limit = Some(128);
+    let tui = TuiAltScreen::new(Box::new(term.clone()), true, None);
+    tui.set_main_screen_mode(true);
+    let text = Arc::new(Text::new("", 0, 0));
+    let transcript = |revision: usize| {
+        (0..100)
+            .map(|line| {
+                if line == 50 {
+                    format!("message 050 revision {revision}")
+                } else {
+                    format!("message {line:03}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    text.set_text(transcript(0));
+    tui.set_layout_root(Some(text.clone()));
+    tui.start_readerless();
+
+    for revision in 1..=10 {
+        text.set_text(transcript(revision));
+        tui.request_render(false);
+        assert_eq!(
+            term.document_row(0).trim(),
+            "message 000",
+            "revision {revision}: repeated repaint must not evict the beginning"
+        );
+        assert_eq!(
+            term.document_row(50).trim(),
+            format!("message 050 revision {revision}")
+        );
+        assert_eq!(term.visible().last().unwrap().trim(), "message 099");
+    }
 }
 
 #[test]

@@ -42,7 +42,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main
           fetch-depth: 0
           persist-credentials: false
       - name: Require the automation token
@@ -79,7 +78,7 @@ jobs:
       contents: write
       pull-requests: read
     concurrency:
-      group: crates-io-release-${{ needs.detect.outputs.version }}
+      group: crates-io-release
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4

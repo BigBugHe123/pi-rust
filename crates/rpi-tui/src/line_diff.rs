@@ -78,6 +78,161 @@ fn context(atoms: &[Atom<'_>]) -> String {
     }
     format!("{sgr}{link}")
 }
+
+/// Track the effective SGR state across wrapped rows without replaying the
+/// entire history of style changes. Replaying history is both unnecessary and
+/// quadratic for text with many foreground spans that use partial resets.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SgrSlot {
+    Intensity,
+    Italic,
+    Underline,
+    Blink,
+    Inverse,
+    Conceal,
+    Strike,
+    Foreground,
+    Background,
+    Other(u16),
+}
+
+fn set_sgr_slot(slots: &mut Vec<(SgrSlot, String)>, slot: SgrSlot, sequence: String) {
+    if let Some((_, current)) = slots.iter_mut().find(|(existing, _)| *existing == slot) {
+        *current = sequence;
+    } else {
+        slots.push((slot, sequence));
+    }
+}
+
+fn remove_sgr_slot(slots: &mut Vec<(SgrSlot, String)>, slot: SgrSlot) {
+    slots.retain(|(existing, _)| *existing != slot);
+}
+
+fn update_sgr_context(slots: &mut Vec<(SgrSlot, String)>, sequence: &str) {
+    let Some(params) = sequence
+        .strip_prefix("\x1b[")
+        .and_then(|value| value.strip_suffix('m'))
+    else {
+        return;
+    };
+    if params.is_empty() {
+        slots.clear();
+        return;
+    }
+
+    let values: Vec<&str> = params.split(';').collect();
+    let mut index = 0;
+    while index < values.len() {
+        let Ok(code) = values[index].parse::<u16>() else {
+            index += 1;
+            continue;
+        };
+        let simple = || format!("\x1b[{code}m");
+        match code {
+            0 => slots.clear(),
+            1 | 2 => set_sgr_slot(slots, SgrSlot::Intensity, simple()),
+            3 => set_sgr_slot(slots, SgrSlot::Italic, simple()),
+            4 => set_sgr_slot(slots, SgrSlot::Underline, simple()),
+            5 | 6 => set_sgr_slot(slots, SgrSlot::Blink, simple()),
+            7 => set_sgr_slot(slots, SgrSlot::Inverse, simple()),
+            8 => set_sgr_slot(slots, SgrSlot::Conceal, simple()),
+            9 => set_sgr_slot(slots, SgrSlot::Strike, simple()),
+            22 => remove_sgr_slot(slots, SgrSlot::Intensity),
+            23 => remove_sgr_slot(slots, SgrSlot::Italic),
+            24 => remove_sgr_slot(slots, SgrSlot::Underline),
+            25 => remove_sgr_slot(slots, SgrSlot::Blink),
+            27 => remove_sgr_slot(slots, SgrSlot::Inverse),
+            28 => remove_sgr_slot(slots, SgrSlot::Conceal),
+            29 => remove_sgr_slot(slots, SgrSlot::Strike),
+            30..=37 | 90..=97 => {
+                set_sgr_slot(slots, SgrSlot::Foreground, simple());
+            }
+            40..=47 | 100..=107 => {
+                set_sgr_slot(slots, SgrSlot::Background, simple());
+            }
+            39 => remove_sgr_slot(slots, SgrSlot::Foreground),
+            49 => remove_sgr_slot(slots, SgrSlot::Background),
+            38 | 48 => {
+                let slot = if code == 38 {
+                    SgrSlot::Foreground
+                } else {
+                    SgrSlot::Background
+                };
+                let component_count = match values.get(index + 1).copied() {
+                    Some("5") if values.get(index + 2).is_some() => 3,
+                    Some("2") if values.get(index + 5).is_some() => 6,
+                    _ => 0,
+                };
+                if component_count != 0 {
+                    let sequence =
+                        format!("\x1b[{}m", values[index..index + component_count].join(";"));
+                    set_sgr_slot(slots, slot, sequence);
+                    index += component_count;
+                    continue;
+                }
+                set_sgr_slot(slots, SgrSlot::Other(code), simple());
+            }
+            _ => set_sgr_slot(slots, SgrSlot::Other(code), simple()),
+        }
+        index += 1;
+    }
+}
+
+fn update_osc8_context(link: &mut Option<String>, sequence: &str) {
+    let Some(content) = sequence.strip_prefix("\x1b]8;").and_then(|value| {
+        value
+            .strip_suffix('\x07')
+            .or_else(|| value.strip_suffix("\x1b\\"))
+    }) else {
+        return;
+    };
+    let Some((_, uri)) = content.split_once(';') else {
+        return;
+    };
+    if uri.is_empty() {
+        *link = None;
+    } else {
+        *link = Some(sequence.to_string());
+    }
+}
+
+fn wrapped_context(atoms: &[Atom<'_>]) -> String {
+    let mut slots = Vec::new();
+    let mut link = None;
+    for atom in atoms.iter().filter(|atom| atom.width == 0) {
+        if atom.text.starts_with("\x1b[") {
+            update_sgr_context(&mut slots, atom.text);
+        } else if atom.text.starts_with("\x1b]8;") {
+            update_osc8_context(&mut link, atom.text);
+        }
+    }
+
+    let mut output = slots
+        .into_iter()
+        .map(|(_, sequence)| sequence)
+        .collect::<String>();
+    if let Some(link) = link {
+        output.push_str(&link);
+    }
+    output
+}
+
+/// Wrapped rows can be repainted independently. Carry their incoming style
+/// explicitly and close it at the row boundary instead of depending on the
+/// previous physical row having just been written by the terminal.
+pub(crate) fn isolate_wrapped_lines(lines: &mut [String]) {
+    let mut carry = String::new();
+    for line in lines {
+        let source = format!("{carry}{line}");
+        let Some(parsed) = atoms(&source) else {
+            carry.clear();
+            continue;
+        };
+        carry = wrapped_context(&parsed);
+        *line = format!("{source}\x1b[0m\x1b]8;;\x07");
+    }
+}
+
 /// Slice terminal columns without losing SGR/OSC8 context or splitting wide graphemes.
 /// Unsupported control protocols retain their existing unsliced fallback path.
 pub(crate) fn slice(line: &str, start: usize, width: usize) -> Option<String> {
@@ -152,6 +307,20 @@ pub(crate) fn patch(old: &str, new: &str) -> Option<(usize, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wrapped_style_context_keeps_only_active_sgr_state() {
+        let mut lines: Vec<String> = (0..20).map(|_| "\x1b[31mA\x1b[39m".to_string()).collect();
+        isolate_wrapped_lines(&mut lines);
+
+        let lengths: Vec<usize> = lines.iter().map(String::len).collect();
+        assert!(lengths.iter().all(|length| *length < 64));
+        assert!(lengths.windows(2).all(|pair| pair[0] == pair[1]));
+
+        let mut active_style = vec!["\x1b[31mred".to_string(), "tail".to_string()];
+        isolate_wrapped_lines(&mut active_style);
+        assert!(active_style[1].starts_with("\x1b[31mtail"));
+    }
+
     #[test]
     fn scrolling_chat_does_not_write_unchanged_sidebar() {
         let (column, text) = patch(

@@ -250,6 +250,8 @@ rpi install rpi-extension-example --version 0.1.0
 rpi install my-extension --path ../my-rpi-extension --force
 ```
 
+`rpi install <name>` upgrades newer versions directly and skips an already installed version. Use `--force` to reinstall the same version or allow a downgrade. This also applies to Cargo builds and local installs; local changes without a version bump require `--force`.
+
 For iterative development:
 
 ```bash

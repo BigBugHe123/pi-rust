@@ -102,8 +102,8 @@ impl Markdown {
     }
 
     /// Wrap one rendered line with the configured base style, re-opening the
-    /// base after every nested `SGR 0` reset. Returns the line unchanged when
-    /// no base style is configured.
+    /// base after nested full, italic, or foreground resets. Returns the line
+    /// unchanged when no base style is configured.
     fn apply_base_style(&self, line: &str) -> String {
         let base = self.options.base_style.as_str();
         if base.is_empty() {
@@ -113,10 +113,27 @@ impl Markdown {
         let mut out = String::with_capacity(line.len() + base.len() * 4 + reset.len());
         out.push_str(base);
         let mut rest = line;
-        while let Some(idx) = rest.find(reset) {
-            out.push_str(&rest[..idx + reset.len()]);
-            out.push_str(base);
-            rest = &rest[idx + reset.len()..];
+        while let Some(idx) = rest.find("\x1b[") {
+            out.push_str(&rest[..idx]);
+            rest = &rest[idx..];
+            let Some(end) = rest
+                .as_bytes()
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(_, byte)| (0x40..=0x7e).contains(*byte))
+                .map(|(index, _)| index + 1)
+            else {
+                break;
+            };
+            let sequence = &rest[..end];
+            out.push_str(sequence);
+            // Inner emphasis closes with SGR 23, and links/colors with SGR 39.
+            // Both must restore the thinking base just like inline code's SGR 0.
+            if matches!(sequence, "\x1b[0m" | "\x1b[m" | "\x1b[23m" | "\x1b[39m") {
+                out.push_str(base);
+            }
+            rest = &rest[end..];
         }
         out.push_str(rest);
         // Terminate the line so the base style cannot bleed into the next row

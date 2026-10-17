@@ -170,7 +170,7 @@ async fn check_startup_with_client(client: Option<reqwest::Client>) -> UpdateRep
     // path stays independent of any Pi package resource discovery.
     let native_checks = crate::install::installed_native_packages()
         .into_iter()
-        .filter(|package| package.source.is_none() || package.prebuilt.is_some())
+        .filter(|package| package.supports_registry_update())
         .map(|package| {
             let client = client.clone();
             async move {
@@ -385,7 +385,7 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
         }
     }
     for package in crate::install::installed_native_packages() {
-        if package.source.is_some() && package.prebuilt.is_none() {
+        if !package.supports_registry_update() {
             continue;
         }
         let Some(latest) = cache.native_packages.get(&native_cache_key(&package)) else {
@@ -400,13 +400,13 @@ fn report_from_cache(cache: &UpdateCache) -> UpdateReport {
                     package.prebuilt.as_ref().filter(|p| p.custom_repository)
                 {
                     format!(
-                        "rpi install {} --github {} --force",
+                        "rpi install {} --github {}",
                         package.name, source.repository
                     )
                 } else if package.prebuilt.is_some() {
-                    format!("rpi install {} --force", package.name)
+                    format!("rpi install {}", package.name)
                 } else {
-                    format!("rpi install {} --build --force", package.name)
+                    format!("rpi install {} --build", package.name)
                 },
             });
         }
@@ -474,7 +474,7 @@ async fn fetch_crates_url(client: &reqwest::Client, url: &str) -> RegistryLookup
 pub fn is_newer(current: &str, latest: &str) -> bool {
     let parse = |value: &str| semver::Version::parse(value.trim().trim_start_matches('v')).ok();
     match (parse(current), parse(latest)) {
-        (Some(current), Some(latest)) => latest > current,
+        (Some(current), Some(latest)) => latest.cmp_precedence(&current).is_gt(),
         _ => false,
     }
 }
@@ -2433,7 +2433,7 @@ mod tests {
         assert_eq!(report.notices[0].latest, "2.0.0");
         assert_eq!(
             report.notices[0].command,
-            "rpi install demo --github https://github.com/owner/repo --force"
+            "rpi install demo --github https://github.com/owner/repo"
         );
         let mut other = record.clone();
         other.prebuilt.as_mut().unwrap().repository = "https://github.com/another/repo".into();
@@ -2441,12 +2441,42 @@ mod tests {
             super::native_cache_key(&record),
             super::native_cache_key(&other)
         );
+
+        // A successful install updates the registry. A cached remote version
+        // must no longer advertise an update after that version is installed.
+        let mut updated = record.clone();
+        updated.version = "2.0.0".into();
+        std::fs::write(
+            agent.path().join("native-packages.json"),
+            serde_json::to_vec(&[updated]).unwrap(),
+        )
+        .unwrap();
+        assert!(super::report_from_cache(&cache).notices.is_empty());
         other = record.clone();
         other.prebuilt.as_mut().unwrap().custom_repository = false;
         assert_ne!(
             super::native_cache_key(&record),
             super::native_cache_key(&other)
         );
+        let mut cargo = record.clone();
+        cargo.source = None;
+        cargo.prebuilt = None;
+        for (package, command) in [
+            (other, "rpi install demo"),
+            (cargo, "rpi install demo --build"),
+        ] {
+            cache
+                .native_packages
+                .insert(super::native_cache_key(&package), "2.0.0".into());
+            std::fs::write(
+                agent.path().join("native-packages.json"),
+                serde_json::to_vec(&[package]).unwrap(),
+            )
+            .unwrap();
+            let report = super::report_from_cache(&cache);
+            assert_eq!(report.notices.len(), 1);
+            assert_eq!(report.notices[0].command, command);
+        }
     }
 
     /// Fixtures may live under an ambient TEMP that is itself a junction
@@ -3312,6 +3342,8 @@ mod tests {
         assert!(is_newer("1.2.3-beta.1", "1.2.3-beta.2"));
         assert!(is_newer("1.2.3-beta.2", "1.2.3"));
         assert!(!is_newer("1.2.3", "1.2.3"));
+        assert!(!is_newer("1.2.3", "1.2.3+build.1"));
+        assert!(!is_newer("1.2.3+build.1", "1.2.3+build.2"));
         assert!(!is_newer("nightly", "1.0.0"));
     }
 

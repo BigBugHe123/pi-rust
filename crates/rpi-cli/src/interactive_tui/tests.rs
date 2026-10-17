@@ -1255,7 +1255,7 @@ fn package_updates_render_without_an_rpi_update() {
         name: "rpi-im-message".into(),
         current: "0.1.9".into(),
         latest: "0.1.10".into(),
-        command: "rpi install rpi-im-message --force".into(),
+        command: "rpi install rpi-im-message".into(),
     };
 
     for include_rpi in [false, true] {
@@ -1280,6 +1280,10 @@ fn package_updates_render_without_an_rpi_update() {
         assert!(plain.contains("Package Update Available"), "{plain}");
         assert!(plain.contains("rpi-im-message 0.1.9 -> 0.1.10"), "{plain}");
         assert!(plain.contains(&package_notice.command), "{plain}");
+        assert!(
+            !plain.contains(&format!("{}.", package_notice.command)),
+            "{plain}"
+        );
         assert_eq!(plain.contains("rpi update"), include_rpi, "{plain}");
     }
 }

@@ -220,6 +220,21 @@ fn list(args: &[String]) -> i32 {
 }
 
 fn update(args: &[String]) -> i32 {
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    update_at(&cwd, args, update_global_package)
+}
+
+fn update_at(
+    cwd: &Path,
+    args: &[String],
+    mut update_global: impl FnMut(&crate::install::InstalledNativePackage, &[String]) -> bool,
+) -> i32 {
     let mut name = None;
     let mut link_args = Vec::new();
     let mut i = 0;
@@ -244,14 +259,7 @@ fn update(args: &[String]) -> i32 {
         i += 1;
     }
 
-    let cwd = match std::env::current_dir() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 1;
-        }
-    };
-    let registry = match read_registry(&cwd) {
+    let registry = match read_registry(cwd) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("error: {e}");
@@ -268,25 +276,6 @@ fn update(args: &[String]) -> i32 {
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut status = 0;
-    for package in packages {
-        let package_name = package.name.clone();
-        eprintln!("package: updating project package `{package_name}`...");
-        let mut args = vec![
-            "--path".to_string(),
-            package.source,
-            "--package".to_string(),
-            package.cargo_package,
-            "--name".to_string(),
-            package.name,
-            "--force".to_string(),
-        ];
-        args.extend(link_args.iter().cloned());
-        if link(&args) != 0 {
-            status = 1;
-        }
-    }
-
     // Global extensions installed by `rpi install` are also packages. This is
     // the path used by crates.io extensions such as rpi-im-message; delegate to
     // the existing transactional installer so artifact and registry updates
@@ -295,7 +284,7 @@ fn update(args: &[String]) -> i32 {
         Ok(packages) => packages
             .into_iter()
             .filter(|package| {
-                package.source.is_none()
+                package.supports_registry_update()
                     && name
                         .as_deref()
                         .map_or(true, |wanted| wanted == package.name)
@@ -317,25 +306,63 @@ fn update(args: &[String]) -> i32 {
             return 1;
         }
     }
+
+    if packages.is_empty() && global_packages.is_empty() {
+        println!("no project or global packages to update");
+        return 0;
+    }
+
+    let mut status = 0;
+    for package in packages {
+        let package_name = package.name.clone();
+        eprintln!("package: updating project package `{package_name}`...");
+        let mut args = vec![
+            "--path".to_string(),
+            package.source,
+            "--package".to_string(),
+            package.cargo_package,
+            "--name".to_string(),
+            package.name,
+            "--force".to_string(),
+        ];
+        args.extend(link_args.iter().cloned());
+        if link(&args) != 0 {
+            status = 1;
+        }
+    }
     for package in global_packages {
         eprintln!("package: updating global package `{}`...", package.name);
-        if !update_global_package(&package.name, &link_args) {
+        if !update_global(&package, &link_args) {
             status = 1;
         }
     }
 
-    if status == 0 && registry.packages.is_empty() && name.is_none() {
-        let has_global = crate::install::installed_native_packages()
-            .into_iter()
-            .any(|package| package.source.is_none());
-        if !has_global {
-            println!("no project or global packages to update");
-        }
-    }
     status
 }
 
-fn update_global_package(name: &str, args: &[String]) -> bool {
+fn global_update_args(
+    package: &crate::install::InstalledNativePackage,
+    args: &[String],
+) -> Vec<String> {
+    let mut install_args = vec!["install".into(), package.name.clone()];
+    if let Some(source) = &package.prebuilt {
+        if source.custom_repository {
+            install_args.extend(["--github".into(), source.repository.clone()]);
+        }
+    } else {
+        install_args.push("--build".into());
+    }
+    if package.prebuilt.is_none() && args.iter().any(|arg| arg == "--locked") {
+        install_args.push("--locked".into());
+    }
+    install_args
+}
+
+fn update_global_package(
+    package: &crate::install::InstalledNativePackage,
+    args: &[String],
+) -> bool {
+    let name = &package.name;
     let executable = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
@@ -344,10 +371,7 @@ fn update_global_package(name: &str, args: &[String]) -> bool {
         }
     };
     let mut command = std::process::Command::new(executable);
-    command.args(["install", name, "--force"]);
-    if args.iter().any(|arg| arg == "--locked") {
-        command.arg("--locked");
-    }
+    command.args(global_update_args(package, args));
     match command.status() {
         Ok(exit) if exit.success() => true,
         Ok(exit) => {
@@ -596,6 +620,171 @@ fn print_update_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_package(name: &str, source: Option<&str>) -> crate::install::InstalledNativePackage {
+        crate::install::InstalledNativePackage {
+            name: name.into(),
+            version: "0.1.11".into(),
+            source: source.map(str::to_owned),
+            prebuilt: None,
+            artifacts: Vec::new(),
+        }
+    }
+
+    fn prebuilt_package(custom_repository: bool) -> crate::install::InstalledNativePackage {
+        serde_json::from_value(serde_json::json!({
+            "name": "rpi-im-message", "version": "0.1.11",
+            "source": "prebuilt:https://github.com/owner/extensions",
+            "prebuilt": {
+                "repository": "https://github.com/owner/extensions",
+                "target": "x86_64-pc-windows-msvc",
+                "manifest_sha256": "a".repeat(64), "source_commit": "b".repeat(40),
+                "sdk_version": "0.4.0", "plugin_abi": 4,
+                "archive_sha256": "c".repeat(64), "library_sha256": "d".repeat(64),
+                "custom_repository": custom_repository
+            }
+        }))
+        .unwrap()
+    }
+
+    fn with_registry(data: &[u8], test: impl FnOnce(&Path)) {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+        let _guard = crate::config::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let agent = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, agent.path());
+        std::fs::write(agent.path().join("native-packages.json"), data).unwrap();
+        test(project.path());
+    }
+
+    #[test]
+    fn update_includes_prebuilt_packages_and_preserves_install_backends() {
+        let records = vec![
+            prebuilt_package(false),
+            native_package("cargo-extension", None),
+            native_package("local-extension", Some("/dev/local-extension")),
+        ];
+        with_registry(&serde_json::to_vec(&records).unwrap(), |cwd| {
+            // Reproduce the empty project registry from the bug report. Neither
+            // the prebuilt source marker nor the lack of project links should
+            // hide an installed remote package.
+            let mut commands = Vec::new();
+            assert_eq!(
+                update_at(cwd, &[], |package, args| {
+                    commands.push(global_update_args(package, args));
+                    true
+                }),
+                0
+            );
+            assert_eq!(
+                commands,
+                [
+                    vec!["install", "rpi-im-message"],
+                    vec!["install", "cargo-extension", "--build"],
+                ]
+            );
+
+            for wanted in ["rpi-im-message", "cargo-extension"] {
+                commands.clear();
+                assert_eq!(
+                    update_at(cwd, &[wanted.into(), "--locked".into()], |package, args| {
+                        commands.push(global_update_args(package, args));
+                        true
+                    }),
+                    0
+                );
+                assert_eq!(commands.len(), 1);
+                assert_eq!(commands[0][1], wanted);
+                assert_eq!(
+                    commands[0].iter().any(|arg| arg == "--locked"),
+                    wanted == "cargo-extension"
+                );
+            }
+            for wanted in ["local-extension", "missing-extension"] {
+                assert_eq!(
+                    update_at(cwd, &[wanted.into()], |_, _| {
+                        panic!("local or unknown packages must not trigger a remote install")
+                    }),
+                    1
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn update_preserves_explicit_github_repository() {
+        let record = prebuilt_package(true);
+        with_registry(&serde_json::to_vec(&[record]).unwrap(), |cwd| {
+            let mut commands = Vec::new();
+            assert_eq!(
+                update_at(cwd, &[], |package, args| {
+                    commands.push(global_update_args(package, args));
+                    true
+                }),
+                0
+            );
+            assert_eq!(
+                commands,
+                [vec![
+                    "install",
+                    "rpi-im-message",
+                    "--github",
+                    "https://github.com/owner/extensions"
+                ]]
+            );
+        });
+    }
+
+    #[test]
+    fn update_continues_after_a_failed_package_and_returns_failure() {
+        let records = vec![
+            prebuilt_package(false),
+            native_package("other-extension", None),
+        ];
+        with_registry(&serde_json::to_vec(&records).unwrap(), |cwd| {
+            let mut visited = Vec::new();
+            assert_eq!(
+                update_at(cwd, &[], |package, _| {
+                    visited.push(package.name.clone());
+                    package.name != "rpi-im-message"
+                }),
+                1
+            );
+            assert_eq!(visited, ["rpi-im-message", "other-extension"]);
+        });
+    }
+
+    #[test]
+    fn update_rejects_corrupt_global_metadata_before_building_project_packages() {
+        with_registry(b"invalid json", |cwd| {
+            write_registry(
+                cwd,
+                &PackageRegistry {
+                    packages: vec![ProjectPackage {
+                        name: "project-extension".into(),
+                        version: "0.1.0".into(),
+                        source: "/missing/source".into(),
+                        cargo_package: "project-extension".into(),
+                        artifacts: Vec::new(),
+                    }],
+                },
+            )
+            .unwrap();
+            assert_eq!(update_at(cwd, &[], |_, _| panic!("invalid registry")), 1);
+            assert!(!cwd.join(".rpi/packages/project-extension").exists());
+        });
+    }
 
     #[test]
     fn package_names_reject_path_traversal() {

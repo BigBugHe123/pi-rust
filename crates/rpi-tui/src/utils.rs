@@ -345,6 +345,9 @@ pub fn wrap_text_with_ansi(s: &str, max_width: usize) -> Vec<String> {
         lines.push(String::new());
     }
 
+    if s.contains('\x1b') {
+        crate::line_diff::isolate_wrapped_lines(&mut lines);
+    }
     lines
 }
 
