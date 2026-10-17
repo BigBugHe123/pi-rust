@@ -61,7 +61,7 @@ function renderList() {
 async function init() {
   await initI18n();
   const responses = await Promise.all(['./data/packages.json', './data/packages-meta.json'].map(async (url) => {
-    const response = await fetch(url, { cache: 'no-cache' });
+    const response = await fetch(url);
     if (!response.ok) throw new Error(`Failed to load ${url}: ${response.status}`);
     return response.json();
   }));

@@ -23,6 +23,7 @@ pub mod hooks;
 pub mod message;
 pub mod queue;
 pub mod stream_fn;
+pub mod tool_execution_scope;
 pub mod types;
 
 pub use abort::AbortHandle;

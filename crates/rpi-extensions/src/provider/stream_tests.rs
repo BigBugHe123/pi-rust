@@ -80,8 +80,9 @@ async fn cancellation_finishes_before_an_uncooperative_plugin_and_retains_its_li
     let provider = PluggableProvider::new(record, snapshot, keepalive, Handle::current());
     let model = Model::new("m", "M", Api::Faux, "probe", "https://example");
     let options = SimpleStreamOptions::default();
-    let mut stream = provider
-        .stream_simple(&model, &Context::new(vec![]), &options)
+    let scope = Arc::new(rpi_agent::tool_execution_scope::ToolExecutionScope::default());
+    let mut stream = scope
+        .run(provider.stream_simple(&model, &Context::new(vec![]), &options))
         .await;
     drop(provider);
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -98,6 +99,9 @@ async fn cancellation_finishes_before_an_uncooperative_plugin_and_retains_its_li
     options.signal.cancel();
     let terminal = tokio::time::timeout(Duration::from_millis(500), stream.next()).await;
     let library_retained = weak.upgrade().is_some();
+    let capacity_retained = tokio::time::timeout(Duration::from_millis(25), scope.wait_idle())
+        .await
+        .is_err();
 
     // Release before asserting so a failure cannot strand a blocking pool thread.
     *state.released.lock().unwrap() = true;
@@ -111,6 +115,10 @@ async fn cancellation_finishes_before_an_uncooperative_plugin_and_retains_its_li
     .expect("the library is released after the FFI call finishes");
 
     assert!(library_retained, "the detached request must retain its DLL");
+    assert!(
+        capacity_retained,
+        "an uncooperative provider must retain child capacity until its FFI call returns"
+    );
     let terminal = terminal
         .expect("cancellation must not wait for plugin completion")
         .unwrap();

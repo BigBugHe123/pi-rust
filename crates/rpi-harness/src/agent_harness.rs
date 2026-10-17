@@ -456,6 +456,8 @@ struct ActiveRun {
     run_id: String,
     lane: String,
     signal: CancellationToken,
+    /// Cancels delegated work on abort OR normal parent completion.
+    children: CancellationToken,
     idle: Arc<tokio::sync::Notify>,
     kind: OperationKind,
 }
@@ -596,6 +598,10 @@ pub const MAX_RESUME_ATTEMPTS: u32 = 3;
 /// operation so the loop sees a consistent snapshot; setters replace fields
 /// in place.
 struct HarnessInner {
+    // The final harness owner cancels children even if weak runtime bindings
+    // still retain the public session/event facades.
+    child_scope: Arc<Mutex<CancellationToken>>,
+    execution_scope: Option<Arc<rpi_agent::tool_execution_scope::ToolExecutionScope>>,
     model: Model,
     thinking_level: ThinkingLevel,
     active_tool_names: Vec<String>,
@@ -656,7 +662,15 @@ pub struct AgentHarness {
     /// Serializes external appends with operation admission and boundary drains.
     /// Never held while executing a tool or invoking an external event handler.
     message_writes: Arc<tokio::sync::Mutex<()>>,
+    child_scope: Arc<Mutex<CancellationToken>>,
+    is_child: bool,
+    max_turns: Option<u32>,
 }
+
+mod child;
+pub use child::ChildHarness;
+mod weak;
+pub use weak::WeakAgentHarness;
 
 impl AgentHarness {
     /// Construct from options. Mirrors TS `AgentHarness.create`: when the
@@ -735,7 +749,10 @@ impl AgentHarness {
             }
         }
 
+        let child_scope = Arc::new(Mutex::new(CancellationToken::new()));
         let inner = HarnessInner {
+            child_scope: child_scope.clone(),
+            execution_scope: None,
             model: options.model,
             thinking_level: options.thinking_level,
             active_tool_names: options.active_tool_names,
@@ -781,6 +798,9 @@ impl AgentHarness {
             bus: HarnessEventBus::new(),
             lane: "main".to_string(),
             message_writes: Arc::new(tokio::sync::Mutex::new(())),
+            child_scope,
+            is_child: false,
+            max_turns: None,
         };
         if options.allow_existing_session {
             let messages = harness.flush_context_messages_locked().await?;
@@ -1060,6 +1080,9 @@ impl AgentHarness {
             bus: self.bus.clone(),
             lane: name.to_string(),
             message_writes: Arc::clone(&self.message_writes),
+            child_scope: self.child_scope.clone(),
+            is_child: self.is_child,
+            max_turns: self.max_turns,
         })
     }
 
@@ -2020,6 +2043,7 @@ impl AgentHarness {
     pub async fn close(&self) -> HarnessResult<()> {
         let mut inner = self.inner.lock().unwrap();
         inner.closed = true;
+        self.child_scope.lock().unwrap().cancel();
         Ok(())
     }
 
@@ -2082,6 +2106,12 @@ impl AgentHarness {
                 }
             };
             queue.lock().unwrap().pending.push_back(item);
+        }
+        // Retire children of the old session, but permit new children after the swap.
+        {
+            let mut scope = self.child_scope.lock().unwrap();
+            scope.cancel();
+            *scope = CancellationToken::new();
         }
         self.session.set_storage(target.storage());
         Ok(())
@@ -2243,6 +2273,7 @@ impl AgentHarness {
             run_id: run_id.clone(),
             lane: self.lane.clone(),
             signal: signal.clone(),
+            children: self.child_scope.lock().unwrap().child_token(),
             idle: Arc::clone(&idle),
             kind,
         });
@@ -2258,7 +2289,15 @@ impl AgentHarness {
                 .as_ref()
                 .is_some_and(|run| run.run_id == run_id)
             {
-                inner.active_run.take().map(|a| a.idle)
+                inner.active_run.take().map(|a| {
+                    // A child's run owns every detached tool task it started,
+                    // including when the foreground future unwinds or is dropped.
+                    if self.is_child {
+                        a.signal.cancel();
+                    }
+                    a.children.cancel();
+                    a.idle
+                })
             } else {
                 None
             }
@@ -3023,6 +3062,11 @@ impl AgentHarness {
             return Err(HarnessError::closed());
         }
         Ok(ConfigSnapshot {
+            child_scope: inner.active_run.as_ref().map_or_else(
+                || self.child_scope.lock().unwrap().child_token(),
+                |run| run.children.child_token(),
+            ),
+            parent_signal: inner.active_run.as_ref().map(|run| run.signal.clone()),
             model: inner.model.clone(),
             thinking_level: inner.thinking_level,
             active_tool_names: inner.active_tool_names.clone(),
@@ -3033,6 +3077,7 @@ impl AgentHarness {
             retry: inner.retry.clone(),
             compaction: inner.compaction,
             tool_execution: inner.tool_execution,
+            driving: inner.driving,
             models: inner.models.clone(),
             to_provider_messages: inner.to_provider_messages.clone(),
             entry_projectors: inner.entry_projectors.clone(),
@@ -3491,6 +3536,21 @@ impl AgentHarness {
         admission: (String, CancellationToken, Arc<tokio::sync::Notify>),
         resume: Option<PendingResume>,
     ) -> HarnessResult<RunResult> {
+        let scope = self.inner.lock().unwrap().execution_scope.clone();
+        let run = self.run_admitted_inner(prompts, from_assistant, admission, resume);
+        match scope {
+            Some(scope) => scope.run(run).await,
+            None => run.await,
+        }
+    }
+
+    async fn run_admitted_inner(
+        &self,
+        prompts: Vec<AgentMessage>,
+        from_assistant: bool,
+        admission: (String, CancellationToken, Arc<tokio::sync::Notify>),
+        resume: Option<PendingResume>,
+    ) -> HarnessResult<RunResult> {
         let (run_id, signal, _idle) = admission;
         let _run_lease = ActiveRunLease {
             harness: self,
@@ -3755,7 +3815,10 @@ impl AgentHarness {
         // run (`docs/debugging/llm-repetition-forensics.md` §二). Upstream has no such
         // ceiling either, so this is **off unless** `RPI_MAX_TURNS_PER_RUN=<n>`
         // asks for it; when off the hook stays `None` and the loop is unchanged.
-        let run_budget = Arc::new(Mutex::new(crate::run_budget::RunBudget::from_env()));
+        let run_budget = Arc::new(Mutex::new(match self.max_turns {
+            Some(limit) => crate::run_budget::RunBudget::new(limit),
+            None => crate::run_budget::RunBudget::from_env(),
+        }));
         let should_stop_after_turn: Option<rpi_agent::ShouldStopAfterTurn> =
             if run_budget.lock().unwrap().is_enabled() {
                 let budget = Arc::clone(&run_budget);
@@ -4382,6 +4445,8 @@ impl AgentHarness {
 
 /// Config snapshot cloned out of `HarnessInner` at the start of an operation.
 struct ConfigSnapshot {
+    child_scope: CancellationToken,
+    parent_signal: Option<CancellationToken>,
     model: Model,
     thinking_level: ThinkingLevel,
     active_tool_names: Vec<String>,
@@ -4392,6 +4457,7 @@ struct ConfigSnapshot {
     retry: RetryPolicy,
     compaction: CompactionSettings,
     tool_execution: HarnessToolExecution,
+    driving: DrivingMode,
     models: Vec<Arc<dyn AiProvider>>,
     to_provider_messages: Option<ConvertToLlm>,
     entry_projectors: BTreeMap<String, CustomEntryContextMessageProjector>,
@@ -5019,6 +5085,9 @@ pub struct LaneHandle {
     #[allow(dead_code)]
     bus: HarnessEventBus,
     message_writes: Arc<tokio::sync::Mutex<()>>,
+    child_scope: Arc<Mutex<CancellationToken>>,
+    is_child: bool,
+    max_turns: Option<u32>,
 }
 
 impl LaneHandle {
@@ -5029,6 +5098,9 @@ impl LaneHandle {
             bus: self.bus.clone(),
             lane: self.lane.clone(),
             message_writes: Arc::clone(&self.message_writes),
+            child_scope: self.child_scope.clone(),
+            is_child: self.is_child,
+            max_turns: self.max_turns,
         }
     }
 }

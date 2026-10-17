@@ -25,6 +25,20 @@ pub enum PanelLayout {
     Footer,
 }
 
+/// Theme colors for literal text highlights; terminal escapes are never accepted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanelHighlightColor {
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PanelHighlight {
+    pub text: String,
+    pub color: PanelHighlightColor,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtensionPanel {
@@ -50,6 +64,8 @@ pub struct ExtensionPanel {
     #[serde(default)]
     pub title: String,
     pub lines: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub highlights: Vec<PanelHighlight>,
 }
 fn default_width() -> usize {
     44
@@ -78,6 +94,13 @@ impl ExtensionPanel {
             || self.title.len() > 256
         {
             return Err("panel content exceeds limits".into());
+        }
+        if self.highlights.len() > 32
+            || self.highlights.iter().any(|h| {
+                h.text.is_empty() || h.text.len() > 256 || h.text.chars().any(char::is_control)
+            })
+        {
+            return Err("invalid panel highlights".into());
         }
         Ok(())
     }

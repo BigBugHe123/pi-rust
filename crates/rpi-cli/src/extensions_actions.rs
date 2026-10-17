@@ -25,13 +25,13 @@
 //! tools the harness is built with), but the plugin stores the
 //! `ActionBridge`'s `user_data` pointer during `register` and that pointer
 //! must remain valid for the whole session. So the host cannot hold the
-//! `AgentHarness` directly — it holds an [`Arc<OnceLock<Arc<AgentHarness>>>`]
+//! `AgentHarness` directly — it holds an [`Arc<OnceLock<WeakAgentHarness>>`]
 //! that is **empty at register time** and **filled once** by
 //! [`HarnessActionHost::set_harness`] immediately after `AgentHarness::create`
-//! succeeds. No plugin can call a runtime action before the harness runs, so
-//! the cell is always set before the first `get()`. The `Arc<dyn
-//! RuntimeActionHost>` (and thus the `ActionBridge` pointer) is stable from
-//! construction, satisfying the FFI lifetime requirement.
+//! succeeds. Each action upgrades that weak binding for its duration; the host
+//! must not keep tools/providers alive via adapter -> keepalive -> bridge -> host.
+//! Before construction or after final harness release, actions fail explicitly.
+//! The bridge's opaque handle stays stable without retaining the harness.
 //!
 //! The impl needs the model `catalog` for `set_model(id)` (the lane wants a
 //! `Model`, not an id) and the `cwd` for session create/fork/switch. Both are
@@ -44,7 +44,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use rpi_ai::types::ThinkingLevel;
 use rpi_extensions::RuntimeActionHost;
 use rpi_harness::agent_harness::{
-    AgentHarness, HarnessRunOutcome, NavigationOutcome, SendMessageResult,
+    AgentHarness, HarnessRunOutcome, NavigationOutcome, SendMessageResult, WeakAgentHarness,
 };
 use rpi_harness::session::session::Session;
 use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery};
@@ -63,10 +63,9 @@ use crate::session::{default_session_dir, open_session_by_id};
 /// any thread; the impl's async methods run ON that runtime (they are spawned
 /// by the trampoline), so they may freely await.
 pub struct HarnessActionHost {
-    /// Filled by `set_harness` after the harness exists. `get()` is infallible
-    /// once set; before that (only possible mid-build, before any plugin call)
-    /// methods return a "not ready" error.
-    harness: Arc<OnceLock<Arc<AgentHarness>>>,
+    /// Weak binding filled after construction. Each operation upgrades it;
+    /// before construction or after final owner release it returns an error.
+    harness: Arc<OnceLock<WeakAgentHarness>>,
     /// The auth-filtered catalog (the same list the TUI `/model` selector
     /// shows). `set_model(id)` resolves an id against this.
     catalog: RwLock<Vec<rpi_ai::Model>>,
@@ -81,6 +80,7 @@ pub struct HarnessActionHost {
     /// tool state keyed off the old id would otherwise keep serving the session
     /// it named before the swap.
     tool_context: rpi_extensions::ToolCallContext,
+    children: crate::child_agents::ChildAgents,
     #[allow(dead_code)]
     runtime: Handle,
 }
@@ -98,7 +98,7 @@ impl HarnessActionHost {
         runtime: Handle,
         cli_flags: BTreeMap<String, serde_json::Value>,
         tool_context: rpi_extensions::ToolCallContext,
-    ) -> (Self, Arc<OnceLock<Arc<AgentHarness>>>) {
+    ) -> (Self, Arc<OnceLock<WeakAgentHarness>>) {
         let harness = Arc::new(OnceLock::new());
         (
             Self {
@@ -107,6 +107,7 @@ impl HarnessActionHost {
                 cwd,
                 cli_flags,
                 tool_context,
+                children: crate::child_agents::ChildAgents::default(),
                 runtime,
             },
             harness,
@@ -124,20 +125,18 @@ impl HarnessActionHost {
     /// `AgentHarness::create` succeeds. Returns the host (for fluent chaining)
     /// — the caller already holds the `Arc<dyn RuntimeActionHost>` from
     /// construction; this just populates the cell that host reads.
-    pub fn set_harness(cell: &Arc<OnceLock<Arc<AgentHarness>>>, harness: Arc<AgentHarness>) {
-        // `set` panics if already set; that's the right failure (double-build
-        // is a programming error, not a runtime condition).
-        let _ = cell.set(harness);
+    pub fn set_harness(cell: &Arc<OnceLock<WeakAgentHarness>>, harness: Arc<AgentHarness>) {
+        let _ = cell.set(harness.downgrade());
     }
 
-    /// Borrow the harness, or return a "not ready" error. Only reachable
-    /// mid-build before `set_harness`; once the harness runs, plugins can fire
-    /// actions and the cell is set.
-    fn harness(&self) -> Result<&AgentHarness, String> {
+    /// Pin the harness only for this action. The binding itself must not retain
+    /// tools/providers through the plugin -> keepalive -> host reference cycle.
+    fn harness(&self) -> Result<AgentHarness, String> {
         self.harness
             .get()
-            .map(|h| h.as_ref())
-            .ok_or_else(|| "runtime action invoked before harness was built".to_string())
+            .ok_or_else(|| "runtime action invoked before harness was built".to_string())?
+            .upgrade()
+            .ok_or_else(|| "runtime action invoked after harness was dropped".to_string())
     }
 
     /// Resolve `id` (case-insensitive exact, then substring) against the
@@ -192,7 +191,7 @@ fn arg_str_array(args: &serde_json::Value, key: &str) -> Result<Vec<String>, Str
 /// Render a `HarnessRunOutcome` as JSON for the plugin. Only the terminal
 /// status + leaf id cross (the final message text is folded to a string; full
 /// assistant content is too rich for a v1 action result).
-fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
+pub(crate) fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value {
     match outcome {
         HarnessRunOutcome::Completed {
             leaf_id,
@@ -348,9 +347,47 @@ fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
+    fn cancel_child_agents(&self, owner: u64) {
+        self.children.cancel_owner(owner);
+    }
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
+    async fn get_execution_context(
+        &self,
+        _args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let harness = self.harness()?;
+        let mut context = harness.execution_context().map_err(|e| e.to_string())?;
+        if let Some(serde_json::Value::Object(child)) =
+            rpi_agent::tool_execution_scope::execution_context()
+        {
+            context
+                .as_object_mut()
+                .expect("execution context is an object")
+                .extend(child);
+        }
+        context["cwd"] = serde_json::json!(self.cwd);
+        context["sessionId"] = serde_json::json!(harness.session().storage().metadata().id);
+        Ok(context)
+    }
+
+    async fn child_agent(
+        &self,
+        owner: u64,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if rpi_agent::tool_execution_scope::is_child_execution() {
+            return Err("recursive child agents are not allowed".into());
+        }
+        if args.get("op").and_then(serde_json::Value::as_str) == Some("start") {
+            self.children.handle(&self.harness()?, owner, args).await
+        } else {
+            // Reclamation must remain possible after the parent was dropped.
+            self.children.handle_existing(owner, args)
+        }
+    }
+
     async fn get_cli_flag(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let name = arg_str(&args, "name")?;
         Ok(serde_json::json!({
@@ -529,6 +566,7 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn new_session(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let dir = default_session_dir(&self.cwd);
         std::fs::create_dir_all(&dir)
@@ -537,19 +575,18 @@ impl RuntimeActionHost for HarnessActionHost {
             .await
             .map_err(|e| format!("create session: {e}"))?;
         let id = session.storage().metadata().id.clone();
-        crate::session::set_active_session(self.harness()?, session, Some(&self.tool_context))
-            .await?;
+        crate::session::set_active_session(&harness, session, Some(&self.tool_context)).await?;
         Ok(serde_json::json!({ "sessionId": id }))
     }
 
     async fn fork(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let harness = self.harness()?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
-        let new_session = crate::session::fork_session_storage(self.harness()?, &cwd_str)
+        let new_session = crate::session::fork_session_storage(&harness, &cwd_str)
             .await
             .map_err(|e| format!("fork session: {e}"))?;
         let id = new_session.storage().metadata().id.clone();
-        crate::session::set_active_session(self.harness()?, new_session, Some(&self.tool_context))
-            .await?;
+        crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
         Ok(serde_json::json!({ "sessionId": id }))
     }
 
@@ -578,14 +615,14 @@ impl RuntimeActionHost for HarnessActionHost {
     }
 
     async fn switch_session(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let harness = self.harness()?;
         let id = arg_str(&args, "id")?;
         let cwd_str = self.cwd.to_string_lossy().to_string();
         let new_session: Session = open_session_by_id(&id, &cwd_str)
             .await
             .map_err(|e| e.to_string())?;
         let new_id = new_session.storage().metadata().id.clone();
-        crate::session::set_active_session(self.harness()?, new_session, Some(&self.tool_context))
-            .await?;
+        crate::session::set_active_session(&harness, new_session, Some(&self.tool_context)).await?;
         Ok(serde_json::json!({ "sessionId": new_id }))
     }
 
@@ -596,6 +633,9 @@ impl RuntimeActionHost for HarnessActionHost {
         Err("reload not configured (no /reload callback on this bridge)".to_string())
     }
 }
+
+#[cfg(test)]
+mod lifetime_tests;
 
 #[cfg(test)]
 mod send_message_tests {

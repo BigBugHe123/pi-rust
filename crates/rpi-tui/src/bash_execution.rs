@@ -20,7 +20,7 @@ use super::component::Component;
 use crate::ansi::bold;
 use crate::ansi::strip_ansi;
 use crate::spacer::Spacer;
-use crate::theme::{theme, theme_revision};
+use crate::theme::{theme, theme_revision, Theme, ThemeColors};
 use crate::utils::{truncate_to_width, wrap_text_with_ansi};
 use crate::visual_truncate::truncate_to_visual_lines;
 
@@ -224,12 +224,11 @@ impl BashExecutionComponent {
     }
 
     /// Build the trailing status/truncation line(s), if any.
-    fn status_line(&self, hidden: usize) -> Vec<String> {
+    fn status_line(&self, hidden: usize, colors: &ThemeColors) -> Vec<String> {
         let status = *self.status.lock().unwrap();
         let truncation = self.truncation.lock().unwrap().clone();
         let exit_code = *self.exit_code.lock().unwrap();
         let expanded = *self.expanded.lock().unwrap();
-        let colors = theme().colors;
 
         let mut parts: Vec<String> = Vec::new();
         // Total elapsed up front: it is the first thing a reader looks for on a
@@ -275,8 +274,103 @@ impl BashExecutionComponent {
         if parts.is_empty() {
             Vec::new()
         } else {
-            vec![format!("  {}", parts.join(" "))]
+            vec![parts.join(" ")]
         }
+    }
+
+    /// Render against one theme snapshot; keep all insets inside the background.
+    fn render_panel(&self, width: usize, status: BashStatus, theme: &Theme) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
+        let colors = &theme.colors;
+        // Preserve at least one content column on narrow terminals.
+        let padding_x = theme.spacing.tool_panel_padding_x.min((width - 1) / 2);
+        let content_width = width - padding_x * 2;
+        let pad = " ".repeat(padding_x);
+        let bg = match status {
+            BashStatus::Running => colors.tool_pending_bg,
+            BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
+            BashStatus::Complete => colors.tool_success_bg,
+        };
+        let panel_line = |content: &str| {
+            // A wide glyph cannot fit in a one-column terminal. Clip only that
+            // degenerate case rather than letting it overflow the panel.
+            let content = truncate_to_width(content, content_width, "");
+            crate::utils::apply_background_to_line(&format!("{pad}{content}"), width, |s| bg.bg(s))
+        };
+        let blank = panel_line("");
+        let mut lines = Spacer::new(1).render(width);
+        lines.extend(std::iter::repeat(blank.clone()).take(theme.spacing.tool_panel_padding_y));
+
+        let excluded = *self.exclude_from_context.lock().unwrap();
+        let color_key = if excluded {
+            colors.dim
+        } else {
+            colors.bash_mode
+        };
+        let command = self.command.lock().unwrap().clone();
+        for part in wrap_text_with_ansi(&format!("$ {command}"), content_width) {
+            lines.push(panel_line(&color_key.fg(&bold(&part))));
+        }
+
+        let (display_lines, hidden) = {
+            let out = self.output_lines.lock().unwrap();
+            let expanded = *self.expanded.lock().unwrap();
+            if out.is_empty() {
+                (Vec::new(), 0usize)
+            } else {
+                let styled = format!(
+                    "\n{}",
+                    out.iter()
+                        .map(|l| colors.muted.fg(l))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                if expanded {
+                    (
+                        crate::text::Text::new(&styled, 0, 0).render(content_width),
+                        0,
+                    )
+                } else {
+                    let r = truncate_to_visual_lines(&styled, PREVIEW_LINES, content_width, 0);
+                    (r.visual_lines, r.skipped_count)
+                }
+            }
+        };
+        for line in &display_lines {
+            lines.push(panel_line(line));
+        }
+
+        if status == BashStatus::Running {
+            let elapsed = self.elapsed();
+            let row = format!(
+                "{} {}",
+                colors.accent.fg("●"),
+                colors
+                    .muted
+                    .fg(&crate::tool_execution::format_elapsed(elapsed)),
+            );
+            lines.push(panel_line(&truncate_to_width(&row, content_width, "…")));
+            if elapsed > LONG_RUNNING_HINT_AFTER {
+                let hint = format!("{} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
+                for part in wrap_text_with_ansi(&hint, content_width) {
+                    lines.push(panel_line(&part));
+                }
+            }
+        } else {
+            let status_lines = self.status_line(hidden, colors);
+            if !status_lines.is_empty() {
+                lines.push(blank.clone());
+                for line in &status_lines {
+                    for part in wrap_text_with_ansi(line, content_width) {
+                        lines.push(panel_line(&part));
+                    }
+                }
+            }
+        }
+        lines.extend(std::iter::repeat(blank).take(theme.spacing.tool_panel_padding_y));
+        lines
     }
 }
 
@@ -302,108 +396,7 @@ impl Component for BashExecutionComponent {
             }
         }
 
-        let colors = theme().colors;
-        let mut lines: Vec<String> = Vec::new();
-
-        // `!!` commands are excluded from the model context, so they render
-        // dim instead of the normal bash color (mirrors `bash-execution.ts`).
-        let excluded = *self.exclude_from_context.lock().unwrap();
-        let color_key = if excluded {
-            colors.dim
-        } else {
-            colors.bash_mode
-        };
-
-        // Background tint for the bash panel — mirrors the tool execution
-        // panel backgrounds so bash blocks visually match tool blocks.
-        let bg = match *self.status.lock().unwrap() {
-            BashStatus::Running => colors.tool_pending_bg,
-            BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
-            BashStatus::Complete => colors.tool_success_bg,
-        };
-
-        // Spacer
-        lines.extend(Spacer::new(1).render(width));
-
-        // Command header: "$ {command}" in accent.
-        let command = self.command.lock().unwrap().clone();
-        let header_text = format!("$ {command}");
-        let header_width = width.saturating_sub(2).max(1);
-        for part in wrap_text_with_ansi(&header_text, header_width) {
-            let line = format!("  {}", color_key.fg(&bold(&part)));
-            lines.push(crate::utils::apply_background_to_line(&line, width, |s| {
-                bg.bg(s)
-            }));
-        }
-
-        // Output preview
-        let (display_lines, hidden) = {
-            let out = self.output_lines.lock().unwrap();
-            let expanded = *self.expanded.lock().unwrap();
-            if out.is_empty() {
-                (Vec::new(), 0usize)
-            } else {
-                let muted = colors.muted;
-                let styled = format!(
-                    "
-{}",
-                    out.iter().map(|l| muted.fg(l)).collect::<Vec<_>>().join(
-                        "
-"
-                    )
-                );
-                if expanded {
-                    let all = crate::text::Text::new(&styled, 1, 0).render(width);
-                    (all, 0)
-                } else {
-                    let r = truncate_to_visual_lines(&styled, PREVIEW_LINES, width, 1);
-                    (r.visual_lines, r.skipped_count)
-                }
-            }
-        };
-        for dl in &display_lines {
-            lines.push(crate::utils::apply_background_to_line(dl, width, |s| {
-                bg.bg(s)
-            }));
-        }
-
-        // Spinner (while running) or status line (when complete)
-        if status == BashStatus::Running {
-            // A live elapsed timer, not a spinner: tool panels report progress
-            // the same way (static status glyph + elapsed), so two concurrent
-            // operations never look like two different kinds of "busy".
-            let elapsed = self.elapsed();
-            let row = format!(
-                "  {} {}",
-                colors.accent.fg("●"),
-                colors
-                    .muted
-                    .fg(&crate::tool_execution::format_elapsed(elapsed)),
-            );
-            let row = truncate_to_width(&row, width, "…");
-            lines.push(crate::utils::apply_background_to_line(&row, width, |s| {
-                bg.bg(s)
-            }));
-            if elapsed > LONG_RUNNING_HINT_AFTER {
-                let hint = format!("  {} Esc / Ctrl+C 中止", colors.muted.fg("⏸"));
-                let hint = truncate_to_width(&hint, width, "…");
-                lines.push(crate::utils::apply_background_to_line(&hint, width, |s| {
-                    bg.bg(s)
-                }));
-            }
-        } else {
-            let sl = self.status_line(hidden);
-            if !sl.is_empty() {
-                lines.push(crate::utils::apply_background_to_line("", width, |s| {
-                    bg.bg(s)
-                }));
-                for sline in &sl {
-                    lines.push(crate::utils::apply_background_to_line(sline, width, |s| {
-                        bg.bg(s)
-                    }));
-                }
-            }
-        }
+        let lines = self.render_panel(width, status, &theme());
 
         if status != BashStatus::Running {
             if let Ok(mut cache) = self.cache.lock() {
@@ -433,6 +426,136 @@ impl Component for BashExecutionComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn panel_has_themed_insets_in_every_execution_state() {
+        let theme = Theme::default();
+        let width = 40;
+        for (exit_code, cancelled) in [
+            (None, false),
+            (Some(0), false),
+            (Some(1), false),
+            (Some(0), true),
+        ] {
+            let c = BashExecutionComponent::new("echo hi");
+            c.append_output("hi");
+            if exit_code.is_some() {
+                c.set_complete(exit_code, cancelled, BashTruncation::default());
+            }
+            let status = *c.status.lock().unwrap();
+            let bg = match status {
+                BashStatus::Running => theme.colors.tool_pending_bg,
+                BashStatus::Complete => theme.colors.tool_success_bg,
+                BashStatus::Error | BashStatus::Cancelled => theme.colors.tool_error_bg,
+            };
+            let lines = c.render_panel(width, status, &theme);
+            assert_eq!(lines[0], "", "outer spacer must remain uncolored");
+            assert_eq!(lines[1], bg.bg(&" ".repeat(width)));
+            assert_eq!(lines.last().unwrap(), &lines[1]);
+            let plain: Vec<_> = lines[1..].iter().map(|line| strip_ansi(line)).collect();
+            assert_eq!(plain[1].trim_end(), "  $ echo hi");
+            assert!(plain.iter().any(|line| line.trim_end() == "  hi"));
+            for (styled, text) in lines[1..].iter().zip(&plain) {
+                assert!(styled.starts_with(&bg.to_bg()));
+                assert_eq!(crate::utils::visible_width(text), width);
+                assert!(text.starts_with("  ") && text.ends_with("  "), "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn custom_theme_spacing_controls_panel_without_global_mutation() {
+        let mut theme = Theme::default();
+        theme.spacing.tool_panel_padding_x = 4;
+        theme.spacing.tool_panel_padding_y = 2;
+        let c = BashExecutionComponent::new("echo hi");
+        // Keep this layout-only test independent of scheduler delays.
+        *c.started_at.lock().unwrap() = None;
+        c.append_output("hi");
+        c.set_complete(Some(0), false, BashTruncation::default());
+        let lines = c.render_panel(40, BashStatus::Complete, &theme);
+        let blank = theme.colors.tool_success_bg.bg(&" ".repeat(40));
+        assert_eq!(lines[1..3], [blank.clone(), blank.clone()]);
+        assert_eq!(lines[lines.len() - 2..], [blank.clone(), blank]);
+        assert_eq!(strip_ansi(&lines[3]).trim_end(), "    $ echo hi");
+        assert!(lines
+            .iter()
+            .any(|line| strip_ansi(line).trim_end() == "    hi"));
+
+        theme.spacing.tool_panel_padding_x = 0;
+        theme.spacing.tool_panel_padding_y = 0;
+        let lines = c.render_panel(40, BashStatus::Complete, &theme);
+        assert_eq!(strip_ansi(&lines[1]).trim_end(), "$ echo hi");
+        assert_eq!(strip_ansi(lines.last().unwrap()).trim_end(), "hi");
+    }
+
+    #[test]
+    fn output_wraps_inside_both_insets_collapsed_and_expanded() {
+        let theme = Theme::default();
+        let output = "abcdefghijklmnop你好世界qrstuvwxyz";
+        let c = BashExecutionComponent::new("echo");
+        *c.started_at.lock().unwrap() = None;
+        c.append_output(output);
+        c.set_complete(Some(0), false, BashTruncation::default());
+        for expanded in [false, true] {
+            c.set_expanded(expanded);
+            let lines = c.render_panel(12, BashStatus::Complete, &theme);
+            let output_rows = &lines[3..lines.len() - 1];
+            let reconstructed: String = output_rows
+                .iter()
+                .map(|line| strip_ansi(line).trim().to_string())
+                .collect();
+            assert_eq!(reconstructed, output);
+            for line in output_rows {
+                let plain = strip_ansi(line);
+                assert_eq!(crate::utils::visible_width(&plain), 12);
+                assert!(plain.starts_with("  ") && plain.ends_with("  "));
+            }
+        }
+    }
+
+    #[test]
+    fn long_status_paths_wrap_inside_panel() {
+        let path = "/tmp/very-long-directory/full-command-output.log";
+        let c = BashExecutionComponent::new("false");
+        c.set_complete(
+            Some(1),
+            false,
+            BashTruncation {
+                truncated: true,
+                full_output_path: Some(path.to_string()),
+            },
+        );
+        let lines = c.render_panel(16, BashStatus::Error, &Theme::default());
+        let compact: String = strip_ansi(&lines.join("\n"))
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains(path));
+        assert!(lines
+            .iter()
+            .all(|line| crate::utils::visible_width(line) <= 16));
+    }
+
+    #[test]
+    fn narrow_panels_reduce_padding_without_overflow() {
+        let c = BashExecutionComponent::new("echo 你好");
+        c.append_output("你好世界");
+        let mut theme = Theme::default();
+        theme.spacing.tool_panel_padding_x = usize::MAX;
+        for width in 0..=8 {
+            let lines = c.render_panel(width, BashStatus::Running, &theme);
+            assert!(
+                lines
+                    .iter()
+                    .all(|line| crate::utils::visible_width(line) <= width),
+                "width {width}: {lines:?}"
+            );
+            if width == 0 {
+                assert!(lines.is_empty());
+            }
+        }
+    }
 
     #[test]
     fn test_new_renders_header_and_live_elapsed() {
@@ -583,7 +706,11 @@ mod tests {
             },
         );
         let lines = c.render(40);
-        let joined = lines.join("\n");
+        // Paths may wrap now that status rows reserve both panel insets.
+        let joined: String = lines
+            .iter()
+            .map(|line| strip_ansi(line).trim().to_string())
+            .collect();
         assert!(joined.contains("/tmp/out.log"), "joined: {joined}");
     }
 }

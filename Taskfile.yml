@@ -45,6 +45,7 @@ version: '3'
 vars:
   RPI_SERVICE_NAME: rpi
   RPI_DOMAIN: rpi.laofu.online
+  RPI_DOMAINS: '{{.RPI_DOMAIN}} rpi.bigfisharc.cn'
   RPI_DEPLOY_DIR: .deploy/rpi
   RPI_RELEASE_HELPER:
     sh: git rev-parse --git-path rpi-release-helper.exe
@@ -228,13 +229,15 @@ tasks:
         echo "使用手册、扩展作者指南和调试指引已上传"
 
   rpi-caddy-upload:
-    desc: 上传 rpi Caddy 配置并重载
+    desc: 上传 rpi Caddy 配置、同步新域名镜像并校验重载
     cmds:
       - scp deploy/rpi.caddy root@139.196.85.175:/root/work/ai-infr/config/caddy/sites/{{.RPI_SERVICE_NAME}}.caddy
       - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'mkdir -p /data/caddy && chmod 755 /data/caddy'"
-      - ssh root@139.196.85.175 "docker exec app-caddy caddy validate --config /etc/caddy/Caddyfile && docker exec app-caddy caddy reload --config /etc/caddy/Caddyfile"
+      # Do not use sync-bigfisharc.sh: it currently masks validation/reload failures.
+      # The mirror is generated, never edited or independently declared here.
+      - ssh root@139.196.85.175 "cd /root/work/ai-infr/config/caddy && python3 gen_bigfisharc.py sites sites-bigfisharc/mirror.caddy && docker exec app-caddy caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && docker exec app-caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
       - >-
-        echo "Caddy 配置已生效: {{.RPI_DOMAIN}}"
+        echo "Caddy 配置已生效: {{.RPI_DOMAINS}}"
 
   rpi-caddy-mount:
     desc: 将 rpi 静态目录挂载到现有 Caddy 容器
@@ -259,18 +262,18 @@ tasks:
       - task: rpi-upload-guide
       - task: rpi-caddy-mount
       - task: rpi-caddy-upload
+      - task: rpi-cdn-purge
       - task: rpi-verify
 
-  rpi-verify:
-    desc: 验证 rpi 公网首页和静态 JSON
+  rpi-cdn-purge:
+    desc: 可选的双域名 CDN 刷新（RPI_CDN_PURGE_SCRIPT 指向供应商脚本）
     cmds:
-      - ssh root@139.196.85.175 "curl --fail --silent --show-error --head https://{{.RPI_DOMAIN}}/"
-      - ssh root@139.196.85.175 "curl --fail --silent --show-error https://{{.RPI_DOMAIN}}/data/packages.json"
-      - ssh root@139.196.85.175 "curl --fail --silent --show-error https://{{.RPI_DOMAIN}}/index.html | grep -F 'bigfish1913/pi-rust'"
-      # Fail the verify if local state is reachable, so a regression is caught here
-      # rather than by someone discovering a session transcript over HTTP.
-      - >-
-        ssh root@139.196.85.175 "for p in .rpi/todo.json .deploy/website.tar.gz; do code=\$(curl -s -o /dev/null -w '%{http_code}' https://{{.RPI_DOMAIN}}/\$p); if [ \"\$code\" != 404 ]; then echo \"LEAK: https://{{.RPI_DOMAIN}}/\$p returned \$code\" >&2; exit 1; fi; done; echo 'no local state exposed over HTTP'"
+      - bash scripts/website-cdn-purge.sh {{.RPI_DOMAINS}}
+
+  rpi-verify:
+    desc: 验证两个域名的官网内容、缓存策略与内部路径保护
+    cmds:
+      - python scripts/verify-website.py {{range splitList " " .RPI_DOMAINS}}https://{{.}} {{end}}
 
   rpi-diagnose:
     desc: 诊断 rpi 公网 HTTP 与 Caddy 状态

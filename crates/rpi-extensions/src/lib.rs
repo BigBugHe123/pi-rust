@@ -94,7 +94,7 @@ pub use registry::{
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use status::ExtensionStatusMailbox;
 mod panel;
-pub use panel::{ExtensionPanel, PanelAnchor, PanelLayout};
+pub use panel::{ExtensionPanel, PanelAnchor, PanelHighlight, PanelHighlightColor, PanelLayout};
 pub use tool::{PluginToolAdapter, PluginToolHandle, ToolCallContext};
 pub use translate::{
     dispatch_data_event, dispatch_data_event_claiming, dispatch_empty_event,
@@ -249,10 +249,9 @@ impl HostApi {
     /// thread-local `CURRENT_HOST_API` (set for the duration of register in
     /// `load_one`) — they ignore `user_data`. Post-register `runtime_action`
     /// cannot use the thread-local (plugin calls from foreign threads), so when
-    /// a bridge is present `user_data` is repurposed to point at the
-    /// `ActionBridge` (the SDK-designated "host's opaque context"). The bridge's
-    /// scoped `Arc` is retained by the loaded plugin and session keepalive, so
-    /// the pointer a plugin stores during register stays valid.
+    /// a bridge is present `user_data` carries an opaque registry handle, never
+    /// its address. Dispatch upgrades a weak reference before accessing host
+    /// state, so an expired candidate reload fails without dereferencing it.
     pub fn build_vtable(self: &Arc<Self>) -> rpi_plugin_sdk::PluginApi {
         // When a bridge is present, user_data carries it (post-register action
         // recovery). Otherwise keep the register-path HostApi pointer (harmless
@@ -264,7 +263,7 @@ impl HostApi {
         let (runtime_action_fn, ud) = match &self.action_bridge {
             Some(bridge) => (
                 trampoline_runtime_action as RuntimeActionFn,
-                Arc::as_ptr(bridge) as *mut c_void,
+                bridge.user_data(),
             ),
             None => (
                 stub_runtime_action as RuntimeActionFn,
@@ -394,18 +393,21 @@ extern "C" fn trampoline_register_tool(
         cancel_fn,
         destroy_fn,
         plugin_free_string,
+        runtime_handle: None,
     };
     // `register_tool` returns `bool` (true on overwrite of a prior same-named
     // tool). For the plugin a name collision is not a hard failure — always
     // return 0 (success) when the registry accepted it; -1 only if the registry
     // was already detached.
-    let ok =
-        with_current_api(
-            |api| match api.with_registry(|reg| reg.register_tool(tool, handle)) {
-                Some(_) => true,
-                None => false,
-            },
-        );
+    let ok = with_current_api(|api| {
+        let mut handle = handle;
+        handle.runtime_handle = api
+            .action_bridge
+            .as_ref()
+            .map(|bridge| bridge.user_data() as usize);
+        api.with_registry(|reg| reg.register_tool(tool, handle))
+            .is_some()
+    });
     if ok == Some(true) {
         0
     } else {

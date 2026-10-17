@@ -221,11 +221,31 @@ impl Color {
     }
 }
 
+/// Spacing tokens for terminal components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ThemeSpacing {
+    /// Horizontal inset on each side of a tool panel, in terminal columns.
+    pub tool_panel_padding_x: usize,
+    /// Vertical inset above and below a tool panel, in terminal rows.
+    pub tool_panel_padding_y: usize,
+}
+
+impl Default for ThemeSpacing {
+    fn default() -> Self {
+        Self {
+            tool_panel_padding_x: 2,
+            tool_panel_padding_y: 1,
+        }
+    }
+}
+
 /// Theme settings.
 #[derive(Debug, Clone)]
 pub struct Theme {
     /// Color scheme.
     pub colors: ThemeColors,
+    /// Component spacing (currently consumed by bash execution panels).
+    pub spacing: ThemeSpacing,
     /// Border style.
     pub border_style: BorderStyle,
     /// Corner style.
@@ -236,6 +256,7 @@ impl Default for Theme {
     fn default() -> Self {
         Self {
             colors: ThemeColors::default(),
+            spacing: ThemeSpacing::default(),
             border_style: BorderStyle::Rounded,
             corner_style: CornerStyle::Rounded,
         }
