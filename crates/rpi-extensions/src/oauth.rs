@@ -21,6 +21,8 @@ pub enum OAuthExtensionError {
     InvalidResponseKind,
     #[error("OAuth action must be one of begin, exchange, refresh, revoke")]
     InvalidAction,
+    #[error("OAuth plugin panicked during request")]
+    PluginPanic,
     #[error("OAuth plugin returned status {0}: {1}")]
     PluginStatus(i32, String),
     #[error("OAuth plugin returned invalid JSON: {0}")]
@@ -160,16 +162,24 @@ fn invoke(
     })
     .to_string();
     let mut out = StbString::empty();
-    let status = (provider.request_fn)(
-        StbStringRef::from_str(&request),
-        &mut out,
-        provider.user_data,
-    );
+    let status = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        (provider.request_fn)(
+            StbStringRef::from_str(&request),
+            &mut out,
+            provider.user_data,
+        )
+    }));
     // SAFETY: the callback transfers a live output to its registered producer.
+    // `out` remains accessible if the callback panics, so the plugin allocation
+    // is reclaimed on both the success and panic paths.
     let out = unsafe {
         rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(provider.plugin_free_string))
     };
     let response = out.to_string_lossy();
+    let status = match status {
+        Ok(status) => status,
+        Err(_) => return Err(OAuthExtensionError::PluginPanic),
+    };
     if status != 0 {
         return Err(OAuthExtensionError::PluginStatus(status, response));
     }

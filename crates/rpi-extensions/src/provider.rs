@@ -227,7 +227,9 @@ async fn drive_plugin_provider(
     // `spawn_blocking` the sync ffi call — `request_fn` is blocking by contract.
     // The join handle is awaited so a panic in the plugin (caught by
     // `catch_unwind` below) surfaces as an error, not a silent hang.
-    let join = runtime.spawn_blocking(move || run_provider_request(&record, &request_json));
+    let request_model_id = model_id.clone();
+    let join = runtime
+        .spawn_blocking(move || run_provider_request(&record, &request_json, &request_model_id));
     let outcome = match join.await {
         Ok(inner) => inner,
         Err(join_err) => {
@@ -269,9 +271,13 @@ enum ProviderOutcome {
 /// recovers the plugin-owned `out` `StbString`, reclaims it via
 /// `plugin_free_string`, parses to an [`AssistantMessage`]. Wrapped in
 /// `catch_unwind` so a plugin panic cannot unwind across FFI (⇒ error outcome).
-fn run_provider_request(record: &RegisteredProvider, request_json: &str) -> ProviderOutcome {
+fn run_provider_request(
+    record: &RegisteredProvider,
+    request_json: &str,
+    model_id: &str,
+) -> ProviderOutcome {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_provider_request_inner(record, request_json)
+        run_provider_request_inner(record, request_json, model_id)
     }));
     match outcome {
         Ok(inner) => inner,
@@ -288,7 +294,11 @@ fn run_provider_request(record: &RegisteredProvider, request_json: &str) -> Prov
     }
 }
 
-fn run_provider_request_inner(record: &RegisteredProvider, request_json: &str) -> ProviderOutcome {
+fn run_provider_request_inner(
+    record: &RegisteredProvider,
+    request_json: &str,
+    model_id: &str,
+) -> ProviderOutcome {
     // Borrowed request envelope: the plugin must NOT free it (StbStringRef is a
     // borrow — the SDK contract).
     let req_ref = StbStringRef::from_str(request_json);
@@ -327,7 +337,7 @@ fn run_provider_request_inner(record: &RegisteredProvider, request_json: &str) -
                 message.provider = record.provider_id.clone();
             }
             if message.model.is_empty() {
-                message.model = String::new(); // host stamps model id upstream; leave as-is
+                message.model = model_id.to_string();
             }
             ProviderOutcome::Ok(message)
         }
@@ -477,8 +487,9 @@ async fn drive_streaming_plugin_provider(
 
     // The plugin call must not hold `prod`: forwarding happens on this task, so
     // a slow consumer cannot stall the plugin thread inside an FFI call.
+    let request_model_id = model_id.clone();
     let join = runtime.spawn_blocking(move || {
-        // Cancellation detaches this task. Keep the library and its host-side
+        // Cancellation detaches this task; keep the library and host-side
         // context alive until the FFI call and all plugin-owned frees finish.
         let _keepalive = keepalive;
         run_streaming_provider_request(
@@ -488,6 +499,7 @@ async fn drive_streaming_plugin_provider(
             &bridge,
             &owner_owned,
             &request_json,
+            &request_model_id,
         )
     });
 
@@ -538,7 +550,7 @@ async fn drive_streaming_plugin_provider(
     // Normal completion has already drained the channel. Cancellation discards
     // queued chunks so no more content is forwarded after the cancel signal.
     rx.close();
-    let message = if cancelled_mid_stream {
+    let mut message = if cancelled_mid_stream {
         // Dropping the join handle detaches the blocking task; waiting here
         // would let an uncooperative plugin hold the entire agent run open.
         mapper.aborted_message()
@@ -562,6 +574,12 @@ async fn drive_streaming_plugin_provider(
             },
         }
     };
+    if message.provider.is_empty() {
+        message.provider = record.provider_id.clone();
+    }
+    if message.model.is_empty() {
+        message.model = model.id.clone();
+    }
     for event in mapper.chunks_then_message(&message) {
         prod.push(event);
     }
@@ -769,6 +787,7 @@ fn run_streaming_provider_request(
     bridge: &StreamEmitBridge,
     owner: &ProviderControlOwner,
     request_json: &str,
+    model_id: &str,
 ) -> StreamingProviderOutcome {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !snapshot.is_active() {
@@ -830,6 +849,9 @@ fn run_streaming_provider_request(
         Ok(Ok(mut message)) => {
             if message.provider.is_empty() {
                 message.provider = record.provider_id.clone();
+            }
+            if message.model.is_empty() {
+                message.model = model_id.to_string();
             }
             message
         }
@@ -1312,7 +1334,7 @@ mod tests {
         /// A stub `ProviderRequestFn` that writes a minimal assistant-message JSON
         /// into `out`. Mirrors the shape a real plugin's request fn returns.
         fn ok_request_fn(_req, out, _ud) {
-        let json = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"api":"faux","provider":"pluggy","model":"m","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
+        let json = r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"api":"faux","provider":"pluggy","model":"","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}},"stopReason":"stop","timestamp":0}"#;
         i32::from(!out.write(json.to_string()))
     } }
 
@@ -1390,10 +1412,11 @@ mod tests {
         let record = snap.providers()[0].clone();
 
         // Valid response → Ok(message).
-        let outcome = run_provider_request(&record, r#"{"model":"m"}"#);
+        let outcome = run_provider_request(&record, r#"{"model":"m"}"#, "m");
         match outcome {
             ProviderOutcome::Ok(m) => {
                 assert_eq!(m.provider, "pluggy");
+                assert_eq!(m.model, "m");
                 assert_eq!(m.stop_reason, rpi_ai::types::StopReason::Stop);
                 assert_eq!(m.content.len(), 1);
             }
@@ -1417,7 +1440,7 @@ mod tests {
             plugin_free_string: stub_free,
             user_data: std::ptr::null_mut(),
         };
-        let outcome = run_provider_request(&err_record, r#"{"model":"m"}"#);
+        let outcome = run_provider_request(&err_record, r#"{"model":"m"}"#, "m");
         assert!(matches!(outcome, ProviderOutcome::Err(_)));
     }
 
