@@ -597,22 +597,48 @@ pub(super) fn find_model_selector_match(
     });
     match (matches.next(), matches.next()) {
         (Some(model), None) => Some(model.clone()),
+        (None, None) if provider.is_some() => {
+            let mut bare = catalog
+                .iter()
+                .filter(|model| model.id.eq_ignore_ascii_case(input));
+            match (bare.next(), bare.next()) {
+                (Some(model), None) => Some(model.clone()),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
 
-/// Build `/provider` selector items: every provider present in the merged
-/// catalog (built-in + models.json), labelled with its model count, origin
-/// (built-in vs configured), wire protocol, and whether a key is configured.
-/// Catalog order (provider id) keeps this deterministic.
-pub(super) fn provider_selector_items() -> Vec<SelectItem> {
-    let catalog = crate::provider::catalog_all().unwrap_or_default();
+/// Read declarations from the live session so `/reload` updates `/provider` too.
+pub(super) fn current_provider_manifests(
+    session: &crate::session::ExtensionSessionCell,
+) -> Vec<rpi_extensions::ProviderManifest> {
+    let session = session.lock().unwrap_or_else(|error| error.into_inner());
+    crate::provider::manifests_from_session(&session)
+}
+
+pub(super) fn current_oauth_providers(
+    session: &crate::session::ExtensionSessionCell,
+) -> Vec<rpi_extensions::OAuthProviderInfo> {
+    let session = session.lock().unwrap_or_else(|error| error.into_inner());
+    session
+        .snapshot_arc()
+        .map(|snapshot| rpi_extensions::list_oauth_providers(&snapshot))
+        .unwrap_or_default()
+}
+
+/// Build `/provider` rows from the full catalog, including packages without
+/// credentials. Label each with its model count, origin, protocol and key policy.
+pub(super) fn provider_selector_items(
+    manifests: &[rpi_extensions::ProviderManifest],
+    current_provider: Option<&str>,
+) -> Vec<SelectItem> {
+    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
     let models_cfg = crate::config::load_models_config().unwrap_or_default();
     let auth = crate::config::read_auth().unwrap_or_default();
-    let current = crate::settings::load_settings()
-        .ok()
-        .and_then(|s| s.default_provider)
-        .unwrap_or_else(|| crate::config::DEFAULT_PROVIDER_ID.to_string());
+    let execution_catalog =
+        crate::provider::execution_catalog_with_manifests(manifests).unwrap_or_default();
 
     let mut providers: Vec<(String, usize)> = Vec::new();
     for model in &catalog {
@@ -626,16 +652,29 @@ pub(super) fn provider_selector_items() -> Vec<SelectItem> {
         .into_iter()
         .map(|(id, count)| {
             let label = provider_display_name(&id);
-            let marker = if id.eq_ignore_ascii_case(&current) {
+            let marker = if current_provider.is_some_and(|current| id.eq_ignore_ascii_case(current))
+            {
                 " (current)"
             } else {
                 ""
             };
-            let (origin, protocol) = provider_origin_protocol(&id, &models_cfg);
-            let key_status = if provider_has_key(&id, &models_cfg, &auth) {
-                "已配置 key"
-            } else {
-                "未配置 key"
+            let manifest = manifests.iter().find(|manifest| manifest.id == id);
+            let (origin, protocol) = provider_origin_protocol(&id, &models_cfg, manifest);
+            let credential =
+                crate::credentials::resolve(&id, models_cfg.providers.get(&id), &auth, manifest);
+            let key_status = match credential.source {
+                crate::credentials::CredentialSource::Anonymous => "无需 key",
+                crate::credentials::CredentialSource::Missing => {
+                    if execution_catalog.iter().any(|model| {
+                        model.provider == id
+                            && crate::credentials::has_header_auth(model.headers.as_ref())
+                    }) {
+                        "已配置认证头"
+                    } else {
+                        "未配置 key"
+                    }
+                }
+                _ => "已配置 key",
             };
             let description =
                 format!("{count} model(s) · {origin} · {protocol} · {key_status}{marker}");
@@ -646,6 +685,523 @@ pub(super) fn provider_selector_items() -> Vec<SelectItem> {
         .collect()
 }
 
+/// Build the provider rows shown by `/login`. Anonymous package providers are
+/// intentionally omitted; built-in and configured providers remain available
+/// even when they currently have no credential.
+#[cfg(test)]
+pub(super) fn login_provider_items(
+    manifests: &[rpi_extensions::ProviderManifest],
+) -> Vec<SelectItem> {
+    login_provider_items_with_oauth(manifests, &[])
+}
+
+pub(super) fn login_provider_items_with_oauth(
+    manifests: &[rpi_extensions::ProviderManifest],
+    oauth_providers: &[rpi_extensions::OAuthProviderInfo],
+) -> Vec<SelectItem> {
+    let catalog = crate::provider::catalog_with_manifests(manifests).unwrap_or_default();
+    let models_cfg = crate::config::load_models_config().unwrap_or_default();
+    let auth = crate::config::read_auth().unwrap_or_default();
+    let mut ids = Vec::new();
+    for model in &catalog {
+        if !ids.iter().any(|id: &String| id == &model.provider) {
+            ids.push(model.provider.clone());
+        }
+    }
+    for id in models_cfg.providers.keys() {
+        if !ids.iter().any(|known| known == id) {
+            ids.push(id.clone());
+        }
+    }
+    for manifest in manifests {
+        if !ids.iter().any(|known| known == &manifest.id) {
+            ids.push(manifest.id.clone());
+        }
+    }
+    for oauth in oauth_providers {
+        if !ids.iter().any(|known| known == &oauth.id) {
+            ids.push(oauth.id.clone());
+        }
+    }
+
+    ids.into_iter()
+        .filter_map(|id| {
+            let manifest = manifests.iter().find(|manifest| manifest.id == id);
+            let oauth = oauth_providers.iter().find(|oauth| oauth.id == id);
+            let configured = models_cfg.providers.get(&id);
+            let requires_auth = oauth.is_some()
+                || manifest.map_or_else(
+                    || {
+                        crate::credentials::builtin_api_key_env(&id).is_some()
+                            || configured.is_some_and(|provider| {
+                                provider.api_key.is_some() || provider.auth_header.is_some()
+                            })
+                    },
+                    |manifest| manifest.requires_auth,
+                );
+            if !requires_auth {
+                return None;
+            }
+            let credential = crate::credentials::resolve(&id, configured, &auth, manifest);
+            let source = credential.source;
+            let env = manifest
+                .and_then(|manifest| manifest.api_key_env.as_deref())
+                .or_else(|| crate::credentials::builtin_api_key_env(&id));
+            let description = if oauth.is_some() {
+                match source {
+                    crate::credentials::CredentialSource::Missing => {
+                        "未配置 · OAuth 登录".to_string()
+                    }
+                    crate::credentials::CredentialSource::StoredOauth => {
+                        "已配置 · OAuth".to_string()
+                    }
+                    crate::credentials::CredentialSource::Environment(name) => {
+                        format!("环境变量 {name} · 可重新登录")
+                    }
+                    _ => "已配置 · API key / OAuth".to_string(),
+                }
+            } else {
+                let status = match source {
+                    crate::credentials::CredentialSource::Missing => "未配置".to_string(),
+                    crate::credentials::CredentialSource::Environment(name) => {
+                        format!("环境变量 {name} · 可重新登录")
+                    }
+                    _ => "已配置".to_string(),
+                };
+                match env {
+                    Some(env) => format!("{status} · API key / {env}"),
+                    None => format!("{status} · API key"),
+                }
+            };
+            Some(
+                SelectItem::new(&id, &provider_display_name(&id))
+                    .with_description(&description)
+                    .with_search_text(&format!(
+                        "{} {id} {description} login oauth",
+                        provider_display_name(&id)
+                    )),
+            )
+        })
+        .collect()
+}
+
+/// Dispatch without holding the input-slot lock: submit and escape callbacks
+/// clear or replace that same slot synchronously (API-key and OAuth login).
+pub(super) fn handle_provider_login_key(state: &TuiState, key: KeyEvent) -> bool {
+    let input = state.active_provider_input.lock().unwrap().clone();
+    let Some(input) = input else {
+        return false;
+    };
+    input.handle_key(key);
+    true
+}
+
+/// Open the masked API-key input for one provider and save it under that
+/// provider's own auth.json entry. A successful save asks the main loop to
+/// reload the provider catalog so the newly authenticated models become live.
+pub(super) fn begin_provider_login(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    extension_session: &crate::session::ExtensionSessionCell,
+    provider_id: &str,
+) {
+    if current_oauth_providers(extension_session)
+        .iter()
+        .any(|provider| provider.id.eq_ignore_ascii_case(provider_id))
+    {
+        begin_provider_oauth_login(state, editor_container, editor, tui, tx, provider_id);
+    } else {
+        begin_api_key_login(state, editor_container, editor, tui, tx, provider_id);
+    }
+}
+
+fn begin_api_key_login(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    provider_id: &str,
+) {
+    let provider_id = provider_id.to_string();
+    let input = Arc::new(Input::with_placeholder("Paste API key, then press Enter"));
+    input.set_masked(true);
+    input.set_focused(true);
+    let title = format!("Login · {provider_id}");
+    let question = format!("API key for {provider_id}");
+    let frame = provider_form_frame(
+        &title,
+        &question,
+        input.clone(),
+        "Enter saves to auth.json · Esc cancels",
+    );
+    editor.set_focused(false);
+    editor_container.clear();
+    editor_container.add_child(frame);
+    *state.active_provider_input.lock().unwrap() = Some(input.clone());
+    tui.set_focus(Some(input.clone()));
+
+    let state_submit = state.clone();
+    let ec_submit = editor_container.clone();
+    let editor_submit = editor.clone();
+    let tui_submit = tui.clone();
+    let tx_submit = tx.clone();
+    let provider_submit = provider_id.clone();
+    input.on_submit(Arc::new(move |text| {
+        let key = text.trim();
+        if key.is_empty() {
+            add_error_message(
+                &state_submit.chat_container,
+                &format!("API key for {provider_submit} cannot be empty."),
+            );
+            tui_submit.request_render(false);
+            return;
+        }
+        match crate::config::upsert_credential(
+            &provider_submit,
+            crate::config::Credential::ApiKey {
+                key: Some(key.to_string()),
+                env: None,
+            },
+        ) {
+            Ok(()) => {
+                add_note_message(
+                    &state_submit.chat_container,
+                    &format!("Saved credentials for {provider_submit}; reloading providers…"),
+                );
+                let _ = tx_submit.send(TuiMessage::ReloadExtensions);
+                finish_provider_login(&state_submit, &ec_submit, &editor_submit, &tui_submit);
+            }
+            Err(error) => add_error_message(
+                &state_submit.chat_container,
+                &format!("Could not save {provider_submit} credentials: {error}"),
+            ),
+        }
+        tui_submit.request_render(false);
+    }));
+
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    input.on_escape(Arc::new(move || {
+        finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+        add_note_message(&state_cancel.chat_container, "Provider login cancelled.");
+    }));
+    tui.request_render(false);
+}
+
+fn begin_provider_oauth_login(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    provider_id: &str,
+) {
+    let flow_id = state
+        .provider_auth_generation
+        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+        .wrapping_add(1);
+    state
+        .provider_auth_flow_id
+        .store(flow_id, std::sync::atomic::Ordering::Release);
+    show_provider_auth_status(
+        state,
+        editor_container,
+        editor,
+        tui,
+        &format!("Starting OAuth login for {provider_id}…"),
+    );
+    let _ = tx.send(TuiMessage::ProviderOAuthAction {
+        provider: provider_id.to_string(),
+        action: "begin".to_string(),
+        input: serde_json::json!({}),
+        purpose: ProviderOAuthPurpose::Login,
+        flow_id,
+    });
+}
+pub(super) fn show_provider_auth_status(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    message: &str,
+) {
+    let frame = provider_form_frame(
+        "Provider authentication",
+        message,
+        Arc::new(Text::new("Please wait…", 0, 0)),
+        "OAuth is running · wait for the provider response",
+    );
+    *state.active_provider_input.lock().unwrap() = None;
+    editor.set_focused(false);
+    editor_container.clear();
+    editor_container.add_child(frame);
+    tui.set_focus(None);
+    tui.request_render(false);
+}
+
+pub(super) fn handle_provider_oauth_result(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    provider: &str,
+    action: &str,
+    result: Result<serde_json::Value, String>,
+    purpose: ProviderOAuthPurpose,
+    flow_id: u64,
+) {
+    let value = match result {
+        Ok(value) => value,
+        Err(error) => {
+            finish_provider_login(state, editor_container, editor, tui);
+            add_error_message(
+                &state.chat_container,
+                &format!("OAuth {action} failed for {provider}: {error}"),
+            );
+            tui.request_render(false);
+            return;
+        }
+    };
+    let response = match rpi_extensions::OAuthActionResponse::parse(value) {
+        Ok(response) => response,
+        Err(error) => {
+            finish_provider_login(state, editor_container, editor, tui);
+            add_error_message(
+                &state.chat_container,
+                &format!("Invalid OAuth response from {provider}: {error}"),
+            );
+            tui.request_render(false);
+            return;
+        }
+    };
+
+    match (purpose, response.kind) {
+        (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Interaction) => {
+            begin_provider_oauth_input(
+                state,
+                editor_container,
+                editor,
+                tui,
+                tx,
+                provider,
+                response.payload,
+                flow_id,
+            );
+        }
+        (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Credential) => {
+            match response.credential() {
+                Ok(Some(token)) => match crate::config::upsert_oauth_token(
+                    provider,
+                    token.access,
+                    token.refresh,
+                    token.expires_at,
+                ) {
+                    Ok(()) => {
+                        finish_provider_login(state, editor_container, editor, tui);
+                        add_note_message(
+                            &state.chat_container,
+                            &format!(
+                                "OAuth credentials saved for {provider}; reloading providers…"
+                            ),
+                        );
+                        let _ = tx.send(TuiMessage::ReloadExtensions);
+                    }
+                    Err(error) => {
+                        finish_provider_login(state, editor_container, editor, tui);
+                        add_error_message(
+                            &state.chat_container,
+                            &format!("Could not save OAuth credentials for {provider}: {error}"),
+                        );
+                    }
+                },
+                Ok(None) | Err(_) => {
+                    finish_provider_login(state, editor_container, editor, tui);
+                    add_error_message(
+                        &state.chat_container,
+                        &format!("OAuth login for {provider} returned no valid credential."),
+                    );
+                }
+            }
+            tui.request_render(false);
+        }
+        (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Error)
+        | (ProviderOAuthPurpose::Login, rpi_extensions::OAuthResponseKind::Success) => {
+            finish_provider_login(state, editor_container, editor, tui);
+            add_error_message(
+                &state.chat_container,
+                &format!("OAuth login for {provider} did not return credentials."),
+            );
+            tui.request_render(false);
+        }
+        (ProviderOAuthPurpose::Logout, rpi_extensions::OAuthResponseKind::Success) => {
+            finish_provider_login(state, editor_container, editor, tui);
+            match crate::config::delete_credential(provider) {
+                Ok(true) => {
+                    add_note_message(
+                        &state.chat_container,
+                        &format!("OAuth credentials revoked for {provider}; reloading providers…"),
+                    );
+                    let _ = tx.send(TuiMessage::ReloadExtensions);
+                }
+                Ok(false) => add_note_message(
+                    &state.chat_container,
+                    &format!("No saved credentials found for {provider}."),
+                ),
+                Err(error) => add_error_message(
+                    &state.chat_container,
+                    &format!("Could not remove {provider} credentials: {error}"),
+                ),
+            }
+            tui.request_render(false);
+        }
+        (ProviderOAuthPurpose::Logout, _) => {
+            finish_provider_login(state, editor_container, editor, tui);
+            add_error_message(
+                &state.chat_container,
+                &format!(
+                    "OAuth revoke for {provider} did not succeed; local credentials were kept."
+                ),
+            );
+            tui.request_render(false);
+        }
+    }
+}
+
+fn begin_provider_oauth_input(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+    tx: &mpsc::UnboundedSender<TuiMessage>,
+    provider: &str,
+    payload: serde_json::Value,
+    flow_id: u64,
+) {
+    let display = payload.get("display").unwrap_or(&payload);
+    let title = display
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("OAuth authorization");
+    let mut details = Vec::new();
+    if let Some(url) = display.get("url").and_then(serde_json::Value::as_str) {
+        details.push(format!("Open: {url}"));
+    }
+    if let Some(instructions) = display
+        .get("instructions")
+        .and_then(serde_json::Value::as_array)
+    {
+        details.extend(
+            instructions
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string),
+        );
+    }
+    if details.is_empty() {
+        details.push("Enter the authorization value returned by the provider.".to_string());
+    }
+    let body = Arc::new(Container::new());
+    body.add_child(Arc::new(Text::new(details.join("\n"), 0, 0)));
+    body.add_child(Arc::new(Spacer::new(1)));
+    let input = Arc::new(Input::with_placeholder("Paste OAuth code or response"));
+    input.set_focused(true);
+    body.add_child(input.clone());
+    let frame = provider_form_frame(
+        &format!("OAuth login · {provider}"),
+        title,
+        body,
+        "Enter submits · Esc cancels this OAuth flow",
+    );
+    *state.active_provider_input.lock().unwrap() = Some(input.clone());
+    editor.set_focused(false);
+    editor_container.clear();
+    editor_container.add_child(frame);
+    tui.set_focus(Some(input.clone()));
+
+    let state_submit = state.clone();
+    let ec_submit = editor_container.clone();
+    let editor_submit = editor.clone();
+    let tui_submit = tui.clone();
+    let tx_submit = tx.clone();
+    let provider_submit = provider.to_string();
+    input.on_submit(Arc::new(move |text| {
+        let value = text.trim();
+        if value.is_empty() {
+            add_error_message(&state_submit.chat_container, "OAuth input cannot be empty.");
+            tui_submit.request_render(false);
+            return;
+        }
+        show_provider_auth_status(
+            &state_submit,
+            &ec_submit,
+            &editor_submit,
+            &tui_submit,
+            &format!("Completing OAuth login for {provider_submit}…"),
+        );
+        add_note_message(
+            &state_submit.chat_container,
+            &format!("Completing OAuth login for {provider_submit}…"),
+        );
+        let _ = tx_submit.send(TuiMessage::ProviderOAuthAction {
+            provider: provider_submit.clone(),
+            action: "exchange".to_string(),
+            input: serde_json::json!({"value": value}),
+            purpose: ProviderOAuthPurpose::Login,
+            flow_id,
+        });
+    }));
+
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    input.on_escape(Arc::new(move || {
+        finish_provider_login(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+        add_note_message(&state_cancel.chat_container, "OAuth login cancelled.");
+    }));
+    tui.request_render(false);
+}
+pub(super) fn finish_provider_login(
+    state: &Arc<TuiState>,
+    editor_container: &Arc<Container>,
+    editor: &Arc<Editor>,
+    tui: &Arc<TuiAltScreen>,
+) {
+    state
+        .provider_auth_flow_id
+        .store(0, std::sync::atomic::Ordering::Release);
+    *state.active_provider_input.lock().unwrap() = None;
+    editor_container.clear();
+    editor_container.add_child(editor.clone());
+    editor.set_focused(true);
+    tui.set_focus(Some(editor.clone()));
+    tui.request_render(false);
+}
+pub(super) fn stored_credential_items() -> Vec<SelectItem> {
+    crate::config::read_auth()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, credential)| {
+            let kind = match credential {
+                crate::config::Credential::ApiKey { .. } => "API key",
+                crate::config::Credential::Oauth { .. } => "OAuth",
+            };
+            SelectItem::new(&id, &provider_display_name(&id))
+                .with_description(&format!("{kind} · remove saved credentials"))
+                .with_search_text(&format!(
+                    "{} {id} {kind} logout",
+                    provider_display_name(&id)
+                ))
+        })
+        .collect()
+}
 /// The providers that can be removed: everything defined in `models.json`
 /// (built-ins are compiled in and cannot be deleted).
 pub(super) fn removable_provider_items() -> Vec<SelectItem> {
@@ -669,7 +1225,21 @@ pub(super) fn removable_provider_items() -> Vec<SelectItem> {
 fn provider_origin_protocol(
     id: &str,
     cfg: &crate::config::ModelsConfig,
+    manifest: Option<&rpi_extensions::ProviderManifest>,
 ) -> (&'static str, &'static str) {
+    if let Some(manifest) = manifest {
+        let api = cfg
+            .providers
+            .get(id)
+            .and_then(|provider| provider.api.as_deref())
+            .or_else(|| manifest.models.first().map(|model| model.api.as_str()));
+        let protocol = match api {
+            Some("anthropic-messages") => "Anthropic 兼容",
+            Some("openai-completions" | "openai-responses") => "OpenAI 兼容",
+            _ => "自定义协议",
+        };
+        return ("package", protocol);
+    }
     match id.to_ascii_lowercase().as_str() {
         "anthropic" => ("内置", "Anthropic"),
         "openai" => ("内置", "OpenAI"),
@@ -689,67 +1259,83 @@ fn provider_origin_protocol(
     }
 }
 
-/// Whether a provider has a usable credential: a stored `auth.json` entry, a
-/// resolved `models.json` apiKey, or (for built-ins) its canonical env var.
-fn provider_has_key(
-    id: &str,
-    cfg: &crate::config::ModelsConfig,
-    auth: &crate::config::AuthStore,
-) -> bool {
-    if auth.contains_key(id) {
-        return true;
-    }
-    if let Some(provider_cfg) = cfg.providers.get(id) {
-        if let Some(raw) = provider_cfg.api_key.as_deref().filter(|k| !k.is_empty()) {
-            if crate::config::resolve_config_value(raw, None)
-                .filter(|v| !v.is_empty())
-                .is_some()
-            {
-                return true;
-            }
-        }
-    }
-    match id.to_ascii_lowercase().as_str() {
-        "anthropic" => std::env::var("ANTHROPIC_API_KEY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false),
-        "openai" => std::env::var("OPENAI_API_KEY")
-            .map(|v| !v.is_empty())
-            .unwrap_or(false),
-        _ => false,
-    }
-}
-
-/// Persist the default provider (and, when the current saved model does not
-/// belong to it, a matching default model) so the next launch resolves to that
-/// provider. Returns a note describing what was saved.
-pub(super) fn set_default_provider(input: &str) -> Result<String, String> {
-    let catalog = crate::provider::catalog_all().map_err(|error| error.to_string())?;
+/// Switch through the authenticated session catalog. Do not advertise success
+/// or persist defaults until the live lane accepted the model.
+pub(super) async fn switch_provider(
+    input: &str,
+    manifests: &[rpi_extensions::ProviderManifest],
+    available: &[rpi_ai::Model],
+    lane: &Arc<dyn AgentLane>,
+) -> Result<(rpi_ai::Model, String), String> {
+    let catalog =
+        crate::provider::catalog_with_manifests(manifests).map_err(|error| error.to_string())?;
     let provider_id = canonicalize_provider_input(input, &catalog)?;
-
-    let mut settings = crate::settings::load_settings().unwrap_or_default();
-    let keeps_existing_model = settings.default_model.as_deref().is_some_and(|existing| {
-        catalog.iter().any(|m| {
-            m.provider.eq_ignore_ascii_case(&provider_id) && m.id.eq_ignore_ascii_case(existing)
-        })
-    });
-    if !keeps_existing_model {
-        settings.default_model = catalog
-            .iter()
-            .find(|m| m.provider.eq_ignore_ascii_case(&provider_id))
-            .map(|m| m.id.clone());
+    let candidates: Vec<_> = available
+        .iter()
+        .filter(|model| model.provider == provider_id)
+        .collect();
+    if candidates.is_empty() {
+        return Err(format!(
+            "Provider \"{provider_id}\" has no authenticated model loaded in this session. Check rpi auth check --provider {provider_id}, then /reload and retry. The current provider is unchanged."
+        ));
     }
+    let mut settings = crate::settings::load_settings().map_err(|error| error.to_string())?;
+    let config = crate::config::load_models_config().map_err(|error| error.to_string())?;
+    let configured = config.providers.get(&provider_id);
+    let matches_api = |model: &&rpi_ai::Model| {
+        configured
+            .and_then(|config| config.api.as_deref())
+            .map_or(true, |api| model.api.as_str() == api)
+    };
+    let current = lane.get_model().await.map_err(|error| error.to_string())?;
+    let saved: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|model| {
+            settings.default_provider.as_deref() == Some(provider_id.as_str())
+                && settings
+                    .default_model
+                    .as_deref()
+                    .is_some_and(|id| model.id.eq_ignore_ascii_case(id))
+        })
+        .collect();
+    let model = candidates
+        .iter()
+        .copied()
+        .find(|model| {
+            model.provider == current.provider
+                && model.api == current.api
+                && model.id.eq_ignore_ascii_case(&current.id)
+        })
+        .or_else(|| saved.iter().copied().find(matches_api))
+        .or_else(|| saved.first().copied())
+        .or_else(|| {
+            configured.and_then(|config| {
+                config.models.first().and_then(|first| {
+                    candidates
+                        .iter()
+                        .copied()
+                        .filter(matches_api)
+                        .find(|model| model.id.eq_ignore_ascii_case(&first.id))
+                })
+            })
+        })
+        .unwrap_or(candidates[0])
+        .clone();
+    lane.set_model(model.clone())
+        .await
+        .map_err(|error| error.to_string())?;
     settings.default_provider = Some(provider_id.clone());
-    crate::settings::save_settings(&settings).map_err(|error| error.to_string())?;
-
-    Ok(match &settings.default_model {
-        Some(model_id) if !model_id.is_empty() => format!(
-            "Default provider set to {provider_id} (model {model_id}) — takes effect after restart. The current session keeps its startup provider."
-        ),
-        _ => format!(
-            "Default provider set to {provider_id} — takes effect after restart. The current session keeps its startup provider."
-        ),
-    })
+    settings.default_model = Some(model.id.clone());
+    let saved = match crate::settings::save_settings(&settings) {
+        Ok(()) => "Default saved.".to_string(),
+        Err(error) => format!("Changed for this session, but could not save the default: {error}"),
+    };
+    let note = format!(
+        "Provider switched to {provider_id} (model {}) — applies to the next message. {saved}",
+        model.id
+    );
+    Ok((model, note))
 }
 
 /// Persist a specific default provider + model pair (used when `/model` picks a
@@ -1082,7 +1668,7 @@ pub(super) fn remove_provider(input: &str) -> Result<String, String> {
     let id = input.trim();
     if cfg.providers.shift_remove(id).is_none() {
         return Err(format!(
-            "Unknown or built-in provider \"{id}\". Only providers defined in models.json can be removed."
+            "Provider \"{id}\" has no models.json configuration to remove. To remove an installed package, use rpi package unlink <name>."
         ));
     }
     crate::config::save_models_config(&cfg).map_err(|error| error.to_string())?;
@@ -1095,7 +1681,7 @@ pub(super) fn remove_provider(input: &str) -> Result<String, String> {
         settings.default_model = None;
         let _ = crate::settings::save_settings(&settings);
     }
-    Ok(format!("Removed provider \"{id}\" — restart rpi to apply."))
+    Ok(format!("Removed models.json configuration for provider \"{id}\" — restart rpi to apply. Installed provider packages remain available; use rpi package unlink to remove a package."))
 }
 
 /// Write the completed form into `models.json` as a new provider with one

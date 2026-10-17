@@ -64,6 +64,7 @@ pub struct Input {
     state: Mutex<InputState>,
     prompt: String,
     placeholder: Option<String>,
+    masked: Mutex<bool>,
     #[allow(dead_code)]
     keybindings: Arc<Keybindings>,
     kill_ring: Mutex<KillRing>,
@@ -82,6 +83,7 @@ impl Input {
             state: Mutex::new(InputState::default()),
             prompt: "> ".to_string(),
             placeholder: None,
+            masked: Mutex::new(false),
             keybindings: Arc::new(Keybindings::new()),
             kill_ring: Mutex::new(KillRing::new()),
             undo_stack: Mutex::new(UndoStack::new()),
@@ -105,6 +107,13 @@ impl Input {
         let mut input = Self::new();
         input.placeholder = Some(placeholder.to_string());
         input
+    }
+
+    /// Mask the entered value while retaining the real value for submission.
+    pub fn set_masked(&self, masked: bool) {
+        if let Ok(mut value) = self.masked.lock() {
+            *value = masked;
+        }
     }
 
     /// Get the current value.
@@ -590,6 +599,7 @@ impl Component for Input {
     fn render(&self, width: usize) -> Vec<String> {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let focused = *self.focused.lock().unwrap_or_else(|e| e.into_inner());
+        let masked = *self.masked.lock().unwrap_or_else(|e| e.into_inner());
 
         let prompt_len = visible_width(&self.prompt);
         let available_width = width.saturating_sub(prompt_len);
@@ -600,6 +610,11 @@ impl Component for Input {
 
         let value = &state.value;
         let cursor = state.cursor.min(char_count(value));
+        let display_value = if masked {
+            "•".repeat(char_count(value))
+        } else {
+            value.clone()
+        };
 
         // Show placeholder if empty and not focused
         if value.is_empty() && !focused {
@@ -609,9 +624,9 @@ impl Component for Input {
             }
         }
 
-        let total_width = visible_width(value);
-        let cursor_byte = byte_offset(value, cursor);
-        let cursor_col = visible_width(&value[..cursor_byte]);
+        let total_width = visible_width(&display_value);
+        let cursor_byte = byte_offset(&display_value, cursor);
+        let cursor_col = visible_width(&display_value[..cursor_byte]);
 
         // Horizontal scrolling. The window is chosen in display columns, but the
         // caret offset inside it must be counted in *characters* — the previous
@@ -621,7 +636,7 @@ impl Component for Input {
         // and feeds that index back in as a byte offset). That desynced the
         // caret as soon as the text scrolled, and panicked on non-ASCII text.
         let (visible_text, cursor_display) = if total_width < available_width {
-            (value.clone(), cursor)
+            (display_value.clone(), cursor)
         } else {
             let scroll_width = if cursor == char_count(value) {
                 available_width.saturating_sub(1)
@@ -640,9 +655,9 @@ impl Component for Input {
                 } else {
                     cursor_col.saturating_sub(half_width)
                 };
-                let visible = slice_by_column(value, start_col, scroll_width, true);
+                let visible = slice_by_column(&display_value, start_col, scroll_width, true);
                 let caret_cols = cursor_col.saturating_sub(start_col).min(scroll_width);
-                let before_caret = slice_by_column(value, start_col, caret_cols, true);
+                let before_caret = slice_by_column(&display_value, start_col, caret_cols, true);
                 let caret = before_caret.chars().count().min(char_count(&visible));
                 (visible, caret)
             }
@@ -735,6 +750,18 @@ mod tests {
         let input = Input::with_placeholder("Enter text...");
         let lines = input.render(20);
         assert!(lines[0].contains("Enter text..."));
+    }
+
+    #[test]
+    fn masked_input_hides_value_but_preserves_submission_value() {
+        let input = Input::new();
+        input.set_focused(true);
+        input.set_masked(true);
+        input.set_value("secret-value");
+        let rendered = strip_ansi(&input.render(40).remove(0));
+        assert!(!rendered.contains("secret-value"));
+        assert!(rendered.contains("••••••••••••"));
+        assert_eq!(input.get_value(), "secret-value");
     }
 
     /// Regression: every deletion path used to call `push_undo()` and

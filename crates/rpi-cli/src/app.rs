@@ -21,8 +21,8 @@ use std::path::Path;
 use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
-use crate::provider::{resolve_for_cwd, ResolveError};
-use crate::session::{build, BuildError};
+use crate::provider::{resolve_with_extensions, ResolveError};
+use crate::session::{build_prepared, prepare_extensions, BuildError};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
 /// for most error paths; v1 distinguishes usage errors with the conventional
@@ -138,10 +138,15 @@ async fn run_inner() -> i32 {
     match argv.first().map(String::as_str) {
         Some("auth") => {
             let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-            let dirs = crate::resource_dirs::extension_dirs(&cwd);
-            let diagnostics: std::sync::Arc<dyn rpi_extensions::PluginDiagnostics> =
-                std::sync::Arc::new(rpi_extensions::NullDiagnostics);
-            let extension_session = rpi_extensions::load_session(&dirs, diagnostics, None);
+            let args = crate::args::parse_args(&argv[1..]);
+            if !args.errors.is_empty() {
+                for error in &args.errors {
+                    eprintln!("error: {error}");
+                }
+                return EXIT_USAGE;
+            }
+            let trusted = crate::session::resolve_project_trust(&args, &cwd);
+            let extension_session = crate::session::load_extensions(&args, &cwd, trusted, None);
             return crate::auth::run_with_extensions(&argv[1..], extension_session.snapshot_arc())
                 .await;
         }
@@ -194,7 +199,7 @@ async fn run_inner() -> i32 {
     // command, so it must work for a newly installed user who has not
     // authenticated yet.
     if let Some(search) = parsed.list_models.as_deref() {
-        return list_models(search).await;
+        return list_models(search, &parsed, &cwd).await;
     }
 
     // Build before provider resolution so compiler errors do not require
@@ -240,14 +245,18 @@ async fn run_inner() -> i32 {
 
     // ---- provider + model resolution ----
     let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
-    let resolved = match resolve_for_cwd(
-        parsed.provider.as_deref(),
-        parsed.model.as_deref(),
-        parsed.thinking,
-        parsed.api_key.as_deref(),
-        parsed.base_url.as_deref(),
+    let prepared = match prepare_extensions(&parsed, &cwd, project_trusted) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            print_build_error(&error);
+            return EXIT_RUNTIME;
+        }
+    };
+    let resolved = match resolve_with_extensions(
+        &parsed,
         &cwd,
         project_trusted,
+        &prepared.extension_session,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -294,7 +303,7 @@ async fn run_inner() -> i32 {
 
     // ---- harness build ----
     let (harness, event_rx, mut reload_context) =
-        match build(&resolved, &parsed, &cwd, project_trusted).await {
+        match build_prepared(&resolved, &parsed, &cwd, project_trusted, prepared).await {
             Ok(triple) => triple,
             Err(e) => {
                 print_build_error(&e);
@@ -642,8 +651,17 @@ fn emit_startup_warnings(parsed: &Args) {
 
 /// Print the merged model catalog, optionally filtered by a case-insensitive
 /// fuzzy-ish substring over provider, id, and display name.
-async fn list_models(search: &str) -> i32 {
-    let catalog = match crate::provider::catalog_all() {
+async fn list_models(search: &str, args: &Args, cwd: &Path) -> i32 {
+    let trusted = crate::session::resolve_project_trust(args, cwd);
+    let prepared = match prepare_extensions(args, cwd, trusted) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            print_build_error(&error);
+            return EXIT_RUNTIME;
+        }
+    };
+    let manifests = crate::provider::manifests_from_session(&prepared.extension_session);
+    let catalog = match crate::provider::catalog_with_manifests(&manifests) {
         Ok(models) => models,
         Err(error) => {
             eprintln!("warning: could not load models.json: {error}");

@@ -487,9 +487,18 @@ fn select_package(
         }
     }
     if requested.is_none() {
+        // Cargo returns normalized manifest paths. --path may contain `..` or
+        // a Windows extended-length prefix; compare normalized paths on both
+        // sides when choosing among several provider packages in a workspace.
+        let source = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let mut local = found
             .iter()
-            .filter(|p| p.manifest.parent().is_some_and(|r| cwd.starts_with(r)))
+            .filter(|p| {
+                p.manifest.parent().is_some_and(|root| {
+                    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+                    source.starts_with(root)
+                })
+            })
             .cloned()
             .collect::<Vec<_>>();
         if local.len() == 1 {

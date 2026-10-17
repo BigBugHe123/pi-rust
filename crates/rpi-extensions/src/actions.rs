@@ -362,6 +362,8 @@ impl UiDialogMailbox {
 /// exhaustive switch that connects the FFI id to the method.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
+    /// Refresh the host-side model selector after provider packages reload.
+    fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits

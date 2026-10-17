@@ -54,7 +54,7 @@ pub(super) enum SelectorKind {
     Session,
     /// `/theme` — dark / light / monochrome presets applied live.
     Theme,
-    /// `/provider` — set the default provider (persisted, applies on restart).
+    /// `/provider` — switch the live provider and persist the successful choice.
     Provider,
     /// `/scoped-models` — multi-toggle Ctrl+P cycle scope.
     ScopedModels,
@@ -235,6 +235,12 @@ pub(super) struct TuiState {
     /// provider form step. `Some` while the form is collecting a field; the key
     /// loop routes keys to it and Enter/Esc drive the form.
     pub(super) active_provider_input: std::sync::Mutex<Option<Arc<Input>>>,
+    /// The currently active OAuth flow id, or zero when no OAuth flow owns the input slot.
+    /// Results carrying an older id are ignored after cancellation or a new flow.
+    pub(super) provider_auth_flow_id: std::sync::atomic::AtomicU64,
+    /// Monotonic source for OAuth flow ids. Kept separate so an inactive flow
+    /// can use zero without allowing a late result to match a future flow.
+    pub(super) provider_auth_generation: std::sync::atomic::AtomicU64,
     /// The select-list currently occupying the input slot for a choice-style
     /// provider form step (the protocol step). Mutually exclusive with
     /// [`Self::active_provider_input`].

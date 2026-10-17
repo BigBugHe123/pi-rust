@@ -2,13 +2,14 @@
 //! Rust-relevant slice of the TS `packages/coding-agent/src/cli/auth-command.ts`
 //! + `main.ts:runAuthCommand` + `core/auth-check.ts`.
 //!
-//! v1 ships three actions:
+//! The host owns credential storage and standard login/check/logout/refresh
+//! commands. Packages own provider-specific policy and OAuth implementations.
 //!
 //! - `rpi auth login`  — legacy API-key prompt (no echo, via `rpassword`) for
 //!   the default provider and persist it to `~/.rpi/auth.json`.
 //!   Mirrors the upstream `/login` TUI's `type:"secret"` prompt + `modify`.
-//! - `rpi auth check`  — local-only probe of `auth.json` + the `ANTHROPIC_*`
-//!   env vars; reports `ready`/`not_ready` (no network call — the upstream
+//! - `rpi auth check`  — local-only probe of `auth.json`, models.json and the
+//!   provider's declared policy; reports `ready`/`not_ready` (no network call — the upstream
 //!   `--no-refresh` equivalent). `--json` emits a structured result.
 //! - `rpi auth logout` — drop the selected provider entry from `auth.json`
 //!   (env vars are left untouched).
@@ -18,13 +19,13 @@
 //! Provider-specific OAuth implementations belong in extensions. The host only
 //! understands the standard OAuth action response and scoped credential format.
 
-use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
 use crate::config::{
     self, delete_credential, read_auth, upsert_credential, Credential, DEFAULT_PROVIDER_ID,
 };
+use crate::credentials::CredentialSource;
 /// Exit code for a missing-credential `auth check` (mirrors upstream's
 /// non-zero `auth check` when not ready).
 const EXIT_NOT_READY: i32 = 1;
@@ -47,7 +48,7 @@ pub async fn run_with_extensions(
     let sub = args.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
         "login" => run_login(&args[1..], snapshot.as_ref()).await,
-        "check" | "status" => run_check(&args[1..]).await,
+        "check" | "status" => run_check(&args[1..], snapshot.as_ref()).await,
         "refresh" => run_refresh(&args[1..], snapshot.as_ref()).await,
         "logout" => run_logout(&args[1..], snapshot.as_ref()).await,
         "--help" | "-h" | "help" | "" => {
@@ -107,16 +108,25 @@ async fn run_login(
         }
     };
     println!("Credentials saved to {}", path.display());
-    println!("Run `rpi auth check` to verify.");
+    println!("Run `rpi auth check --provider {provider}` to verify.");
     0
 }
 
 /// `rpi auth check [--provider <id>] [--json]` — local readiness probe.
-async fn run_check(args: &[String]) -> i32 {
+async fn run_check(
+    args: &[String],
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> i32 {
     let provider = parse_provider(args).unwrap_or(DEFAULT_PROVIDER_ID);
     let want_json = args.iter().any(|a| a == "--json");
 
-    let source = detect_credential(provider);
+    let source = match detect_credential(provider, snapshot) {
+        Ok(source) => source,
+        Err(error) => {
+            eprintln!("error: could not read authentication configuration: {error}");
+            return EXIT_ERROR;
+        }
+    };
     let ready = source.is_present();
     if want_json {
         let json = serde_json::json!({
@@ -126,18 +136,18 @@ async fn run_check(args: &[String]) -> i32 {
         });
         println!("{json}");
     } else if ready {
-        let display = source.as_display().unwrap_or_default();
-        println!("ready ({display})");
+        println!("ready ({})", source.as_json_str());
     } else {
         println!("not_ready — no credentials found.");
         eprintln!();
-        eprintln!(
-            "Set up credentials with one of:\n  \
-             - `rpi auth login`\n  \
-             - export ANTHROPIC_API_KEY=<key>\n  \
-             - export ANTHROPIC_AUTH_TOKEN=<bearer>\n  \
-             - pass --api-key <key>"
-        );
+        eprintln!("Run `rpi auth login --provider {provider}`, configure this provider's apiKey in models.json, or pass --api-key when starting rpi.");
+        let env = match snapshot.and_then(|snapshot| snapshot.provider_manifest(provider)) {
+            Some(manifest) => manifest.api_key_env.as_deref(),
+            None => crate::credentials::builtin_api_key_env(provider),
+        };
+        if let Some(env) = env {
+            eprintln!("You can also set {env}.");
+        }
     }
     if ready {
         0
@@ -146,7 +156,7 @@ async fn run_check(args: &[String]) -> i32 {
     }
 }
 
-/// `rpi auth logout [--provider <id>]` — drop the stored credential.
+/// `rpi auth refresh [--provider <id>]` — refresh a stored OAuth credential.
 async fn run_refresh(
     args: &[String],
     snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
@@ -354,124 +364,34 @@ fn parse_provider(args: &[String]) -> Option<&str> {
     None
 }
 
-/// Where a credential was found — used by `auth check` to report its source.
-enum CredentialSource {
-    StoredApiKey,
-    StoredOauth,
-    ModelsJson,
-    EnvApiKey,
-    EnvAuthTToken,
-    EnvOpenAiApiKey,
-    CliFlagUnset, // placeholder so the enum stays exhaustive; not used as "present"
-}
-
-impl CredentialSource {
-    fn is_present(&self) -> bool {
-        !matches!(self, CredentialSource::CliFlagUnset)
+/// Local readiness uses the same provider identity, precedence and package
+/// policy as requests. It never exposes the resolved credential material.
+fn detect_credential(
+    provider: &str,
+    snapshot: Option<&Arc<rpi_extensions::RegistrySnapshot>>,
+) -> Result<CredentialSource, config::ConfigError> {
+    let store = read_auth()?;
+    let models = config::load_models_config()?;
+    let manifest = snapshot.and_then(|snapshot| snapshot.provider_manifest(provider));
+    let resolved =
+        crate::credentials::resolve(provider, models.providers.get(provider), &store, manifest);
+    if resolved.source.is_present() {
+        return Ok(resolved.source);
     }
-    fn as_json_str(&self) -> &'static str {
-        match self {
-            CredentialSource::StoredApiKey => "auth.json",
-            CredentialSource::StoredOauth => "oauth",
-            CredentialSource::ModelsJson => "models.json",
-            CredentialSource::EnvApiKey => "ANTHROPIC_API_KEY",
-            CredentialSource::EnvAuthTToken => "ANTHROPIC_AUTH_TOKEN",
-            CredentialSource::EnvOpenAiApiKey => "OPENAI_API_KEY",
-            CredentialSource::CliFlagUnset => "none",
-        }
-    }
-    fn as_display(&self) -> Option<&'static str> {
-        match self {
-            CredentialSource::StoredApiKey => Some("key in ~/.rpi/auth.json"),
-            CredentialSource::StoredOauth => Some("OAuth token in ~/.rpi/auth.json"),
-            CredentialSource::ModelsJson => Some("apiKey in ~/.rpi/agent/models.json"),
-            CredentialSource::EnvApiKey => Some("ANTHROPIC_API_KEY env var"),
-            CredentialSource::EnvAuthTToken => Some("ANTHROPIC_AUTH_TOKEN env var"),
-            CredentialSource::EnvOpenAiApiKey => Some("OPENAI_API_KEY env var"),
-            CredentialSource::CliFlagUnset => None,
-        }
-    }
-}
-
-/// Detect the first credential source available for `provider` (mirrors the
-/// `provider::resolve` precedence, minus the `--api-key` flag which lives at
-/// the CLI layer; here we probe file + env only).
-fn detect_credential(provider: &str) -> CredentialSource {
-    if let Ok(store) = read_auth() {
-        match store.get(provider) {
-            Some(Credential::ApiKey { key: Some(k), .. }) if !k.is_empty() => {
-                return CredentialSource::StoredApiKey;
-            }
-            Some(Credential::ApiKey {
-                key: None,
-                env: Some(_),
-                ..
-            }) => {
-                return CredentialSource::StoredApiKey;
-            }
-            Some(Credential::Oauth {
-                access, expires, ..
-            }) if !access.is_empty()
-                && (*expires == 0
-                    || *expires
-                        > std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|duration| duration.as_secs() as i64)
-                            .unwrap_or(i64::MAX)) =>
-            {
-                return CredentialSource::StoredOauth;
-            }
-            _ => {}
-        }
-    }
-    let configured = config::load_models_config().ok().and_then(|models| {
-        models
-            .providers
-            .into_iter()
-            .find(|(id, cfg)| {
-                id.eq_ignore_ascii_case(provider)
-                    || ((provider.eq_ignore_ascii_case("openai")
-                        || provider.eq_ignore_ascii_case("openai-completions"))
-                        && config::provider_is_openai_completions(cfg))
-            })
-            .map(|(_, cfg)| cfg)
+    let manifests = snapshot.map_or_else(Vec::new, |snapshot| {
+        snapshot
+            .providers()
+            .iter()
+            .filter_map(|provider| snapshot.provider_manifest(&provider.provider_id).cloned())
+            .collect()
     });
-    if configured.as_ref().is_some_and(|cfg| {
-        cfg.api_key
-            .as_deref()
-            .filter(|key| !key.is_empty())
-            .and_then(|key| config::resolve_config_value(key, None))
-            .is_some()
+    let catalog = crate::provider::execution_catalog_with_manifests(&manifests)?;
+    if catalog.iter().any(|model| {
+        model.provider == provider && crate::credentials::has_header_auth(model.headers.as_ref())
     }) {
-        return CredentialSource::ModelsJson;
+        return Ok(CredentialSource::Headers);
     }
-    let is_openai = provider.eq_ignore_ascii_case("openai")
-        || provider.eq_ignore_ascii_case("openai-completions")
-        || configured
-            .as_ref()
-            .is_some_and(config::provider_is_openai_completions);
-    if is_openai
-        && std::env::var(crate::provider::OPENAI_API_KEY_ENV)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    {
-        return CredentialSource::EnvOpenAiApiKey;
-    }
-    if !is_openai
-        && std::env::var(crate::provider::ANTHROPIC_AUTH_TOKEN_ENV)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    {
-        return CredentialSource::EnvAuthTToken;
-    }
-    if !is_openai
-        && std::env::var(crate::provider::ANTHROPIC_API_KEY_ENV)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false)
-    {
-        return CredentialSource::EnvApiKey;
-    }
-    CredentialSource::CliFlagUnset
+    Ok(CredentialSource::Missing)
 }
 
 /// `rpi auth --help`. Mirrors the TS auth-command usage but scoped to v1.
@@ -479,7 +399,7 @@ fn print_auth_help() {
     println!(
         "Usage: {name} auth <subcommand> [options]
 
-Manage persisted credentials and inspect models.json provider authentication.
+Manage persisted credentials and inspect provider package authentication.
 
 Subcommands:
   login   Prompt for an API key, or run an OAuth provider login.
@@ -490,12 +410,15 @@ Subcommands:
 
 Options:
   --provider <id>   Provider id (default: anthropic)
+  --extension <path>  Load a provider or OAuth extension explicitly.
+  --no-extensions     Disable extension discovery and package auth declarations.
   --json            (check only) Emit a {{ready, provider, source}} JSON object
 
 Environment:
   ANTHROPIC_API_KEY      Fallback API key (x-api-key) when no stored credential.
   ANTHROPIC_AUTH_TOKEN   Fallback bearer token (Authorization: Bearer).
-  OPENAI_API_KEY         Fallback bearer token for openai-completions.
+  OPENAI_API_KEY         Fallback bearer token for the built-in openai identity.
+  Other providers       Environment names come from installed package declarations.
 
 Notes:
   `login --provider <id>` uses the registered OAuth extension when one exists;
@@ -506,13 +429,6 @@ Notes:
 ",
         name = crate::APP_NAME
     );
-}
-
-// Keep BTreeMap imported for future header-bearing credential variants without
-// triggering an unused-import in the current v1 shape.
-#[allow(dead_code)]
-fn _keep_btreemap() -> Option<BTreeMap<String, String>> {
-    None
 }
 
 #[cfg(test)]
@@ -597,7 +513,7 @@ mod tests {
     #[tokio::test]
     async fn check_not_ready_with_no_credentials() {
         let _cfg = TempConfig::new();
-        let code = run_check(&[]).await;
+        let code = run_check(&[], None).await;
         assert_eq!(code, EXIT_NOT_READY);
     }
 
@@ -612,7 +528,7 @@ mod tests {
             },
         )
         .unwrap();
-        let code = run_check(&[]).await;
+        let code = run_check(&[], None).await;
         assert_eq!(code, 0);
     }
 
@@ -626,7 +542,7 @@ mod tests {
             0,
         )
         .unwrap();
-        assert_eq!(run_check(&[]).await, 0);
+        assert_eq!(run_check(&[], None).await, 0);
     }
 
     #[tokio::test]
@@ -639,15 +555,102 @@ mod tests {
             1,
         )
         .unwrap();
-        assert_eq!(run_check(&[]).await, EXIT_NOT_READY);
+        assert_eq!(run_check(&[], None).await, EXIT_NOT_READY);
     }
 
     #[tokio::test]
     async fn check_ready_with_env_api_key() {
         let _cfg = TempConfig::new();
         std::env::set_var(crate::provider::ANTHROPIC_API_KEY_ENV, "sk-env");
-        let code = run_check(&[]).await;
+        let code = run_check(&[], None).await;
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn check_does_not_borrow_credentials_from_another_provider_or_protocol() {
+        let _cfg = TempConfig::new();
+        std::env::set_var(crate::provider::ANTHROPIC_API_KEY_ENV, "anthropic-key");
+        std::env::set_var(crate::provider::OPENAI_API_KEY_ENV, "openai-key");
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{"providers":{
+            "gateway":{"api":"openai-completions","models":[{"id":"model"}]},
+            "another":{"api":"openai-completions","apiKey":"another-key","models":[{"id":"other"}]}
+        }}"#,
+        )
+        .unwrap();
+        for provider in ["gateway", "unknown", "openai-completions", "OpenAI"] {
+            assert_eq!(
+                detect_credential(provider, None).unwrap(),
+                CredentialSource::Missing,
+                "{provider}"
+            );
+        }
+        // A gateway key also must not make the built-in OpenAI identity ready.
+        std::env::remove_var(crate::provider::OPENAI_API_KEY_ENV);
+        assert_eq!(
+            detect_credential("openai", None).unwrap(),
+            CredentialSource::Missing
+        );
+    }
+
+    #[test]
+    fn check_resolves_stored_references_and_rejects_empty_or_unresolved_values() {
+        let _cfg = TempConfig::new();
+        upsert_credential(
+            "gateway",
+            Credential::ApiKey {
+                key: Some("$RPI_TEST_STORED_KEY".into()),
+                env: Some(std::collections::BTreeMap::from([(
+                    "RPI_TEST_STORED_KEY".into(),
+                    "stored-key".into(),
+                )])),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            detect_credential("gateway", None).unwrap(),
+            CredentialSource::StoredApiKey
+        );
+        for key in [Some("$RPI_TEST_AUTH_MISSING_VARIABLE"), Some("   "), None] {
+            upsert_credential(
+                "gateway",
+                Credential::ApiKey {
+                    key: key.map(str::to_string),
+                    env: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                detect_credential("gateway", None).unwrap(),
+                CredentialSource::Missing
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn check_reports_config_errors_and_respects_resolved_header_auth() {
+        let _cfg = TempConfig::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{"providers":{"gateway":{
+            "api":"openai-completions","models":[{"id":"model","headers":{"Authorization":""}}]
+        }}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            detect_credential("gateway", None).unwrap(),
+            CredentialSource::Missing
+        );
+        std::fs::write(config::models_path().unwrap(), r#"{"providers":{"gateway":{
+            "api":"openai-completions","models":[{"id":"model","headers":{"Authorization":"Bearer key"}}]
+        }}}"#).unwrap();
+        assert_eq!(
+            detect_credential("gateway", None).unwrap(),
+            CredentialSource::Headers
+        );
+        std::fs::write(config::auth_path().unwrap(), "{invalid").unwrap();
+        assert_eq!(run_check(&[], None).await, EXIT_ERROR);
     }
 
     #[tokio::test]
@@ -658,7 +661,7 @@ mod tests {
             r#"{"providers":{"gateway":{"api":"openai-completions","apiKey":"key","models":[{"id":"gpt-test"}]}}}"#,
         )
         .unwrap();
-        let code = run_check(&["--provider".to_string(), "gateway".to_string()]).await;
+        let code = run_check(&["--provider".to_string(), "gateway".to_string()], None).await;
         assert_eq!(code, 0);
     }
 
@@ -675,7 +678,7 @@ mod tests {
             },
         )
         .unwrap();
-        let code = run_check(&["--json".to_string()]).await;
+        let code = run_check(&["--json".to_string()], None).await;
         assert_eq!(code, 0);
     }
 
@@ -694,7 +697,7 @@ mod tests {
         let code = run_logout(&[], None).await;
         assert_eq!(code, 0);
         // The entry should be gone → check is now not_ready.
-        assert_eq!(run_check(&[]).await, EXIT_NOT_READY);
+        assert_eq!(run_check(&[], None).await, EXIT_NOT_READY);
     }
 
     #[tokio::test]
