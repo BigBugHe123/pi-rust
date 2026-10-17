@@ -45,8 +45,10 @@ it is the default.
 - `provider` — the `Provider` trait seam, `ProviderHooks`, `SimpleStreamOptions`,
   and the optional `DeferredProvider` capability for long-poll APIs.
 - `providers` — concrete implementations: `faux` (always), `anthropic`,
-  `openai_completions`, `openai_responses`, `openrouter`, `deepseek`,
-  `llama_cpp`, `proxy` (behind `providers`).
+  `openai_completions`, `openai_responses` (behind `providers`).
+  DeepSeek, OpenRouter, llama.cpp and Proxy live together in the optional
+  [rpi-providers package](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers);
+  see the [migration guide](../../docs/architecture/provider-packages.md).
 
 ## The `Provider` trait
 

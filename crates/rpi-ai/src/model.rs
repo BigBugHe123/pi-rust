@@ -72,8 +72,8 @@ impl AnthropicMessagesCompat {
 /// the plan every turn becomes busy-work (the re-plan symptom in
 /// `docs/debugging/llm-repetition-forensics.md`).
 ///
-/// - `openai-completions`: only with `compat.requiresThinkingAsText`, which
-///   flattens thinking blocks into `text` parts (`providers/openai_completions.rs`).
+/// - `openai-completions`: with `compat.requiresThinkingAsText` (text parts) or
+///   `compat.requiresReasoningContent` (a separate reasoning_content field).
 /// - `openai-responses`: visible thinking is replayed as input content.
 /// - `anthropic-messages`: thinking blocks are echoed back with their signature.
 /// - everything else: reasoning is dropped, so the model cannot see it again.
@@ -83,6 +83,7 @@ pub fn prior_reasoning_is_replayed(model: &Model) -> bool {
             model.compat.as_ref(),
             Some(StreamingProtocolCompat::OpenaiCompletions(compat))
                 if compat.requires_thinking_as_text == Some(true)
+                    || compat.requires_reasoning_content == Some(true)
         ),
         Api::OpenaiResponses | Api::AzureOpenaiResponses | Api::OpenaiCodexResponses => true,
         Api::AnthropicMessages => true,
@@ -105,6 +106,9 @@ pub struct OpenaiCompletionsCompat {
     pub requires_tool_result_name: Option<bool>,
     pub requires_assistant_after_tool_result: Option<bool>,
     pub requires_thinking_as_text: Option<bool>,
+    /// Replay prior assistant thinking in the wire reasoning_content field.
+    /// Opt-in per model; ordinary OpenAI endpoints keep their existing shape.
+    pub requires_reasoning_content: Option<bool>,
     pub supports_strict_mode: Option<bool>,
     pub send_session_affinity_headers: Option<bool>,
     pub supports_long_cache_retention: Option<bool>,

@@ -41,7 +41,13 @@ harness consumes its adapters through injection.
   a veto path that lets a handler refuse startup, and a tee emitter so a plugin
   can observe events without stealing them from the TUI.
 - **Providers.** `PluggableProvider` and `ExtensionProviderHooks` let a plugin
-  serve a model or patch request options.
+  serve a model or patch request options. A plugin that registers
+  `register_streaming_provider` emits per-chunk envelopes that the host maps onto
+  `AssistantMessageEvent`s as they arrive, so a plugin provider renders
+  progressively instead of appearing all at once when the response completes. The
+  same request fn also receives a `ProviderStreamControl`, and a plugin that polls
+  it stops generating on a cancelled run instead of streaming a response nobody
+  will read — one registration, and the plugin decides whether to check.
 
 ## Crate dependencies
 

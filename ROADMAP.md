@@ -88,6 +88,14 @@ global plugins.
 Still unmeasured and worth adding: tool-loop throughput, memory growth over a
 long session, compaction cost, and interactive TUI frame cost.
 
+## Provider packages
+
+Provider boundary cleanup keeps Anthropic and OpenAI in core. DeepSeek,
+OpenRouter, llama.cpp and Proxy share one optional rpi-providers package in the
+independent rpi-package project, with one install and upgrade entry point.
+See [Provider packages](docs/architecture/provider-packages.md) for installation,
+catalog registration, credential isolation and migration details.
+
 ## Later
 
 - **Provider boundary cleanup and external adapters.** Keep the core runtime limited to the

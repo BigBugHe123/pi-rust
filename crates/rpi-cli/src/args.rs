@@ -596,7 +596,7 @@ pub fn print_help() {
   {name} [options] [@files...] [messages...]
 
 {u}Options:{r}
-  --provider <name>              Provider name (anthropic, openai-completions, openai-responses, or models.json id)
+  --provider <name>              Provider name (built-in, installed package, or models.json id)
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
   --api-key <key>                API key override for the selected provider
   --base-url <url>               Override the selected model endpoint

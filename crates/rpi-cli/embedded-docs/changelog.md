@@ -11,40 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
-## [0.4.1] - 2026-10-17
-
-## [0.4.0](https://github.com/bigfish1913/pi-rust/compare/v0.3.24...v0.4.0) - 2026-10-16
-
 ### Added
 
-- Configure per-model USD cost rates, long-context pricing tiers and thinking-level
-  mappings in `models.json`; preserve those values when saving the configuration.
-- Prepare unified workspace Release PRs automatically after main CI succeeds.
-  Merging a Release PR publishes crates, five platform binaries, Homebrew/Scoop
-  and a retry-safe Microsoft winget submission.
-
-### Changed
-
-- Add `Model.cost_configured` (`costConfigured` in JSON) to distinguish unknown
-  prices from explicitly free models. `ModelDefinition` also adds `cost` and
-  `thinking_level_map`. Rust callers using exhaustive struct literals must supply
-  the new fields; `Model::new` provides its default. These API changes require the
-  0.4.0 release; the native extension SDK ABI remains unchanged.
-- Expose pricing availability in extension provider hooks and calculate request
-  costs using the configured model rates, including long-context tiers.
+- Stream custom plugin providers. A plugin registered with
+  `register_streaming_provider` emits per-chunk envelopes on a host callback and
+  the host maps them onto `AssistantMessageEvent`s as they arrive, so a plugin
+  provider renders progressively instead of appearing all at once when the
+  response is complete.
+- Cancel a plugin provider mid-generation. The streaming request fn now also
+  receives a `ProviderStreamControl` (plus a deferred completion signal reserved
+  for a future host). Polling it is the plugin's choice — one registration and one
+  signature cover both the fire-and-forget and the cooperative shape. A cancelled
+  run stops forwarding content and ends on `Error { reason: Aborted }` immediately,
+  and a cooperative plugin stops producing instead of streaming a generation
+  nobody will read.
 
 ### Fixed
 
-- Wait for buffered file appends to complete before returning, so immediate
-  reads and metadata queries always observe the appended bytes.
-- Release extension dialog state locks before submit callbacks, preventing
-  free-form answers and editor submissions from deadlocking the TUI.
-- Restore enhanced keyboard input on compatible macOS terminals so Shift+Enter
-  inserts a newline. Otty retains legacy input for CJK IME compatibility, with
-  `RPI_KITTY_KEYBOARD` available as an explicit override.
-- Wrap long Markdown code lines instead of clipping their tails with an ellipsis.
-- Keep different versions in separate publish queues and synchronize embedded
-  release notes before the Release PR becomes ready.
+- Report an aborted plugin provider as `ErrorReason::Aborted` rather than
+  `ErrorReason::Error`, so a user-cancelled run is no longer indistinguishable
+  from a provider failure.
+
+## [0.4.1] - 2026-10-17
 
 ## [0.3.24] - 2026-10-15
 

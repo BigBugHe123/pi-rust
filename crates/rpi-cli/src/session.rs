@@ -189,41 +189,27 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
     cwd.join(".rpi").join("sessions")
 }
 
-/// Build the `AgentHarness` from the resolved model + parsed args + cwd.
-///
-/// This is the v1 equivalent of TS `createAgentSession`. It:
-/// 1. Builds the `OsExecutionEnv` rooted at `cwd`.
-/// 2. Constructs the built-in tools (optionally filtered by `--tools`/
-///    `--exclude-tools`/`--no-tools`/`--no-builtin-tools`).
-/// 3. Resolves the session storage (ephemeral vs fresh JSONL vs restore-error).
-/// 4. Assembles `AgentHarnessOptions` and calls `AgentHarness::create`.
-///
-/// Returns the harness plus a `broadcast::Receiver<AgentEvent>` carrying the
-/// live `AgentEvent` stream from every run (backed by a `BroadcastEmitter`
-/// installed on the harness). Interactive mode drains this to render streaming
-/// responses; the non-interactive modes simply drop it.
-/// Returns the harness, the live `AgentEvent` broadcast receiver, and a
-/// [`ReloadContext`] the interactive TUI holds to drive `/reload` (and a
-/// plugin's `runtime_action(Reload)` via the mailbox). Non-interactive modes
-/// drop the context (no `/reload` surface in print/json mode).
-pub async fn build(
-    resolved: &ResolvedModel,
+/// Extensions are loaded exactly once before model resolution. Their action
+/// host remains unbound until the harness and authenticated catalog exist.
+pub struct PreparedExtensions {
+    pub extension_session: ExtensionSession,
+    runtime: tokio::runtime::Handle,
+    tool_context: rpi_extensions::ToolCallContext,
+    action_host: Arc<crate::extensions_actions::HarnessActionHost>,
+    harness_cell: Arc<std::sync::OnceLock<Arc<AgentHarness>>>,
+    reload_mailbox: rpi_extensions::ReloadMailbox,
+    ui_dialog_mailbox: rpi_extensions::UiDialogMailbox,
+    ext_status_mailbox: rpi_extensions::ExtensionStatusMailbox,
+    editor_text_mailbox: rpi_extensions::EditorTextMailbox,
+    action_bridge: Arc<rpi_extensions::ActionBridge>,
+}
+
+pub fn prepare_extensions(
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
-) -> Result<
-    (
-        AgentHarness,
-        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
-        ReloadContext,
-    ),
-    BuildError,
-> {
+) -> Result<PreparedExtensions, BuildError> {
     let cwd_str = cwd.to_string_lossy().to_string();
-    // Plugin tools get the session's identity injected into every call's
-    // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
-    // before the tools are built, and completed with the session id below once
-    // the session exists — the tool set has to exist before the harness does.
     let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
     if !project_trusted && args.verbose {
         eprintln!(
@@ -251,7 +237,7 @@ pub async fn build(
     let runtime = tokio::runtime::Handle::try_current().map_err(|e| {
         BuildError::HarnessCreate(format!("no tokio runtime for action bridge: {e}"))
     })?;
-    let catalog = crate::provider::available_catalog(resolved);
+    let catalog = Vec::new();
     let (action_host, harness_cell) = crate::extensions_actions::HarnessActionHost::new_empty(
         catalog.clone(),
         cwd.to_path_buf(),
@@ -259,7 +245,8 @@ pub async fn build(
         args.unknown_flags.clone(),
         tool_context.clone(),
     );
-    let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
+    let action_host = Arc::new(action_host);
+    let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
     // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
     //
@@ -294,6 +281,99 @@ pub async fn build(
         editor_text_mailbox.clone(),
     );
 
+    let extension_session = if args.no_extensions {
+        ExtensionSession::none()
+    } else {
+        load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
+    };
+    if args.verbose {
+        if let Some(s) = extension_session.summary() {
+            eprintln!("extensions: {s}");
+        }
+        report_deferred_renderers(&extension_session);
+    }
+    Ok(PreparedExtensions {
+        runtime,
+        tool_context,
+        action_host,
+        harness_cell,
+        reload_mailbox,
+        ui_dialog_mailbox,
+        ext_status_mailbox,
+        editor_text_mailbox,
+        action_bridge,
+        extension_session,
+    })
+}
+
+/// Build the `AgentHarness` from the resolved model + parsed args + cwd.
+///
+/// This is the v1 equivalent of TS `createAgentSession`. It:
+/// 1. Builds the `OsExecutionEnv` rooted at `cwd`.
+/// 2. Constructs the built-in tools (optionally filtered by `--tools`/
+///    `--exclude-tools`/`--no-tools`/`--no-builtin-tools`).
+/// 3. Resolves the session storage (ephemeral vs fresh JSONL vs restore-error).
+/// 4. Assembles `AgentHarnessOptions` and calls `AgentHarness::create`.
+///
+/// Returns the harness plus a `broadcast::Receiver<AgentEvent>` carrying the
+/// live `AgentEvent` stream from every run (backed by a `BroadcastEmitter`
+/// installed on the harness). Interactive mode drains this to render streaming
+/// responses; the non-interactive modes simply drop it.
+/// Returns the harness, the live `AgentEvent` broadcast receiver, and a
+/// [`ReloadContext`] the interactive TUI holds to drive `/reload` (and a
+/// plugin's `runtime_action(Reload)` via the mailbox). Non-interactive modes
+/// drop the context (no `/reload` surface in print/json mode).
+pub async fn build(
+    resolved: &ResolvedModel,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
+    ),
+    BuildError,
+> {
+    let prepared = prepare_extensions(args, cwd, project_trusted)?;
+    build_prepared(resolved, args, cwd, project_trusted, prepared).await
+}
+
+pub async fn build_prepared(
+    resolved: &ResolvedModel,
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    prepared: PreparedExtensions,
+) -> Result<
+    (
+        AgentHarness,
+        tokio::sync::broadcast::Receiver<rpi_agent::AgentEvent>,
+        ReloadContext,
+    ),
+    BuildError,
+> {
+    let cwd_str = cwd.to_string_lossy().to_string();
+    // Plugin tools get the session's identity injected into every call's
+    // arguments (see `rpi_extensions::ToolCallContext`). It is created here,
+    // before the tools are built, and completed with the session id below once
+    // the session exists — the tool set has to exist before the harness does.
+    let PreparedExtensions {
+        runtime,
+        tool_context,
+        action_host,
+        harness_cell,
+        reload_mailbox,
+        ui_dialog_mailbox,
+        ext_status_mailbox,
+        editor_text_mailbox,
+        action_bridge,
+        extension_session,
+    } = prepared;
+    let catalog = crate::provider::authenticated_catalog(resolved);
+    action_host.set_catalog(catalog.clone());
+
     // ---- Execution env + tools ----
     let env = Arc::new(OsExecutionEnv::with_cwd(cwd.to_path_buf()));
     let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
@@ -312,17 +392,6 @@ pub async fn build(
     // apply to the merged set), and keep the loaded `Library` handles alive for
     // the harness lifetime via the returned session guard. `--no-extensions`
     // skips discovery entirely (no dirs scanned, no plugins loaded).
-    let extension_session = if args.no_extensions {
-        ExtensionSession::none()
-    } else {
-        load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
-    };
-    if args.verbose {
-        if let Some(s) = extension_session.summary() {
-            eprintln!("extensions: {s}");
-        }
-        report_deferred_renderers(&extension_session);
-    }
     merge_extension_tools(&mut tools, &extension_session, args, &tool_context);
     let active = filter_active_tool_names(active_tool_names(&tools, args), args);
 
@@ -797,8 +866,8 @@ pub async fn build(
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         tool_context,
-        catalog,
-        providers: resolved.providers.clone(),
+        catalog: Arc::new(std::sync::RwLock::new(catalog)),
+        providers: Arc::new(std::sync::RwLock::new(resolved.providers.clone())),
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
@@ -935,14 +1004,12 @@ pub struct ReloadContext {
     /// optional auto-send countdown, and submits through the normal path so the
     /// user bubble renders as usual.
     pub editor_text: rpi_extensions::EditorTextMailbox,
-    /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
-    /// `available_catalog(resolved)` is captured once — reload does not re-resolve
-    /// the provider (auth/provider resolution is a startup concern; reloading
-    /// extensions does not re-open auth).
-    pub catalog: Vec<rpi_ai::Model>,
-    /// The resolved provider runtimes (for rebuilding `models` =
-    /// `providers + PluggableProvider::from_session`). Cheap to clone (`Arc`).
-    pub providers: Vec<Arc<dyn Provider>>,
+    /// Shared authenticated model catalog for runtime actions and the TUI.
+    /// Provider-package reloads replace it together with the runtime bindings.
+    pub catalog: Arc<std::sync::RwLock<Vec<rpi_ai::Model>>>,
+    /// Current configured provider runtimes. Replaced after package reload so
+    /// subsequent reloads cannot recover stale plugin snapshots.
+    pub providers: Arc<std::sync::RwLock<Vec<Arc<dyn Provider>>>>,
     /// The ambient runtime handle (captured in `build`) — `PluggableProvider`
     /// + the fresh `ActionBridge` need a captured `Handle` to spawn from any
     /// thread.
@@ -1186,7 +1253,10 @@ where
             // No prior bridge (no extensions ever loaded). Build a fresh host so
             // a reload that newly discovers plugins can still drive actions.
             let (action_host, _cell) = crate::extensions_actions::HarnessActionHost::new_empty(
-                ctx.catalog.clone(),
+                ctx.catalog
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
                 ctx.args.unknown_flags.clone(),
@@ -1229,6 +1299,69 @@ where
         }
         report_deferred_renderers(&extension_session);
     }
+
+    let has_package_providers = |session: &ExtensionSession| {
+        session.snapshot().is_some_and(|snapshot| {
+            snapshot
+                .providers()
+                .iter()
+                .any(|provider| snapshot.provider_manifest(&provider.provider_id).is_some())
+        })
+    };
+    let packaged = has_package_providers(&extension_session)
+        || has_package_providers(&ctx.extension_session.lock().unwrap());
+    let refreshed = if packaged {
+        let mut args = effective_args.clone();
+        if let Ok(current) = harness.lane("main").get_model().await {
+            let was_package = ctx
+                .extension_session
+                .lock()
+                .unwrap()
+                .snapshot()
+                .is_some_and(|snapshot| snapshot.provider_manifest(&current.provider).is_some());
+            let has_replacement = extension_session.snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .providers()
+                    .iter()
+                    .any(|provider| provider.provider_id == current.provider)
+            });
+            if was_package && !has_replacement {
+                return ReloadOutcome {
+                    summary: "Reload failed while resolving provider packages".into(),
+                    had_warnings: true,
+                    details: vec![format!(
+                        "active provider package '{}' is no longer loaded",
+                        current.provider
+                    )],
+                    had_errors: true,
+                };
+            }
+            args.provider = Some(current.provider.clone());
+            args.model = Some(current.id);
+            if current.provider != ctx.resolved_model.provider {
+                args.api_key = None;
+                args.base_url = None;
+            }
+        }
+        match crate::provider::resolve_with_extensions(
+            &args,
+            &ctx.cwd,
+            ctx.project_trusted,
+            &extension_session,
+        ) {
+            Ok(resolved) => Some(resolved),
+            Err(error) => {
+                return ReloadOutcome {
+                    summary: "Reload failed while resolving provider packages".into(),
+                    had_warnings: true,
+                    details: vec![error.to_string()],
+                    had_errors: true,
+                }
+            }
+        }
+    } else {
+        None
+    };
 
     // ---- 2. Invalidate the old session + bridge BEFORE the swap ----
     // The old registry's `active` flag flips false so any in-flight
@@ -1435,7 +1568,15 @@ where
     let _ = harness.set_agent_emitter(Some(emitter)).await;
     let _ = harness
         .set_models(build_models_with_extensions_for_reload(
-            &ctx.providers,
+            &refreshed
+                .as_ref()
+                .map(|resolved| resolved.providers.clone())
+                .unwrap_or_else(|| {
+                    ctx.providers
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone()
+                }),
             &extension_session,
             ctx.runtime.clone(),
         ))
@@ -1446,6 +1587,22 @@ where
                 .map(|h| Arc::new(h) as Arc<dyn rpi_ai::ProviderHooks>),
         )
         .await;
+
+    if let Some(resolved) = &refreshed {
+        *ctx.providers
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = resolved.providers.clone();
+        let catalog = crate::provider::authenticated_catalog(resolved);
+        fresh_bridge
+            .clone_host()
+            .replace_model_catalog(catalog.clone());
+        *ctx.catalog
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = catalog;
+        // Refresh the public descriptor. Credentials remain in the newly bound
+        // provider instances installed above and never enter the lane model.
+        let _ = harness.lane("main").set_model(resolved.model.clone()).await;
+    }
 
     // Re-merge extension tools (a reloaded plugin may have added/removed a
     // tool). The built-in set is rebuilt from scratch + extension tools merged
@@ -1619,7 +1776,20 @@ fn build_models_with_extensions_for_reload(
 ) -> Vec<Arc<dyn Provider>> {
     let mut models: Vec<Arc<dyn Provider>> = providers.to_vec();
     let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
-    models.extend(pluggable);
+    for provider in pluggable {
+        // Declared packages must enter through credential-bound factories.
+        // Falling back to a raw adapter would reintroduce packages rejected by
+        // auth filtering and would discard their configured model snapshot.
+        if extension_session
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.provider_manifest(provider.id()).is_some())
+        {
+            continue;
+        }
+        if !models.iter().any(|known| known.id() == provider.id()) {
+            models.push(provider);
+        }
+    }
     models
 }
 
@@ -1665,24 +1835,14 @@ pub enum BuildError {
     HarnessCreate(String),
 }
 
-/// B5c: build the `AgentHarnessOptions.models` vec — the resolved gateway
-/// provider first, then one `Arc<dyn Provider>` per registered extension
-/// provider (each a [`rpi_extensions::PluggableProvider`] wrapping a plugin's
-/// sync `ProviderRequestFn`). The harness resolves a provider lazily per call by
-/// `models.iter().find(|p| p.id() == model.provider)`, so the gateway stays
-/// first-match for its own ids and an extension provider serves a catalog model
-/// whose `provider` matches its id. `runtime` is the same `Handle` captured for
-/// the action bridge — `PluggableProvider` needs a captured `Handle` to
-/// `spawn_blocking` the sync ffi call from the async `stream_simple`.
+/// Keep configured factories (including package-specific auth and catalogs)
+/// first, then append legacy plugin registrations that have no runtime yet.
 fn build_models_with_extensions(
     resolved: &ResolvedModel,
     extension_session: &ExtensionSession,
     runtime: tokio::runtime::Handle,
 ) -> Vec<Arc<dyn Provider>> {
-    let mut models: Vec<Arc<dyn Provider>> = resolved.providers.clone();
-    let pluggable = rpi_extensions::PluggableProvider::from_session(extension_session, runtime);
-    models.extend(pluggable);
-    models
+    build_models_with_extensions_for_reload(&resolved.providers, extension_session, runtime)
 }
 
 /// Resolve project resource loading without prompting. Explicit CLI overrides
@@ -1704,12 +1864,15 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
 /// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
 /// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
 /// the `--verbose` summary.
-fn load_extensions(
+pub(crate) fn load_extensions(
     args: &Args,
     cwd: &Path,
     project_trusted: bool,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
+    if args.no_extensions {
+        return ExtensionSession::none();
+    }
     let mut dirs = if args.dev_local_only {
         Vec::new()
     } else if args.project_only {
@@ -2652,6 +2815,51 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn unauthenticated_packages_are_not_reintroduced_as_legacy_adapters() {
+        extern "C" fn request(
+            _: rpi_plugin_sdk::StbStringRef,
+            _: *mut rpi_plugin_sdk::StbString,
+            _: *mut std::ffi::c_void,
+        ) -> i32 {
+            1
+        }
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        for id in ["package", "legacy"] {
+            registry.register_provider(rpi_extensions::RegisteredProvider {
+                provider_id: id.into(),
+                base_url: "http://localhost".into(),
+                api_style: "openai-completions".into(),
+                request_fn: request,
+                stream_fn: None,
+                plugin_free_string: rpi_plugin_sdk::callbacks::free_string,
+                user_data: std::ptr::null_mut(),
+            });
+        }
+        assert!(registry.apply_declaration_json(&serde_json::json!({"providers":[{
+            "id":"package", "requiresAuth":true,
+            "models":[rpi_ai::Model::new("model", "Model", rpi_ai::Api::OpenaiCompletions, "package", "http://localhost")]
+        }]}).to_string()));
+        let session = ExtensionSession::from_parts(
+            Arc::new(registry.snapshot()),
+            rpi_extensions::PluginKeepalive::empty(),
+            vec![],
+            None,
+        );
+        let providers = build_models_with_extensions_for_reload(
+            &[],
+            &session,
+            tokio::runtime::Handle::current(),
+        );
+        assert_eq!(
+            providers
+                .iter()
+                .map(|provider| provider.id())
+                .collect::<Vec<_>>(),
+            ["legacy"]
+        );
+    }
     use crate::args::Args;
 
     #[test]

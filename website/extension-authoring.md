@@ -146,9 +146,23 @@ fan-out 到所有已注册 handler，合并返回的 `{skillPaths, promptPaths, 
 
 ### Provider 与渲染器
 
-`api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
-`api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
-`register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
+Provider 接入遵循 [Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)，
+完整模板见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)。
+只改已有协议的端点和模型时优先使用 `models.json`；需要目录、认证策略或协议适配时使用独立 package。
+生产实现统一维护在 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+一个安装入口提供多个独立 provider；新增供应商在包内加模块，根模块只导出一次插件入口。
+
+推荐 `rpi-provider-runtime::export_provider!`：通过 `declare` 声明完整模型目录、
+`apiKeyEnv` 与 `requiresAuth`，优先注册 `register_streaming_provider`，旧宿主降级
+`register_provider`。流式增量在生成期间发送，最终 `out` 仍返回完整消息；宿主产生唯一终态。
+取消后应停止网络与后台任务，request fn 返回后不得继续调用 `emit`。
+
+凭据由宿主按 provider ID 解析，插件使用本次请求的 model / options，不自行继承
+`OPENAI_API_KEY`。公开模型描述没有请求头，实际端点与认证在私有执行绑定中恢复。
+验收应覆盖真实动态库加载、首段到达后才继续响应的 SSE 门控、取消、401、认证隔离和重载。
+
+`register_message_renderer` / `register_markdown_transformer` / `register_entry_renderer`
+注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
 
 ## 6. Rust 工具设计最佳实践
 

@@ -1144,8 +1144,166 @@ pub type RenderFn =
 /// A provider-injection factory fn (for `register_provider`). `req_json` is a
 /// borrowed request envelope; `out` is an owning response the plugin frees.
 /// The host wraps this into a `Provider` impl (B4/B5).
+///
+/// **One-shot.** The plugin returns the complete assistant message and the host
+/// emits it as a single terminal chunk (no progressive rendering). A provider
+/// that can stream should use [`ProviderStreamRequestFn`] via
+/// `register_streaming_provider` instead; both slots stay registered so an
+/// existing plugin keeps its behavior unchanged.
 pub type ProviderRequestFn =
     extern "C" fn(req_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
+
+/// Chunk kind for [`ProviderStreamControl::is_cancelled`]. **Appended last** so a
+/// plugin compiled against an older, shorter struct reads only the fields it
+/// knows about.
+#[repr(u32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderChunkKind {
+    /// A chunk that carries model output (`text_delta`, `thinking_delta`, …).
+    /// A cancelled request has no one left to deliver it to.
+    Content = 0,
+    /// A structural or accounting chunk (`start`, `*_start`, `*_end`, `usage`).
+    /// Still acknowledged while the request winds down. A host that already
+    /// emitted its aborted terminal discards these cleanup chunks.
+    Structural = 1,
+}
+
+/// The plugin's synchronous control surface over the host, passed to a **v2**
+/// streaming request fn.
+///
+/// The fields are plain fn pointers plus an opaque pointer, so the struct is
+/// `Copy` and needs no deallocation. The host owns it for the duration of the
+/// request and it must not be retained.
+///
+/// `is_cancelled` is the cheap check a plugin's request loop makes between
+/// chunks (poll it, do not block on it). `wait_cancelled_ms` is the blocking
+/// variant for a plugin whose loop is not able to poll — an SSE frame read, a
+/// sleep between retries — and it must return promptly on cancellation rather
+/// than waiting out the full timeout.
+///
+/// ```ignore
+/// // Inside a v2 request fn, before handing a delta to `emit`:
+/// if control.is_cancelled(control.user_data, ProviderChunkKind::Content as u32) != 0 {
+///     return 1; // stop producing; the host is already gone
+/// }
+/// ```
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct ProviderStreamControl {
+    /// `is_cancelled(control_user_data, chunk_kind: u32) -> i32`. Nonzero when
+    /// the caller has gone away. `chunk_kind` lets the host still admit the
+    /// structural chunks a partial message needs: pass
+    /// [`ProviderChunkKind::Content`] (0) for model output and
+    /// [`ProviderChunkKind::Structural`] (1) otherwise. Never blocking, never
+    /// frees anything.
+    pub is_cancelled: extern "C" fn(user_data: *mut c_void, chunk_kind: u32) -> i32,
+    /// `wait_cancelled_ms(control_user_data, timeout_ms) -> i32`. Blocks up to
+    /// `timeout_ms` waiting for cancellation, returning nonzero the moment it is
+    /// observed. `timeout_ms == 0` is a non-blocking poll (same as
+    /// `is_cancelled` with [`ProviderChunkKind::Content`]). Safe to call from the
+    /// request thread: it only touches the host's cancellation latch, which is
+    /// always present in the snapshot and never holds another lock.
+    pub wait_cancelled_ms: extern "C" fn(user_data: *mut c_void, timeout_ms: u32) -> i32,
+    /// Host-owned opaque handle, passed back unchanged to both fields above.
+    pub user_data: *mut c_void,
+}
+
+/// Completion signal a **v2** streaming provider calls **after** its request fn
+/// has returned.
+///
+/// Retained in the ABI for a future host that can keep the plugin's own stream
+/// alive past the request fn. This host does **not** use it: the plugin receives
+/// `None` and must therefore finish inside its request fn (which it can do
+/// promptly on cancellation by polling [`ProviderStreamControl`]). Keeping the
+/// type documented — rather than deleting it — is what makes a future host able
+/// to add the capability without another signature change.
+///
+/// `message_json` is a **plugin-owned** owning [`StbString`] holding the final
+/// assistant message.
+pub type ProviderStreamCompletionFn =
+    extern "C" fn(message_json: StbString, user_data: *mut c_void) -> i32;
+
+/// Per-chunk callback a **streaming** provider invokes while the response is
+/// still being produced (for `register_streaming_provider`).
+///
+/// `event_json` is an **owning** [`StbString`] the plugin produces and transfers
+/// to the host: the host reclaims it with the **producer's** `plugin_free_string`
+/// — the one the plugin passed to `register_streaming_provider` — exactly like a
+/// tool's partial-progress chunk. The host must not use its own `free_string`
+/// for it: the allocation belongs to the plugin's SDK instance.
+///
+/// The callback is invoked **synchronously inside the request fn**, on the same
+/// thread, only for the duration of that call — a plugin must never retain
+/// `emit`, `emit_user_data`, or the struct they live in past the request.
+/// Returns `0` on success; nonzero means the host rejected the chunk (a malformed
+/// envelope), which a plugin may ignore or treat as a request failure.
+pub type ProviderStreamEmitFn = extern "C" fn(event_json: StbString, user_data: *mut c_void) -> i32;
+
+/// A **streaming** provider-injection fn (for `register_streaming_provider`).
+///
+/// Same request envelope and final-response contract as [`ProviderRequestFn`],
+/// plus a per-chunk channel and the cancellation protocol:
+///
+/// - `req_json` — borrowed `{ model, context, options }` envelope (never freed by
+///   the plugin).
+/// - `emit` + `emit_user_data` — the host's per-chunk callback. `emit` is `None`
+///   only if the host cannot accept chunks; a plugin then degrades to buffering
+///   and returning the message through `out`. While the caller is cancelled the
+///   host acknowledges structural cleanup chunks and rejects content chunks
+///   (nonzero rc). Cleanup chunks are discarded after the aborted terminal.
+/// - `control` — pointer to the host's [`ProviderStreamControl`], present on
+///   **every** call. It is `null` only against a host that cannot describe its
+///   control surface; a plugin then treats the request as not cancellable and
+///   behaves as if cancellation never happens. The plugin must not retain it: it
+///   is valid only for the duration of the request fn.
+/// - `completion` — reserved; always `None` on this host (see
+///   [`ProviderStreamCompletionFn`]). A plugin must return its final message
+///   through `out` and may not expect to keep streaming after returning.
+/// - `out` — owning, plugin-owned, plugin-freed response holding the **final**
+///   `AssistantMessage` JSON (identical to the one-shot contract).
+/// - `user_data` — the opaque value the plugin registered with.
+///
+/// Call order: zero or more `emit` chunks, then exactly one return. The host
+/// derives the terminal `Done`/`Error` event from `out` (or from a nonzero rc),
+/// so a plugin that emits deltas still must fill `out`.
+///
+/// **Cancellation is opt-in per chunk, not per registration.** There is one
+/// streaming registration and one signature; whether a plugin checks `control` is
+/// up to it. A plugin that ignores `control` behaves exactly like the simpler
+/// fire-and-forget shape (the host still stops forwarding content and terminates
+/// the run on `Aborted`) — it just keeps generating until it finishes on its own.
+///
+/// Chunk envelope (JSON object with a `type` discriminator). `contentIndex` is the
+/// index of the block inside the final message; each index may be started once,
+/// but blocks may be opened in any order:
+///
+/// ```json
+/// {"type":"start"}
+/// {"type":"text_start","contentIndex":0}
+/// {"type":"text_delta","contentIndex":0,"delta":"hello "}
+/// {"type":"text_end","contentIndex":0,"content":"hello world"}
+/// {"type":"thinking_start","contentIndex":1}
+/// {"type":"thinking_delta","contentIndex":1,"delta":"considering"}
+/// {"type":"thinking_end","contentIndex":1,"content":"considering..."}
+/// {"type":"toolcall_start","contentIndex":2,"id":"call_1","name":"echo"}
+/// {"type":"toolcall_delta","contentIndex":2,"delta":"{\"text\""}
+/// {"type":"toolcall_end","contentIndex":2,"id":"call_1","name":"echo","arguments":{}}
+/// {"type":"usage","usage":{"input":1,"output":2}}
+/// ```
+///
+/// Unknown `type` values are ignored (forward compatibility). A `*_delta` may
+/// carry an optional `partial` object (a full assistant message) to override the
+/// host-side accumulated snapshot; otherwise the host accumulates deltas itself.
+pub type ProviderStreamRequestFn = extern "C" fn(
+    req_json: StbStringRef,
+    emit: Option<ProviderStreamEmitFn>,
+    emit_user_data: *mut c_void,
+    control: *const ProviderStreamControl,
+    completion: Option<ProviderStreamCompletionFn>,
+    completion_user_data: *mut c_void,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32;
 
 /// OAuth provider callback. The host sends a JSON action envelope and the
 /// plugin returns a JSON response. Actions are `begin`, `exchange`,
@@ -1300,6 +1458,31 @@ pub struct PluginApi {
             user_data: *mut c_void,
         ) -> i32,
     >,
+
+    /// Register a **streaming** custom provider (see
+    /// [`ProviderStreamRequestFn`]). Appended after `register_oauth_provider` so
+    /// every earlier field keeps its offset — a plugin compiled against a shorter
+    /// [`PluginApi`] stays valid without an ABI version bump.
+    ///
+    /// Nullable: `register_entrypoint` fills slots absent from an older host's
+    /// vtable with `None`; a plugin that cannot find the slot should fall back to
+    /// `register_provider` (one-shot) rather than refuse to load.
+    ///
+    /// `provider_id`/`base_url`/`api_style` mirror `register_provider` and are
+    /// copied by the host at registration. A streaming registration for an id
+    /// that already has a one-shot registration **replaces** it: streaming is a
+    /// strict superset of the one-shot contract, so a plugin registering both
+    /// ends up on the richer path.
+    pub register_streaming_provider: Option<
+        extern "C" fn(
+            provider_id: StbStringRef,
+            base_url: StbStringRef,
+            api_style: StbStringRef,
+            request_fn: ProviderStreamRequestFn,
+            plugin_free_string: FreeStringFn,
+            user_data: *mut c_void,
+        ) -> i32,
+    >,
 }
 unsafe impl Send for PluginApi {}
 unsafe impl Sync for PluginApi {}
@@ -1373,8 +1556,10 @@ macro_rules! export_plugin {
 ///
 /// # Safety
 ///
-/// `api` must be a valid, properly aligned pointer to a [`PluginApi`] that
-/// remains valid for the duration of `body`.
+/// `api` must point to a properly aligned, readable ABI header followed by
+/// `struct_size` readable bytes of the host's initialized vtable. It may be a
+/// shorter, older layout of [`PluginApi`]. The mandatory prefix through
+/// `user_data` must be present, and optional trailing slots must be complete.
 pub unsafe fn register_entrypoint(
     api: *const PluginApi,
     body: impl FnOnce(&PluginApi) -> i32,
@@ -1391,15 +1576,33 @@ pub unsafe fn register_entrypoint(
         // and skips loading this plugin.
         return 1;
     }
-    if (struct_size as usize) < core::mem::size_of::<PluginApi>() {
-        // Host predates a field the plugin expects; degrade gracefully.
+    let host_size = struct_size as usize;
+    let known_size = core::mem::size_of::<PluginApi>();
+    let required_size = core::mem::offset_of!(PluginApi, declare);
+    // All trailing fields are nullable function-pointer slots. Do not accept a
+    // truncated mandatory prefix or a partial function pointer.
+    if host_size < required_size
+        || (host_size < known_size
+            && (host_size - required_size) % core::mem::size_of::<*const ()>() != 0)
+    {
         return 3;
     }
-    // SAFETY: the caller keeps the correctly sized vtable live through body.
-    let api = unsafe { &*api };
+    let mut normalized = core::mem::MaybeUninit::<PluginApi>::zeroed();
+    // SAFETY: copy only bytes the host advertises and this SDK knows. The
+    // mandatory prefix contains every non-null function pointer; all missing
+    // trailing fields are Option<extern "C" fn>, whose zero representation is
+    // None. No reference to the larger PluginApi is formed over the old layout.
+    let api = unsafe {
+        core::ptr::copy_nonoverlapping(
+            api.cast::<u8>(),
+            normalized.as_mut_ptr().cast::<u8>(),
+            host_size.min(known_size),
+        );
+        normalized.assume_init()
+    };
     // Contain panics: unwinding out of the plugin's `extern "C"` shim aborts
     // the process, so convert a panic into a status code the host can report.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(api))) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&api))) {
         Ok(code) => code,
         Err(_) => REGISTER_PANIC_STATUS,
     }
@@ -1668,6 +1871,7 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
+            register_streaming_provider: None,
         };
         // All optional slots are null → plugin must degrade.
         assert!(api.register_tool.is_none());
@@ -1681,6 +1885,10 @@ mod tests {
         assert!(!core::mem::needs_drop::<StepResult>());
         assert!(!core::mem::needs_drop::<StablePluginEvent>());
         assert!(!core::mem::needs_drop::<StableToolSchema>());
+        assert!(
+            !core::mem::needs_drop::<ProviderStreamControl>(),
+            "the control struct is fn pointers + a u32: it must stay Copy/POD"
+        );
     }
 
     /// New vtable slots must be **appended**, never inserted.
@@ -1703,16 +1911,59 @@ mod tests {
             size_of::<u32>()
         );
 
-        // The most recently added slot is last, and the two before it are
+        // The most recently added slot is last, and the ones before it are
         // adjacent — i.e. nothing was wedged in between them.
         let declare = core::mem::offset_of!(PluginApi, declare);
-        let new_slot = core::mem::offset_of!(PluginApi, register_before_agent_start);
+        let prompt_slot = core::mem::offset_of!(PluginApi, register_before_agent_start);
         assert_eq!(
-            new_slot,
+            prompt_slot,
             declare + size_of::<Option<extern "C" fn(StbStringRef) -> i32>>(),
             "register_before_agent_start must be appended right after `declare`; \
              inserting a slot earlier shifts every later offset and breaks \
              plugins built against the previous layout"
+        );
+        let oauth_slot = core::mem::offset_of!(PluginApi, register_oauth_provider);
+        assert_eq!(
+            oauth_slot,
+            prompt_slot
+                + size_of::<
+                    Option<extern "C" fn(BeforeAgentStartFn, FreeStringFn, *mut c_void) -> i32>,
+                >(),
+            "register_oauth_provider must stay adjacent to register_before_agent_start"
+        );
+        let streaming_slot = core::mem::offset_of!(PluginApi, register_streaming_provider);
+        assert_eq!(
+            streaming_slot,
+            oauth_slot
+                + size_of::<
+                    Option<
+                        extern "C" fn(
+                            StbStringRef,
+                            OAuthRequestFn,
+                            FreeStringFn,
+                            *mut c_void,
+                        ) -> i32,
+                    >,
+                >(),
+            "register_streaming_provider must be appended after register_oauth_provider \
+             so an older plugin's every offset stays valid"
+        );
+        assert_eq!(
+            streaming_slot
+                + size_of::<
+                    Option<
+                        extern "C" fn(
+                            StbStringRef,
+                            StbStringRef,
+                            StbStringRef,
+                            ProviderStreamRequestFn,
+                            FreeStringFn,
+                            *mut c_void,
+                        ) -> i32,
+                    >,
+                >(),
+            size_of::<PluginApi>(),
+            "register_streaming_provider is the last slot; anything after it is a bug"
         );
         assert_eq!(align_of::<PluginApi>(), align_of::<*const ()>());
     }
@@ -1761,9 +2012,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn register_entrypoint_version_mismatch_refuses() {
-        let api = PluginApi {
+    fn entrypoint_test_api() -> PluginApi {
+        PluginApi {
             abi_version: RPI_PLUGIN_ABI_VERSION_UNIFIED,
             struct_size: core::mem::size_of::<PluginApi>() as u32,
             free_string: test_free,
@@ -1783,7 +2033,13 @@ mod tests {
             declare: None,
             register_before_agent_start: None,
             register_oauth_provider: None,
-        };
+            register_streaming_provider: None,
+        }
+    }
+
+    #[test]
+    fn register_entrypoint_version_mismatch_refuses() {
+        let api = entrypoint_test_api();
         assert_eq!(RPI_PLUGIN_ABI_VERSION_UNIFIED, 4);
 
         // A future version is rejected by the pre-dereference check.
@@ -1806,5 +2062,80 @@ mod tests {
         let rc = unsafe { register_entrypoint(core::ptr::null(), |_| 0) };
         assert_ne!(rc, 0);
         let _ = reset_freed();
+    }
+
+    #[test]
+    fn register_entrypoint_accepts_short_vtables_without_reading_missing_slots() {
+        extern "C" fn declare(_: StbStringRef) -> i32 {
+            7
+        }
+        extern "C" fn provider(
+            _: StbStringRef,
+            _: StbStringRef,
+            _: StbStringRef,
+            _: ProviderRequestFn,
+            _: FreeStringFn,
+            _: *mut c_void,
+        ) -> i32 {
+            0
+        }
+        for size in [
+            core::mem::offset_of!(PluginApi, declare),
+            core::mem::offset_of!(PluginApi, register_before_agent_start),
+            core::mem::offset_of!(PluginApi, register_oauth_provider),
+            core::mem::offset_of!(PluginApi, register_streaming_provider),
+        ] {
+            let mut api = entrypoint_test_api();
+            api.struct_size = size as u32;
+            api.register_provider = Some(provider);
+            api.declare = Some(declare);
+            // Allocate exactly the old layout's size, with pointer alignment.
+            let mut old = vec![0usize; size / core::mem::size_of::<usize>()];
+            // SAFETY: both buffers are valid for size bytes; the old layout is
+            // a fully initialized prefix ending at a complete field boundary.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (&api as *const PluginApi).cast::<u8>(),
+                    old.as_mut_ptr().cast::<u8>(),
+                    size,
+                );
+            }
+            let mut called = false;
+            let rc = unsafe {
+                register_entrypoint(old.as_ptr().cast(), |api| {
+                    called = true;
+                    assert_eq!(api.struct_size, size as u32);
+                    assert!(api.register_streaming_provider.is_none());
+                    assert!(
+                        api.register_provider.is_some(),
+                        "one-shot fallback remains available"
+                    );
+                    if size > core::mem::offset_of!(PluginApi, declare) {
+                        assert_eq!((api.declare.unwrap())(StbStringRef::from_str("{}")), 7);
+                    } else {
+                        assert!(api.declare.is_none());
+                    }
+                    0
+                })
+            };
+            assert_eq!(rc, 0);
+            assert!(
+                called,
+                "the plugin registration body must run on an older host"
+            );
+        }
+    }
+
+    #[test]
+    fn register_entrypoint_rejects_incomplete_mandatory_fields_or_slots() {
+        for size in [
+            core::mem::offset_of!(PluginApi, declare) - 1,
+            core::mem::offset_of!(PluginApi, register_streaming_provider) + 1,
+        ] {
+            let mut api = entrypoint_test_api();
+            api.struct_size = size as u32;
+            let rc = unsafe { register_entrypoint(&api, |_| panic!("incomplete ABI layout")) };
+            assert_eq!(rc, 3);
+        }
     }
 }

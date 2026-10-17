@@ -60,7 +60,8 @@ serde_json = "1"
 
 宿主只加载统一 C ABI 符号 `rpi_plugin_register`。扩展使用 `export_plugin!`，
 通过同一个 `PluginApi` 注册能力并调用 `api.declare` 声明优先级/平台。
-SDK 在注册前检查 `abi_version` 和 `struct_size`；不兼容时返回非零状态，宿主报告加载失败。
+SDK 在注册前检查 `abi_version` 和 `struct_size`；旧宿主缺少的尾部可选槽位补成
+`None`，插件可据此降级。版本不兼容或必需字段不完整时返回非零状态，宿主报告加载失败。
 
 ```rust
 rpi_plugin_sdk::export_plugin!(|api| {
@@ -255,9 +256,90 @@ extern "C" fn on_before_agent_start(
 
 ### Provider 与渲染器
 
+推理 provider 的目录、认证、执行绑定与验收要求见本文末尾的「Provider 接入规范」。
+
 `api.register_provider` 注入自定义 LLM Provider（`provider_id`/`base_url`/
 `api_style` + `request_fn`）。`register_message_renderer`/`register_markdown_transformer`/
 `register_entry_renderer` 注册消息渲染能力。这些槽位都可能为 `None`，使用前必须检测。
+
+`api.register_streaming_provider` 注入**流式** Provider。注册时同样提供 provider ID、
+端点、API style 和字符串释放回调；流式 request fn 另有逐块回调 `emit`、
+`emit_user_data`、可选控制面 `control` 和当前宿主恒为 `None` 的 `completion`。
+插件在请求还没结束时调用 `emit`，把增量推给宿主：
+
+```json
+{"type":"text_delta","contentIndex":0,"delta":"hello "}
+{"type":"thinking_delta","contentIndex":1,"delta":"weighing"}
+{"type":"toolcall_delta","contentIndex":2,"delta":"{\"path\""}
+```
+
+宿主即时把它们映射成 `AssistantMessageEvent`（`TextDelta`/`ThinkingDelta`/
+`ToolCallDelta` 等），所以 TUI 在模型还在生成时就开始渲染，而不是等整段返回。
+可用的 `type`：`start`、`text_start`/`text_delta`/`text_end`、
+`thinking_start`/`thinking_delta`/`thinking_end`、
+`toolcall_start`/`toolcall_delta`/`toolcall_end`、`usage`；未知 `type` 忽略（向前兼容）。
+
+约定：
+
+- **`out` 仍是最终消息。** 回调只送增量；插件返回时写入 `out` 的完整
+  `AssistantMessage` 才是终态 `Done`/`Error` 的载荷。宿主会在终态前补一个 `Start`，
+  所以即使插件一个块都没发，事件流也合法。
+- **回调的所有权与工具 partial 一致。** 每个 chunk 都是插件分配的 `StbString`，宿主
+  用插件注册时给的 `plugin_free_string` 回收；`emit`/`emit_user_data` 只在本次请求
+  期间有效，插件不得保存。
+
+该槽位同样追加在结构体末尾且可为 `None`：面向旧宿主时应降级到 `register_provider`
+（一次性）而不是拒绝加载。同一 `provider_id` 先一次性、再流式注册时，流式会原地替换
+该记录（流式是一次性的超集）。可从 `examples/plugin-stub/src/lib.rs` 的
+`on_provider_stream_request` 复制完整可运行的骨架。
+
+#### 取消：同一个方法，插件自行决定
+
+长时间生成需要能被中断。**没有单独的「可取消」注册**：`register_streaming_provider`
+只有一个方法、一个签名，request fn 永远会收到一个 `control` 参数（宿主提供的同步
+控制面）。要不要轮询它，由插件自己决定。
+
+```rust
+// 每个 SSE frame 之间（真实 provider 通常在这里阻塞在 socket read 上）：
+if (control.is_cancelled)(control.user_data, ProviderChunkKind::Content as u32) != 0 {
+    return 1; // 调用方已经走了，停止生成
+}
+```
+
+- `is_cancelled(user_data, chunk_kind)`：非阻塞轮询。传 `Content`（0）表示
+  “模型输出”，传 `Structural`（1）表示 `start`/`*_end`/`usage` 这类收尾帧。
+  取消后宿主确认结构帧、拒收内容帧；已发出终态后的收尾帧会被丢弃。
+  取消终态保留已转发的内容、模型标识和用量。插件持有 DLL 引用直到请求返回，
+  后续写入 `out` 的成功结果不会覆盖取消终态。
+- `wait_cancelled_ms(user_data, timeout_ms)`：阻塞版，供无法轮询的循环使用；
+  已取消时会立即返回，不会睡满超时。
+
+宿主的取消信号来自 `options.signal`（和内置 provider 同一个 `CancellationToken`，
+用户中断时由 agent loop 取消）。取消发生后宿主会：latch 控制面、停止转发内容 delta、
+**立即**发出 `Error { reason: Aborted }` 终态并结束事件流——不再等一次没人要的完整
+生成。`emit` 对内容帧返回非 0 也算同一个信号，插件可据此退出。
+
+轮询 `control` 是**可选**的，两种写法都合法：
+
+- **不轮询**（fire-and-forget）：插件照常把整段产出推完。取消时宿主仍会停止转发内容
+  帧并立刻结束该轮，插件只是多花了它已经产出的那部分 token。
+- **轮询**：插件在最早一个可检查点退出，省掉剩余生成。
+
+`control` 可能是 `null`（面向不支持控制面的宿主）；此时当作「不可取消」，不要拒绝加载。
+
+`completion` 参数在**当前宿主上恒为 `None`**：本宿主不允许插件在 request fn 返回后
+继续回调（那会让回调指针比调用活得久）。插件必须在 request fn 内收尾并写 `out`；
+ABI 里保留该参数是为了将来宿主能扩展，而不必再改签名。
+
+插件只需按 流式 → 一次性 逐级降级：
+
+```rust
+if let Some(register) = api.register_streaming_provider { /* 流式，可选轮询 control */ }
+else { /* register_provider，一次性 */ }
+```
+
+可从 `examples/plugin-stub/src/lib.rs` 的 `on_provider_stream_request`（不轮询）和
+`on_cancellable_provider_stream_request`（轮询）各复制一份骨架。
 
 ## 6. Rust 工具设计最佳实践
 
@@ -380,3 +462,93 @@ Linux/macOS 使用冒号分隔。命令行和环境变量适合本机开发、CI
 4. 实现领域逻辑与边界测试，再连接 loader/ABI。
 5. 使用 `rpi dev --no-watch` 与 `rpi install <crate> --build --force` 做真实 smoke test。
 6. 不声称未验证的 Pi capability 已完全兼容；明确记录降级行为。
+
+## Provider 接入规范
+
+统一生产包为 `rpi-providers`，一个安装入口包含 DeepSeek、OpenRouter、llama.cpp 和 Proxy。
+新增供应商优先在包内添加模块；只有根模块导出一次 `export_plugin!`，各模块共用注册桥接。
+provider ID、目录与凭据继续独立。单 provider 教学样例才使用 `export_provider!`。
+
+完整规范：[Provider 接入规范](https://github.com/bigfish1913/pi-rust/blob/feature-stream-porider/docs/extensions/provider-integration.md)。创建推理扩展时优先复制
+正式 provider package 示例见 [rpi-providers](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，通用工具扩展再使用 `plugin-stub`。当前接入约定如下。
+
+### 方式与目录
+
+只改已支持协议的端点、模型和 key 时，优先使用 `models.json`；需要可安装目录、
+认证策略或供应商逻辑时，使用独立 package。新供应商不添加为 CLI 的默认依赖。
+Provider 负责推理，auth 负责凭据和登录流程，两者独立注册。
+
+通过 `declare` 的 `providers` 数组声明 `id`、完整 `rpi_ai::Model` 数组 `models`、
+可选 `apiKeyEnv` 和默认 `true` 的 `requiresAuth`。用 `Model::new` 构造后序列化，
+不能使用 models.json 的简写对象。provider ID、每个模型的 `provider`、实际注册 ID
+必须一致；model ID 是发送给服务端的名称。匿名服务必须显式设置 `requiresAuth: false`，
+协议客户端也必须允许匿名，不能只修改目录声明。
+
+目录只在同一插件成功注册对应 provider 后生效，同名冲突时保留第一份实现及其目录。
+注册和目录发现不要求凭据；宿主在选择模型前加载扩展、合并 models.json 覆盖。
+`--list-models` 可无凭据显示目录；`--no-extensions` 同时禁用实现和声明。
+
+### Factory 与私有执行绑定
+
+统一包内复用 `crate::registration::register_provider!`；单 provider 教学包可使用
+`rpi-provider-runtime::export_provider!`。模块提供
+`fn(&Model, &SimpleStreamOptions) -> Arc<dyn Provider>`。OpenAI-compatible 接入可复用
+`rpi_provider_runtime::completions(model, options, anonymous)`，无需复制 SSE 解析器。
+宿主私有 `ProviderFactory` 统一选择扩展 / 内置协议，不是插件需要实现的接口。
+运行时依赖使用 `rpi-ai`、`rpi-plugin-sdk` 与桥接库，不依赖 `rpi-cli`；宿主加载器
+可以作为测试依赖。
+
+公开目录、当前模型及配置后 `Provider::models()` 返回的描述不携带请求头。
+宿主私有 `ExecutionBinding` 保存实际端点、模型请求头及默认认证，执行前按
+provider / API / model ID 恢复；修改公开描述不能重定向绑定的凭据。
+`base_url` 仍公开用于展示，每次请求显式传入的 options 仍按既有规则生效。
+插件必须使用请求传入的 model / options，不能改用硬编码端点或进程环境变量中的 key。
+
+### 认证与重载
+
+默认凭据由宿主按 provider ID 解析：选中 provider 的 `--api-key` → `auth.json`
+有效 key / OAuth → `models.json` → 声明的 `apiKeyEnv` → 显式允许的匿名。
+协议名不决定认证，不继承 `OPENAI_API_KEY`；空白、未解析引用和过期 token 不算可用。
+目录不得含凭据；请求参数、token 与私密请求头不得进入日志、普通事件或错误文本。
+OAuth 供应商流程另外通过 `register_oauth_provider` 接入，宿主负责通用命令与存储。
+
+`auth check`、`/provider` 与实际请求使用同一认证解析。`auth check` 只检查本地状态，
+不访问服务端或刷新 token；退出码为就绪 0、缺少凭据 1、配置错误 2。
+`/provider <id>` 与列表选择会即时切换当前会话并保存默认模型；缺少认证或切换失败时
+保留原会话与默认值。`/model` 选择具体模型；`/provider remove` 删除配置，
+卸载 package 使用 `rpi package unlink`。API-key logout 不会清除环境变量或 models.json。
+
+涉及 provider package 的 `/reload` 会重新绑定 runtime、凭据、端点与公开目录；
+当前 package 消失或无法重新解析时返回错误并保留旧会话。仅内置 provider 的会话仍使用
+既有资源重载逻辑，不承诺重新解析所有 provider 配置；完整重载尚非原子代次切换。
+
+### 流式与验收
+
+增量必须在生成期间发出，最终 `out` 仍提供完整消息，宿主只产生一个 Done / Error。
+取消要及时停止请求并保留部分输出；同步 request fn 返回后禁止继续调用 `emit`。
+使用桥接库处理 ABI 字符串释放、取消与 runtime 生命周期，手写 ABI 遵守前述协议。
+
+验收必须包含真实动态库加载、本地 SSE 在首个正文增量到达后才继续发送的门控测试、
+UTF-8 跨块、usage、唯一终态、响应未结束时取消与 HTTP 401；认证隔离、端点 / 请求头
+覆盖、公开目录无认证头、命令与重载也要验证。工具和 OAuth 只声明已完成验证的能力。
+真实 API 测试默认 ignored，显式运行时从环境注入 key 并限制超时、重试和用量。
+正式统一包位于独立的 [rpi-package 项目](https://github.com/pi-rust/rpi-package/tree/feature-1014/packages/rpi-providers)，
+保留 `deepseek` ID，声明 `DEEPSEEK_API_KEY`，并通过 `requiresReasoningContent` 支持工具续轮。
+
+在 rpi-package 仓库运行正式 package 的离线验证：
+
+```sh
+cd /path/to/rpi-package
+cargo build -p rpi-providers
+cargo test -p rpi-providers --test streaming
+cargo test -p rpi-providers --test host
+```
+
+在 pi-rust 仓库运行 CLI 集成测试时设置 `RPI_TEST_PROVIDER_LIBRARY` 和
+`RPI_TEST_PROVIDER_PACKAGE`，再执行：
+
+```sh
+cargo test -p rpi-cli --test provider_packages
+```
+
+新增 package 还必须构建并测试自身动态库，不能仅凭宿主测试通过就声称接入完成。

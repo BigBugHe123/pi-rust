@@ -305,8 +305,16 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
 
     // (a) registration landed.
     let providers = snap.providers();
-    assert_eq!(providers.len(), 1, "expected one stub provider registered");
+    assert_eq!(
+        providers.len(),
+        3,
+        "the stub registers one one-shot and two streaming providers"
+    );
     assert_eq!(providers[0].provider_id, "stub-provider");
+    assert!(
+        providers[0].stream_fn.is_none(),
+        "the one-shot record must not claim a streaming fn"
+    );
     let markdown_renderers = snap.renderers_of(rpi_extensions::RegisteredRendererKind::Markdown);
     assert_eq!(
         markdown_renderers.len(),
@@ -323,10 +331,13 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     let pluggable = rpi_extensions::PluggableProvider::from_session(&session, ambient.clone());
     assert_eq!(
         pluggable.len(),
-        1,
+        3,
         "one PluggableProvider per registered provider"
     );
-    let provider: Arc<dyn Provider> = pluggable.into_iter().next().unwrap();
+    let provider: Arc<dyn Provider> = pluggable
+        .into_iter()
+        .find(|p| p.id() == "stub-provider")
+        .expect("the one-shot provider");
     assert_eq!(provider.id(), "stub-provider");
 
     let model = Model::new(
@@ -389,6 +400,253 @@ async fn loads_real_cdylib_and_drives_echo_tool() {
     );
     let md_hits = stub_markdown_transform_hits(&stub_path);
     assert!(md_hits >= 1, "markdown transform fn should have fired");
+
+    // ---- B5c-s: the streaming provider emits real deltas -------------------
+    // (a) The stub registered a second, **streaming** provider
+    //     (`stub-streaming-provider`) whose record carries a `stream_fn`.
+    // (b) Driving `stream_simple` against a model routed to it must yield the
+    //     plugin's chunks as **separate, ordered events** — thinking and text
+    //     deltas before the terminal `Done` — not one buffered chunk. That is the
+    //     whole point of the feature: the consumer renders while the plugin is
+    //     still producing.
+    // (c) The per-chunk callback is only reachable if the host handed the plugin
+    //     a live bridge pointer, and every chunk the plugin produced must be
+    //     reclaimed by the plugin's own `free_string` (a wrong deallocator would
+    //     corrupt the plugin's heap and show up as a crash here).
+    let streaming = snap
+        .providers()
+        .iter()
+        .find(|p| p.provider_id == "stub-streaming-provider")
+        .cloned()
+        .expect("the stub registers a streaming provider");
+    assert!(
+        streaming.stream_fn.is_some(),
+        "register_streaming_provider must record a stream_fn"
+    );
+
+    let streaming_provider: Arc<dyn Provider> =
+        rpi_extensions::PluggableProvider::from_session(&session, ambient.clone())
+            .into_iter()
+            .find(|p| p.id() == "stub-streaming-provider")
+            .expect("a PluggableProvider per registered provider, including the streaming one");
+
+    let model = Model::new(
+        "stub-model",
+        "Stub",
+        Api::Faux,
+        "stub-streaming-provider",
+        "https://stub.example",
+    );
+    let before_emits = stub_stream_emit_hits(&stub_path);
+    let mut stream = streaming_provider.stream_simple(&model, &ctx, &opts).await;
+
+    let mut tags: Vec<&'static str> = Vec::new();
+    let mut deltas: Vec<String> = Vec::new();
+    let mut terminal_reason = None;
+    while let Some(event) = stream.next().await {
+        tags.push(event.type_tag());
+        match &event {
+            rpi_ai::AssistantMessageEvent::ThinkingDelta { delta, .. }
+            | rpi_ai::AssistantMessageEvent::TextDelta { delta, .. } => deltas.push(delta.clone()),
+            rpi_ai::AssistantMessageEvent::Done { reason, .. } => {
+                terminal_reason = Some(*reason);
+            }
+            _ => {}
+        }
+    }
+
+    assert_eq!(
+        terminal_reason,
+        Some(rpi_ai::types::DoneReason::Stop),
+        "the streaming provider ends on a Done terminal"
+    );
+    assert_eq!(
+        tags.first().copied(),
+        Some("start"),
+        "the host opens the stream before any delta: got {tags:?}"
+    );
+    assert_eq!(tags.last().copied(), Some("done"), "got {tags:?}");
+    assert_eq!(
+        deltas,
+        vec!["weighing", " options", "from-stub", "-stream"],
+        "every plugin chunk arrives as its own ordered event: got {tags:?}"
+    );
+    // Order matters: the thinking deltas precede the text deltas, and no delta
+    // arrives after the terminal event.
+    let first_text = tags
+        .iter()
+        .position(|t| *t == "text_delta")
+        .expect("a text delta");
+    let last_thinking = tags
+        .iter()
+        .rposition(|t| *t == "thinking_delta")
+        .expect("a thinking delta");
+    assert!(
+        last_thinking < first_text,
+        "thinking is delivered before text: got {tags:?}"
+    );
+    assert_eq!(
+        tags.iter().filter(|t| **t == "done").count(),
+        1,
+        "exactly one terminal event: got {tags:?}"
+    );
+
+    let after_emits = stub_stream_emit_hits(&stub_path);
+    assert!(
+        after_emits > before_emits,
+        "the plugin's emit callback must have been invoked through the live bridge"
+    );
+
+    // The one-shot provider must be untouched by the streaming path: its hit
+    // counter still reflects its own single call.
+    assert_eq!(
+        stub_provider_request_hits(&stub_path),
+        after,
+        "driving the streaming provider must not call the one-shot request_fn"
+    );
+
+    // ---- B5c-s: cancellation stops a plugin mid-generation ---------------
+    // Both streaming providers register through the **same** method; the difference
+    // is that `stub-cancel-provider` polls the control surface. It would otherwise
+    // emit 200 deltas. Cancelling the run's token must make it **notice** and stop
+    // early, and the caller must see an `Error { reason: Aborted }` terminal
+    // promptly instead of waiting out a full generation. This is the property the
+    // cancel protocol exists for.
+    let cancelling = rpi_extensions::PluggableProvider::from_session(&session, ambient.clone())
+        .into_iter()
+        .find(|p| p.id() == "stub-cancel-provider")
+        .expect("the stub registers a cancellable provider");
+
+    let cancel_model = Model::new(
+        "stub-model",
+        "Stub",
+        Api::Faux,
+        "stub-cancel-provider",
+        "https://stub.example",
+    );
+    // Fresh counters, so this test cannot be confused by the streaming run above.
+    stub_reset_cancel_counters(&stub_path);
+
+    let signal = tokio_util::sync::CancellationToken::new();
+    let cancel_opts = SimpleStreamOptions {
+        signal: signal.clone(),
+        ..SimpleStreamOptions::default()
+    };
+    let mut cancel_stream = cancelling
+        .stream_simple(&cancel_model, &ctx, &cancel_opts)
+        .await;
+
+    // Cancel as soon as the plugin has produced something — the point is to stop
+    // it mid-stream, not before it starts.
+    let mut seen_delta = false;
+    let mut cancel_tags: Vec<&'static str> = Vec::new();
+    let mut aborted = false;
+    let cancel_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while let Some(event) = cancel_stream.next().await {
+        cancel_tags.push(event.type_tag());
+        match &event {
+            rpi_ai::AssistantMessageEvent::TextDelta { .. } if !seen_delta => {
+                seen_delta = true;
+                signal.cancel();
+            }
+            rpi_ai::AssistantMessageEvent::Error { reason, .. } => {
+                aborted = *reason == rpi_ai::types::ErrorReason::Aborted;
+            }
+            _ => {}
+        }
+        assert!(
+            std::time::Instant::now() < cancel_deadline,
+            "a cancelled plugin must terminate promptly, got {cancel_tags:?}"
+        );
+    }
+
+    assert!(
+        seen_delta,
+        "the plugin must have started producing: {cancel_tags:?}"
+    );
+    assert!(
+        aborted,
+        "a cancelled run ends on Error {{ reason: Aborted }}: {cancel_tags:?}"
+    );
+    assert_eq!(
+        cancel_tags.iter().filter(|t| **t == "error").count(),
+        1,
+        "exactly one terminal event: {cancel_tags:?}"
+    );
+    // The aborted terminal is delivered before the blocking plugin must finish.
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while stub_cancel_observed(&stub_path) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the plugin eventually observes the cancellation latch");
+    assert!(
+        stub_cancel_observed(&stub_path) == 1,
+        "the plugin must have observed the cancellation through its control surface"
+    );
+    let emitted = stub_cancel_emits_before_stop(&stub_path);
+    assert!(
+        emitted < 200,
+        "the plugin must stop well before its 200-delta budget, emitted {emitted}"
+    );
+}
+
+/// Read the stub's `plugin_stub_cancel_emits_before_stop` counter through the cdylib.
+fn stub_cancel_emits_before_stop(stub_path: &std::path::Path) -> usize {
+    stub_usize_counter(stub_path, b"plugin_stub_cancel_emits_before_stop\0")
+}
+
+/// Read the stub's `plugin_stub_cancel_observed` flag through the cdylib.
+fn stub_cancel_observed(stub_path: &std::path::Path) -> usize {
+    stub_usize_counter(stub_path, b"plugin_stub_cancel_observed\0")
+}
+
+/// Reset the stub's cancellation counters through the cdylib.
+fn stub_reset_cancel_counters(stub_path: &std::path::Path) {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return,
+    };
+    type ResetFn = extern "C" fn();
+    if let Ok(sym) = unsafe { lib.get::<ResetFn>(b"plugin_stub_reset_cancel_counters\0") } {
+        sym();
+    }
+}
+
+/// Read a `extern "C" fn() -> usize` counter exported by the stub cdylib.
+fn stub_usize_counter(stub_path: &std::path::Path, symbol: &[u8]) -> usize {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> = match unsafe { lib.get(symbol) } {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
+}
+
+/// Read the stub's `plugin_stub_stream_emit_hits` counter through the cdylib.
+fn stub_stream_emit_hits(stub_path: &std::path::Path) -> usize {
+    let lib = match unsafe { libloading::Library::new(stub_path) } {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    type HitFn = extern "C" fn() -> usize;
+    let sym: libloading::Symbol<HitFn> = match unsafe { lib.get(b"plugin_stub_stream_emit_hits\0") }
+    {
+        Ok(s) => s,
+        Err(_) => return 0,
+    };
+    let hits = sym();
+    drop(sym);
+    drop(lib);
+    hits
 }
 
 /// Read the stub's `plugin_stub_prompt_transform_hits` counter through the cdylib.
