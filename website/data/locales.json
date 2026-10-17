@@ -524,7 +524,7 @@
       ],
       "releases": [
         {
-          "version": "0.4.0",
+          "version": "0.4.1",
           "status": "current",
           "title": "Model pricing, terminal fixes and automatic releases",
           "description": "Configure model rates and thinking levels, fix extension dialogs, code wrapping and file appends, and publish every install channel through a Release PR."
