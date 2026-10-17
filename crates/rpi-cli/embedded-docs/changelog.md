@@ -11,6 +11,34 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.5.0](https://github.com/bigfish1913/pi-rust/compare/v0.4.1...v0.5.0) - 2026-10-17
+
+### Added
+
+- *(extensions)* add plugin-owned child agent lifecycle
+- add provider login flows
+- *(extensions)* add streaming and cancellable plugin providers
+
+### Fixed
+
+- *(interactive_tui)* avoid deadlock in provider login key handling
+- *(cli)* switch session providers live and route models by API
+- *(auth)* unify package credential resolution and provider isolation
+- *(cli)* include provider packages in provider commands
+- *(extensions)* correct streaming provider cancellation and compatibility
+- harden provider callbacks and model identity
+
+### Other
+
+- *(changelog)* add 0.4.0 and 0.4.1 release notes
+- merge feature-stream-porider into feature-0.4.2
+- *(providers)* use the unified external provider package
+- *(providers)* move DeepSeek policy out of core
+- *(providers)* define provider integration and acceptance contract
+- *(providers)* unify factories and isolate execution bindings
+- *(extensions)* add DeepSeek streaming provider smoke example
+- *(providers)* extract optional native provider packages
+
 ### Added
 
 - Expose safe live execution metadata and plugin-owned child-agent lifecycle
