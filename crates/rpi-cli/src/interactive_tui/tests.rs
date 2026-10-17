@@ -1956,6 +1956,111 @@ fn provider_input_canonicalization_exact_then_case_insensitive_unique() {
 }
 
 #[test]
+fn provider_login_callbacks_release_the_input_slot_before_submit_and_escape() {
+    let state = test_tui_state();
+    assert!(!handle_provider_login_key(
+        &state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    let input = Arc::new(Input::new());
+    let state_submit = state.clone();
+    input.on_submit(Arc::new(move |text| {
+        assert_eq!(text, "x");
+        // Fail rather than hanging on a recursive lock if routing regresses.
+        *state_submit
+            .active_provider_input
+            .try_lock()
+            .expect("provider input slot locked during submit") = Some(Arc::new(Input::new()));
+    }));
+    let state_cancel = state.clone();
+    input.on_escape(Arc::new(move || {
+        *state_cancel
+            .active_provider_input
+            .try_lock()
+            .expect("provider input slot locked during escape") = None;
+    }));
+    *state.active_provider_input.lock().unwrap() = Some(input.clone());
+    assert!(handle_provider_login_key(
+        &state,
+        KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)
+    ));
+    assert!(handle_provider_login_key(
+        &state,
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    ));
+    let replacement = state.active_provider_input.lock().unwrap().clone().unwrap();
+    assert!(!Arc::ptr_eq(&input, &replacement));
+    *state.active_provider_input.lock().unwrap() = Some(input);
+    assert!(handle_provider_login_key(
+        &state,
+        KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+    ));
+    assert!(state.active_provider_input.lock().unwrap().is_none());
+}
+
+#[test]
+fn provider_login_saves_deepseek_key_and_restores_editor() {
+    with_isolated_config_dir(|| {
+        let state = test_tui_state();
+        let editor_container = Arc::new(Container::new());
+        let editor = state.editor.clone();
+        editor_container.add_child(editor.clone());
+        let tui = Arc::new(TuiAltScreen::new(
+            Box::new(ProcessTerminal::new()),
+            true,
+            None,
+        ));
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        begin_provider_login(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            &state.extension_session,
+            "deepseek",
+        );
+        assert!(!editor.is_focused());
+        let input = state.active_provider_input.lock().unwrap().clone().unwrap();
+        input.handle_paste("fixture-deepseek-key");
+        assert!(handle_provider_login_key(
+            &state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ));
+        assert!(matches!(
+            crate::config::read_auth().unwrap().get("deepseek"),
+            Some(crate::config::Credential::ApiKey { key: Some(key), .. })
+                if key == "fixture-deepseek-key"
+        ));
+        assert!(matches!(rx.try_recv(), Ok(TuiMessage::ReloadExtensions)));
+        assert!(state.active_provider_input.lock().unwrap().is_none());
+        assert!(editor.is_focused());
+        assert_eq!(editor_container.child_count(), 1);
+
+        // Esc closes the same login without saving or requesting another reload.
+        begin_provider_login(
+            &state,
+            &editor_container,
+            &editor,
+            &tui,
+            &tx,
+            &state.extension_session,
+            "cancelled-provider",
+        );
+        assert!(handle_provider_login_key(
+            &state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+        ));
+        assert!(state.active_provider_input.lock().unwrap().is_none());
+        assert!(editor.is_focused());
+        assert!(!crate::config::read_auth()
+            .unwrap()
+            .contains_key("cancelled-provider"));
+        assert!(rx.try_recv().is_err());
+    });
+}
+
+#[test]
 fn provider_form_saves_provider_to_models_json() {
     with_isolated_config_dir(|| {
         let form = ProviderFormState {

@@ -785,6 +785,17 @@ pub(super) fn login_provider_items_with_oauth(
         .collect()
 }
 
+/// Dispatch without holding the input-slot lock: submit and escape callbacks
+/// clear or replace that same slot synchronously (API-key and OAuth login).
+pub(super) fn handle_provider_login_key(state: &TuiState, key: KeyEvent) -> bool {
+    let input = state.active_provider_input.lock().unwrap().clone();
+    let Some(input) = input else {
+        return false;
+    };
+    input.handle_key(key);
+    true
+}
+
 /// Open the masked API-key input for one provider and save it under that
 /// provider's own auth.json entry. A successful save asks the main loop to
 /// reload the provider catalog so the newly authenticated models become live.

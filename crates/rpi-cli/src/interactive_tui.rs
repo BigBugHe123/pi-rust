@@ -1948,10 +1948,7 @@ pub async fn interactive_tui(
             // Provider login inputs use the same input slot without creating an
             // Add-provider form state. Route them before the normal editor so
             // masked API keys and OAuth exchange values actually receive keys.
-            if let Some(provider_input) =
-                state_for_key.active_provider_input.lock().unwrap().clone()
-            {
-                provider_input.handle_key(key);
+            if handle_provider_login_key(&state_for_key, key) {
                 tui_for_key.request_render_reusing_scroll_content();
                 continue;
             }
