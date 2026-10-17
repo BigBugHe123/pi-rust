@@ -524,10 +524,10 @@
       ],
       "releases": [
         {
-          "version": "0.4.1",
+          "version": "0.5.0",
           "status": "current",
-          "title": "Model pricing, terminal fixes and automatic releases",
-          "description": "Configure model rates and thinking levels, fix extension dialogs, code wrapping and file appends, and publish every install channel through a Release PR."
+          "title": "Host-managed child agents and runtime hardening",
+          "description": "Plugins can create isolated child agents through the host with inherited models, authentication and approvals, bounded budgets, cancellation and resource cleanup. Breaking Rust API changes establish 0.5.0 as the new baseline."
         },
         {
           "version": "next",

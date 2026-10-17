@@ -18,7 +18,10 @@ if args[:2] == ['api', 'user']:
     print('test-user')
 elif args[0] == 'api':
     path = next(a for a in args if a.startswith('repos/'))
-    if '--method' in args:
+    if '/releases/tags/' in path:
+        query = args[args.index('--jq') + 1]
+        print('2026-10-17' if 'published_at' in query else '1' * 64)
+    elif '--method' in args:
         print('{}')
     elif path.startswith('repos/microsoft/winget-pkgs/contents/'):
         sys.exit(0 if mode == 'merged' else 1)
@@ -68,11 +71,11 @@ class ChannelScriptTests(unittest.TestCase):
         fake.chmod(0o755)
         self.root = Path(__file__).resolve().parent.parent
 
-    def execute(self, script, mode, *args):
+    def execute(self, script, mode, *args, cwd=None):
         env = dict(os.environ, FAKE_GH_LOG=str(self.log), FAKE_GH_MODE=mode,
                    PATH=str(self.directory) + os.pathsep + os.environ["PATH"])
         result = subprocess.run(["bash", str(self.root / "scripts" / script), *args],
-                                cwd=self.root, env=env, text=True, encoding="utf-8", capture_output=True)
+                                cwd=cwd or self.root, env=env, text=True, encoding="utf-8", capture_output=True)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
         return result, calls
 
@@ -109,6 +112,44 @@ class ChannelScriptTests(unittest.TestCase):
             result, calls = self.execute("winget-submit.sh", mode, self.version())
             self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
             self.assertFalse(any("PUT" in call or "POST" in call for call in calls))
+
+    def test_refresh_updates_stale_bilingual_cards_and_core_packages_idempotently(self):
+        workspace = self.directory / "workspace"
+        subprocess.run(["git", "init", "--quiet", str(workspace)], check=True, capture_output=True)
+        shutil.copytree(self.root / "packaging", workspace / "packaging")
+        data = workspace / "website" / "data"
+        shutil.copytree(self.root / "website" / "data", data)
+        packages = json.loads((data / "packages.json").read_text(encoding="utf-8"))
+        extensions = [package for package in packages if package["type"] != "crate"]
+        for name, version in (("site", "0.3.0"), ("locales", "0.4.0")):
+            path = data / f"{name}.json"
+            document = json.loads(path.read_text(encoding="utf-8"))
+            releases = document["releases"] if name == "site" else document["en"]["site"]["releases"]
+            next(card for card in releases if card["status"] == "current")["version"] = version
+            path.write_text(json.dumps(document), encoding="utf-8")
+        for package in packages:
+            if package["type"] == "crate":
+                package["version"] = "0.2.0"
+        (data / "packages.json").write_text(json.dumps(packages), encoding="utf-8")
+
+        result, _ = self.execute("refresh-channels.sh", "release", "9.8.7", cwd=workspace)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        packages = json.loads((data / "packages.json").read_text(encoding="utf-8"))
+        core = [package for package in packages if package["type"] == "crate"]
+        self.assertEqual(len(core), 9)
+        self.assertTrue(all(package["version"] == "9.8.7" and package["ageLabel"] == "v9.8.7"
+                            and package["publishedAt"] == "2026-10-17" for package in core))
+        self.assertEqual([package for package in packages if package["type"] != "crate"], extensions)
+        for name in ("site", "locales"):
+            document = json.loads((data / f"{name}.json").read_text(encoding="utf-8"))
+            releases = document["releases"] if name == "site" else document["en"]["site"]["releases"]
+            self.assertEqual(next(card for card in releases if card["status"] == "current")["version"], "9.8.7")
+            self.assertEqual(releases[1]["version"], "next")
+        files = [path for folder in (workspace / "packaging", data) for path in folder.rglob("*") if path.is_file()]
+        before = {path: path.read_bytes() for path in files}
+        result, _ = self.execute("refresh-channels.sh", "release", "9.8.7", cwd=workspace)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(before, {path: path.read_bytes() for path in files})
 
     def test_homebrew_cannot_be_downgraded(self):
         result, calls = self.execute("push-taps.sh", "newer", self.version(), "homebrew")

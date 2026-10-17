@@ -92,7 +92,8 @@ perl -pi -e "s/\"version\": \"$OLD\"/\"version\": \"$VERSION\"/; s/v$OLD/v$VERSI
 # winget
 # --------------------------------------------------------------------------
 note "packaging/winget/*.yaml"
-DATE=$(date -u +%Y-%m-%d)
+DATE=$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.published_at // .created_at | split("T")[0]')
+[[ "$DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || die "could not read the release date"
 OLD_WINGET=$(grep -m1 -oE 'InstallerSha256: [0-9A-Fa-f]+' packaging/winget/bigfish1913.rpi.installer.yaml | grep -oE '[0-9A-Fa-f]{64}')
 [[ -n "$OLD_WINGET" ]] || die "could not read the winget InstallerSha256"
 WIN_UPPER=$(printf '%s' "$SHA_WIN_X64" | tr 'a-f' 'A-F')
@@ -104,11 +105,34 @@ perl -pi -e "s/PackageVersion: $OLD/PackageVersion: $VERSION/" \
   packaging/winget/bigfish1913.rpi.yaml
 
 # --------------------------------------------------------------------------
-# Site data: the "current release" card + the version string.
+# Site data: both current-release cards and the nine core crate snapshots.
+# These may lag behind the manifests by more than one release.
 # --------------------------------------------------------------------------
-note "website/data/{packages,locales}.json"
-perl -pi -e "s/v$OLD · current/v$VERSION · current/g" website/data/packages.json
-perl -pi -e "s/\"version\": \"$OLD\"/\"version\": \"$VERSION\"/" website/data/locales.json
+note "website/data/{packages,site,locales}.json"
+python - "$VERSION" "$DATE" <<'PY'
+import datetime
+import json
+from pathlib import Path
+import sys
+
+version, published = sys.argv[1:]
+root = Path('website/data')
+paths = [root / f'{name}.json' for name in ('packages', 'site', 'locales')]
+packages, site, locales = [json.loads(path.read_text(encoding='utf-8')) for path in paths]
+core = {'rpi-cli', 'rpi-tui', 'rpi-harness', 'rpi-tools', 'rpi-extensions',
+        'rpi-plugin-sdk', 'rpi-agent', 'rpi-ai', 'rpi-telemetry'}
+age = max(0, (datetime.datetime.now(datetime.timezone.utc).date()
+              - datetime.date.fromisoformat(published)).days)
+for package in packages:
+    if package['type'] == 'crate' and package['name'] in core:
+        package.update(version=version, publishedAt=published, age=age, ageLabel=f'v{version}')
+for releases in (site['releases'], locales['en']['site']['releases']):
+    for release in releases:
+        if release['status'] == 'current':
+            release['version'] = version
+for path, data in zip(paths, (packages, site, locales)):
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + '\n', encoding='utf-8', newline='\n')
+PY
 
 # --------------------------------------------------------------------------
 # packaging/README.md: the sha table label/rows + the example tag.
