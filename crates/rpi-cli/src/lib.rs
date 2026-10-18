@@ -62,6 +62,7 @@ pub mod session;
 pub mod session_cwd;
 pub mod session_driver;
 pub mod settings;
+mod side_questions;
 pub mod source_info;
 pub mod timings;
 mod transcript_navigation;

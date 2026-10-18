@@ -1067,6 +1067,10 @@ pub enum RuntimeActionId {
     /// Others: childId. Poll drains text deltas and returns status/result.
     /// Handles are scoped to the calling plugin and must be disposed.
     ChildAgent = 24,
+    /// Read-only, host-managed side question. Registration-level commands may
+    /// use start(question), status, cancel, hide and show. Never changes the
+    /// main transcript or its queues. Presentation and execution stay in host.
+    SideQuestion = 25,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -1112,6 +1116,7 @@ impl TryFrom<u32> for RuntimeActionId {
             22 => Ok(Self::UiComponent),
             23 => Ok(Self::GetExecutionContext),
             24 => Ok(Self::ChildAgent),
+            25 => Ok(Self::SideQuestion),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1147,7 +1152,9 @@ pub type RuntimeActionFn = extern "C" fn(
 /// `{kind:"message",text}`, `{kind:"selector",items:[...]}`,
 /// `{kind:"editor",initialText}`, and `{kind:"input",title,placeholder}`
 /// responses; selector/editor/input submissions call the same handler with an
-/// `action` field in `args`.
+/// `action` field in `args`. `user_data` is the registering plugin's opaque
+/// runtime handle (or null when no action bridge exists), scoped to that
+/// registration. Pass it to runtime_action; never cache it across registrations.
 pub type CommandHandlerFn =
     extern "C" fn(args_json: StbStringRef, out: *mut StbString, user_data: *mut c_void) -> i32;
 
@@ -2013,6 +2020,7 @@ mod tests {
             RuntimeActionId::UiComponent,
             RuntimeActionId::GetExecutionContext,
             RuntimeActionId::ChildAgent,
+            RuntimeActionId::SideQuestion,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
@@ -2022,8 +2030,8 @@ mod tests {
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(
-            RuntimeActionId::try_from(25),
-            Err(UnknownRuntimeActionId(25))
+            RuntimeActionId::try_from(26),
+            Err(UnknownRuntimeActionId(26))
         );
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),

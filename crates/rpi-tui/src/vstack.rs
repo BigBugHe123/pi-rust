@@ -113,6 +113,12 @@ impl StackEntry {
         self
     }
 
+    /// Set the maximum allocated size on the stack's main axis.
+    pub fn max_size(mut self, size: usize) -> Self {
+        self.options.max_size = Some(size);
+        self
+    }
+
     /// Convert to a StackLayoutEntry for the layout system.
     pub fn to_layout_entry(&self) -> StackLayoutEntry {
         StackLayoutEntry {

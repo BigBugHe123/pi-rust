@@ -81,6 +81,7 @@ pub struct HarnessActionHost {
     /// it named before the swap.
     tool_context: rpi_extensions::ToolCallContext,
     children: crate::child_agents::ChildAgents,
+    side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
 }
@@ -108,6 +109,7 @@ impl HarnessActionHost {
                 cli_flags,
                 tool_context,
                 children: crate::child_agents::ChildAgents::default(),
+                side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
             },
             harness,
@@ -334,7 +336,7 @@ fn send_message_result(result: SendMessageResult) -> serde_json::Value {
 }
 
 /// Extract the concatenated text from an assistant message (the `text` blocks).
-fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
+pub(crate) fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
     msg.content
         .iter()
         .filter_map(|b| match b {
@@ -347,6 +349,36 @@ fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
+    fn cancel_side_questions(&self, owner: u64) {
+        self.side_questions.cancel_owner(owner);
+    }
+    fn side_question_revision(&self) -> u64 {
+        self.side_questions.revision()
+    }
+    fn side_question_views(&self) -> Vec<serde_json::Value> {
+        self.side_questions.views()
+    }
+    async fn side_question_ui(
+        &self,
+        owner: u64,
+        thread_id: String,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.side_questions
+            .ui_handle(&self.harness()?, owner, thread_id, args)
+            .await
+    }
+    async fn side_question(
+        &self,
+        owner: u64,
+        args: serde_json::Value,
+        sink: rpi_extensions::SideQuestionSink,
+    ) -> Result<serde_json::Value, String> {
+        self.side_questions
+            .handle(&self.harness()?, owner, args, sink)
+            .await
+    }
+
     fn cancel_child_agents(&self, owner: u64) {
         self.children.cancel_owner(owner);
     }
