@@ -11,6 +11,21 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.6.0](https://github.com/bigfish1913/pi-rust/compare/v0.5.1...v0.6.0) - 2026-10-18
+
+### Added
+
+- *(btw)* port native side chat onto main
+
+### Fixed
+
+- *(ai)* preserve Anthropic tool result image payloads
+- *(ai)* serialize content with a single type discriminator
+
+### Other
+
+- *(cli)* format side-question module declaration
+
 ## [0.5.1](https://github.com/bigfish1913/pi-rust/compare/v0.5.0...v0.5.1) - 2026-10-18
 
 ### Fixed
