@@ -70,7 +70,7 @@ use thiserror::Error;
 
 pub use actions::{
     reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
-    RuntimeActionHost, UiDialogMailbox, UiDialogRequest,
+    RuntimeActionHost, SideQuestionSink, UiDialogMailbox, UiDialogRequest,
 };
 pub use editor_text::{EditorTextEdit, EditorTextMailbox, EditorTextMode};
 pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
@@ -427,12 +427,14 @@ extern "C" fn trampoline_register_command(
     let (name, description) =
         unsafe { (name.as_str().to_string(), description.as_str().to_string()) };
     let ok = with_current_api(|api| {
-        // The v1 command ABI predates an explicit context parameter. Keep a
-        // null context for compatibility; plugins that need host state can use
-        // `runtime_action` from their command callback.
-        match api.with_registry(|reg| {
-            reg.register_command(name, description, handler, std::ptr::null_mut())
-        }) {
+        // Commands carry the same opaque owner binding as PluginApi. Never
+        // make a plugin cache a registration pointer globally: one DLL can be
+        // loaded for multiple sessions or a rolled-back reload candidate.
+        let user_data = api
+            .action_bridge
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |bridge| bridge.user_data());
+        match api.with_registry(|reg| reg.register_command(name, description, handler, user_data)) {
             Some(_) => true,
             None => false,
         }

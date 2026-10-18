@@ -50,6 +50,8 @@ pub struct ScrollViewOptions {
     pub axis: Option<ScrollAxis>,
     /// Follow mode for automatic scrolling.
     pub follow: FollowMode,
+    /// Keep manual browsing detached from follow-end across layout changes.
+    pub preserve_manual_position: bool,
     /// Designate this view as the fallback target for global scroll actions.
     pub primary: bool,
     /// Overscroll behavior.
@@ -336,6 +338,7 @@ impl ScrollView {
                 state.follow_suppressed_at_end = false;
             }
             if self.options.follow == FollowMode::End
+                && !self.options.preserve_manual_position
                 && state.scroll_top == max_scroll
                 && !state.follow_suppressed_at_end
             {
@@ -626,6 +629,29 @@ mod scroll_tests {
             sv.scroll_top() > previous_end,
             "tail should advance after follow is restored"
         );
+    }
+
+    #[test]
+    fn detached_scroll_does_not_resume_follow_when_reflow_temporarily_fits() {
+        let text = Arc::new(Text::new("line\n".repeat(30), 0, 0));
+        let sv = ScrollView::new(
+            text.clone(),
+            ScrollViewOptions {
+                preserve_manual_position: true,
+                ..Default::default()
+            },
+        );
+        sv.render_with_viewport(40, 10);
+        sv.scroll_by(-5);
+        assert!(!sv.is_following_end());
+        sv.render_with_viewport(40, 100);
+        assert!(!sv.is_following_end());
+        text.set_text("line\n".repeat(200));
+        sv.render_with_viewport(40, 10);
+        assert_eq!(sv.scroll_top(), 0);
+        assert!(!sv.is_following_end());
+        sv.scroll_to_end();
+        assert!(sv.is_following_end());
     }
 
     #[test]
