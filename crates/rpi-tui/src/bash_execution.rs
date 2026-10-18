@@ -21,6 +21,7 @@ use crate::ansi::bold;
 use crate::ansi::strip_ansi;
 use crate::spacer::Spacer;
 use crate::theme::{theme, theme_revision, Theme, ThemeColors};
+use crate::tool_panel::ToolPanel;
 use crate::utils::{truncate_to_width, wrap_text_with_ansi};
 use crate::visual_truncate::truncate_to_visual_lines;
 
@@ -280,28 +281,20 @@ impl BashExecutionComponent {
 
     /// Render against one theme snapshot; keep all insets inside the background.
     fn render_panel(&self, width: usize, status: BashStatus, theme: &Theme) -> Vec<String> {
-        if width == 0 {
-            return Vec::new();
-        }
         let colors = &theme.colors;
-        // Preserve at least one content column on narrow terminals.
-        let padding_x = theme.spacing.tool_panel_padding_x.min((width - 1) / 2);
-        let content_width = width - padding_x * 2;
-        let pad = " ".repeat(padding_x);
         let bg = match status {
             BashStatus::Running => colors.tool_pending_bg,
             BashStatus::Error | BashStatus::Cancelled => colors.tool_error_bg,
             BashStatus::Complete => colors.tool_success_bg,
         };
-        let panel_line = |content: &str| {
-            // A wide glyph cannot fit in a one-column terminal. Clip only that
-            // degenerate case rather than letting it overflow the panel.
-            let content = truncate_to_width(content, content_width, "");
-            crate::utils::apply_background_to_line(&format!("{pad}{content}"), width, |s| bg.bg(s))
+        let Some(panel) = ToolPanel::new(width, theme.spacing, bg) else {
+            return Vec::new();
         };
-        let blank = panel_line("");
+        let content_width = panel.content_width;
+        let panel_line = |content: &str| panel.line(content);
+        let blank = panel.blank();
         let mut lines = Spacer::new(1).render(width);
-        lines.extend(std::iter::repeat(blank.clone()).take(theme.spacing.tool_panel_padding_y));
+        lines.extend(std::iter::repeat(blank.clone()).take(panel.padding_y));
 
         let excluded = *self.exclude_from_context.lock().unwrap();
         let color_key = if excluded {
@@ -369,7 +362,7 @@ impl BashExecutionComponent {
                 }
             }
         }
-        lines.extend(std::iter::repeat(blank).take(theme.spacing.tool_panel_padding_y));
+        lines.extend(std::iter::repeat(blank).take(panel.padding_y));
         lines
     }
 }

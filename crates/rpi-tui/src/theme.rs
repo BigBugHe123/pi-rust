@@ -244,7 +244,7 @@ impl Default for ThemeSpacing {
 pub struct Theme {
     /// Color scheme.
     pub colors: ThemeColors,
-    /// Component spacing (currently consumed by bash execution panels).
+    /// Component spacing shared by bash and generic tool execution panels.
     pub spacing: ThemeSpacing,
     /// Border style.
     pub border_style: BorderStyle,
