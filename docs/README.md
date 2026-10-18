@@ -13,6 +13,7 @@
 | 长会话与上下文压缩 | [上下文压缩](agent/context-compaction.md) |
 | Rust 动态库扩展与 ABI | [扩展开发](extensions/authoring.md) |
 | 启动、会话与关闭事件 | [扩展生命周期](extensions/lifecycle.md) |
+| 子 agent 配置继承、权限与生命周期 | [宿主管理的子 agent](extensions/subagents.md) |
 | 无头服务端与远程 TUI | [远程模式](remote/user-guide.md) |
 | Agent 与扩展调试 | [Rust 调试指南](debugging/rust-debugging.md) |
 | 重复思考、取消与崩溃恢复排查 | [问题复盘](debugging/llm-repetition-forensics.md)（历史证据与修复过程） |
@@ -20,6 +21,14 @@
 | 发版与跨平台分发 | [发布流程](maintaining/releasing.md) |
 | 对外介绍与文章草稿 | [推广素材](promotion/README.md) |
 | CLI `docs` 工具的模型可读输入 | [内置文档源](rpi-tool/README.md) |
+
+## 来源与致谢
+
+rpi 起步于对 Mario Zechner 的 [Pi TypeScript SDK](https://github.com/earendil-works/pi)
+的 Rust 重新实现，并在此基础上发展自己的运行时和原生扩展 ABI。项目来源、版权和
+许可说明见根目录 [README](../README.md#acknowledgements)、[NOTICE](../NOTICE)
+和 [LICENSE](../LICENSE)。Rust 原生实现不意味着未借鉴上游设计，也不意味着可以直接
+加载 Pi 的 TypeScript/npm 扩展。
 
 ## 维护约定
 

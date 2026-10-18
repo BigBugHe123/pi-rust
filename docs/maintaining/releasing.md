@@ -24,6 +24,27 @@ requires a merged PR from an upstream `release-plz-*` branch whose merge commit
 matches the tested main commit. A fork branch with that name does not qualify.
 Do not use `pull_request_target` to execute contribution code with release secrets.
 
+### Documentation-only updates without a release
+
+A documentation update does not require a version bump. Keep `Cargo.toml`,
+`Cargo.lock`, existing tags and install-channel manifests unchanged, and do not
+run `task publish` or merge a Release PR solely to publish documentation. Update
+the relevant `docs/rpi-tool/` sources and run `sh scripts/sync-embedded-docs.sh`
+when the bundled documentation changes.
+
+An ordinary merge runs CI and may prepare or update a Release PR; it does not
+authorize publication. If the explicit requirement is to avoid release
+automation entirely for a documentation-only change, maintainers can include
+`[skip ci]` in the final merge commit message (or the squash commit message).
+GitHub then skips the push/PR workflows, including the CI job that calls release
+automation. Run documentation checks locally first; do not use this shortcut for
+code changes or to bypass required checks. Skip directives leave required checks
+pending, so repositories that require them must use their normal reviewed merge
+process instead. They do not disable manually dispatched workflows.
+
+Website deployment is separate from merging documentation and is not implied by
+a documentation-only merge.
+
 ### One-time setup
 
 The repository already uses `CARGO_REGISTRY_TOKEN` for crates.io. Add one secret,

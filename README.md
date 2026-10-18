@@ -14,6 +14,11 @@ agent built on top of it. Nine composable crates span provider adapters, a
 durable crash-resumable agent loop, a terminal UI, and a stable plugin ABI — so
 the same code works as an embedded SDK or as a ready-to-run `rpi` command.
 
+rpi began as a Rust reimplementation of the [Pi TypeScript SDK](https://github.com/earendil-works/pi)
+by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
+infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
+for upstream attribution.
+
 Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.html>
 
 ![rpi interactive session](docs/images/rpi-interactive.png)
@@ -165,7 +170,7 @@ and enforced in review:
 rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness
 ```
 
-Three crates sit outside that chain:
+Four crates sit outside that chain:
 
 - `rpi-tui` depends on no other `rpi-*` crate.
 - `rpi-plugin-sdk` is a leaf too (it has no `rpi-*` deps), but it is not only
@@ -275,7 +280,7 @@ can register tools, providers, slash commands, event handlers, markdown
 renderers and discovered resources.
 
 ```bash
-rpi install rpi-todo                    # build from crates.io and install
+rpi install rpi-todo                    # prebuilt extension; no Rust toolchain needed
 rpi install my-ext --path ../my-ext     # local, for development
 rpi dev                                 # build + watch + live reload
 ```
@@ -286,6 +291,46 @@ The host loads project `.rpi/extensions`, then global
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
 an [online catalog](https://rpi.laofu.online/packages.html).
+
+### Web access
+
+Web access is optional, not part of the CLI's default tool set:
+
+```bash
+rpi install rpi-websearch                # websearch: titles, URLs and snippets
+rpi install rpi-webfetch                 # webfetch: readable text from public pages
+```
+
+Restart rpi after installation to load the tools. These extensions do not
+provide an interactive browser: clicking, login flows and page JavaScript
+execution require separate browser tooling.
+
+### Subagents with inherited configuration
+
+Install the companion `rpi-subagents` extension to expose `delegate_task`:
+
+```bash
+rpi install rpi-subagents
+```
+
+The host snapshots the parent's effective model/provider binding, thinking
+level, system prompt, resources, request options, active tools, project cwd and
+approval hooks. It does not reconstruct CLI defaults or pass credentials through
+plugin JSON. Each child runs in a separate in-memory session without copying or
+modifying the parent's conversation history.
+
+The host API can narrow the inherited tool set, never expand it; `delegate_task`
+is excluded and recursive delegation is rejected. Approvals use the parent's UI,
+and parent completion or cancellation stops the child. This is capability
+inheritance and session isolation, not an OS sandbox.
+
+Use a compatible host and subagent extension; unsupported hosts fail explicitly
+rather than falling back to a differently configured subprocess. The SDK entry
+point is `AgentHarness::create_child`; extensions use `GetExecutionContext` and
+`ChildAgent` runtime actions. See the [subagent protocol](docs/extensions/subagents.md)
+for lifecycle, limits and compatibility details.
+
+### Authoring an extension
 
 ```rust
 use rpi_plugin_sdk::{export_plugin, StbStringRef};
@@ -332,12 +377,11 @@ required and none is loaded.
 
 Start with the [documentation index](docs/README.md), grouped by feature.
 
-Start with the [documentation index](docs/README.md), grouped by feature.
-
 - [User guide](docs/guides/user-guide.md) — commands, config, sessions, skills
 - [Architecture](docs/architecture/overview.md) — how the crates fit together and why
 - [Building an agent project](docs/agent/project-structure.md) — recommended structure
 - [Extension authoring](docs/extensions/authoring.md) — plugin templates and ABI rules
+- [Subagents](docs/extensions/subagents.md) — configuration inheritance, permissions and lifecycle
 - [Remote mode](docs/remote/user-guide.md) — protocol, tokens, limitations
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 - [docs.rs](https://docs.rs/rpi-cli) for per-crate API docs
@@ -381,6 +425,15 @@ Questions, ideas and early builds are welcome in either group:
 </table>
 
 <sub>Group invite codes expire — WeChat's rotates every few days. If a QR code stops working, open an issue and it will be refreshed.</sub>
+
+## Acknowledgements
+
+Thank you to Mario Zechner and the [Pi contributors](https://github.com/earendil-works/pi)
+for the original TypeScript SDK and the agent, tool and session designs that
+formed rpi's starting point. rpi reimplements that foundation in Rust and adds
+its own runtime and extension infrastructure; it does not load the TypeScript
+SDK or its npm extensions. Upstream copyright and MIT license notices are
+retained in [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## License
 
