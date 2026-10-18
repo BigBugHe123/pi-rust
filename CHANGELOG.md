@@ -15,6 +15,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ### Fixed
 
+- *(cli)* parse linked changelog headings without losing patch versions
 - *(cli)* gate PowerShell tool import to Windows
 - avoid deprecated atomic updates while preserving MSRV
 - *(tools)* remove unused Unix process extension import
