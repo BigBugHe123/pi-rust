@@ -11,6 +11,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.5.1](https://github.com/bigfish1913/pi-rust/compare/v0.5.0...v0.5.1) - 2026-10-18
+
+### Fixed
+
+- *(cli)* gate PowerShell tool import to Windows
+- avoid deprecated atomic updates while preserving MSRV
+- *(tools)* remove unused Unix process extension import
+- *(ci)* enforce warning-free builds on pull requests
+- *(tui)* apply shared theme spacing to tool panels
+
+### Other
+
+- clarify Pi attribution and 0.5.0 extension capabilities [skip ci]
+
 ## [0.5.0](https://github.com/bigfish1913/pi-rust/compare/v0.4.1...v0.5.0) - 2026-10-17
 
 ### Added
