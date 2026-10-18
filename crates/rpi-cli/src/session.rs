@@ -47,9 +47,11 @@ use rpi_harness::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, DrivingMode,
     HarnessTool, HarnessToolExecution, ToolReplay,
 };
+#[cfg(windows)]
+use rpi_tools::create_powershell_tool;
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool,
-    create_write_tool, ExecutionToolContext, MutationQueueRegistry, OsExecutionEnv,
+    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    MutationQueueRegistry, OsExecutionEnv,
 };
 
 use crate::args::Args;

@@ -10,7 +10,8 @@ use std::time::Instant;
 
 use super::component::Component;
 use crate::ansi::{bold, strip_ansi};
-use crate::theme::{theme, theme_revision, ThemeColors};
+use crate::theme::{theme, theme_revision, Theme, ThemeColors};
+use crate::tool_panel::ToolPanel;
 use crate::utils::{apply_background_to_line, truncate_to_width, wrap_text_with_ansi};
 
 /// Maximum diff lines rendered inline when expanded before collapsing the rest.
@@ -258,31 +259,13 @@ impl ToolExecutionComponent {
     }
 }
 
-impl Component for ToolExecutionComponent {
-    fn render(&self, width: usize) -> Vec<String> {
-        let status = *self.status.lock().unwrap();
-        let revision = self.revision.load(Ordering::Acquire);
-        let theme_revision = theme_revision();
-
-        // A finished panel is immutable; a running/pending one has a live
-        // elapsed timer and may still stream, so only the finished states are
-        // memoized. (Mirrors upstream's width-keyed cache, gated on the
-        // elapsed readout no longer advancing.)
-        let finished = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
-        if finished {
-            if let Ok(cache) = self.cache.lock() {
-                if let Some(cached) = cache.as_ref() {
-                    if cached.width == width
-                        && cached.revision == revision
-                        && cached.theme_revision == theme_revision
-                    {
-                        return cached.lines.clone();
-                    }
-                }
-            }
+impl ToolExecutionComponent {
+    /// Render one theme snapshot, independently of the production render cache.
+    fn render_panel(&self, width: usize, theme: &Theme) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
         }
-
-        let colors = theme().colors;
+        let colors = &theme.colors;
         if let Some((plan, active)) = self.plan_state.lock().unwrap().as_ref() {
             let status = if *active {
                 "Planning"
@@ -403,18 +386,7 @@ impl Component for ToolExecutionComponent {
         // result streaming + Ctrl+O expand plumbing.
         if let Some(skill) = skill_name.as_deref() {
             let content = result.as_deref().unwrap_or("");
-            let lines = render_skill(&colors, skill, content, *expanded, width);
-            if finished {
-                if let Ok(mut cache) = self.cache.lock() {
-                    *cache = Some(ToolRenderCache {
-                        width,
-                        revision,
-                        theme_revision,
-                        lines: lines.clone(),
-                    });
-                }
-            }
-            return lines;
+            return render_skill(colors, skill, content, *expanded, width);
         }
 
         // Status indicator — a colored glyph (no emoji), pi style.
@@ -431,6 +403,9 @@ impl Component for ToolExecutionComponent {
             ToolStatus::Failed => colors.tool_error_bg,
             ToolStatus::Completed => colors.tool_success_bg,
         };
+        let panel = ToolPanel::new(width, theme.spacing, bg).expect("nonzero panel width");
+        let content_width = panel.content_width;
+        lines.extend(std::iter::repeat(panel.blank()).take(panel.padding_y));
 
         // Tool header line.
         // For args JSON we display a compact signature (e.g. `read src/foo.rs`)
@@ -498,9 +473,8 @@ impl Component for ToolExecutionComponent {
         // Do not sacrifice a long tool name/path summary for the running
         // indicator. Tool calls often carry generated paths or extension
         // names; wrap the header into panel rows so it remains inspectable.
-        let header_width = width.saturating_sub(1).max(1);
-        for part in wrap_text_with_ansi(&format!(" {}", head_parts), header_width) {
-            lines.push(apply_background_to_line(&part, width, |s| bg.bg(s)));
+        for part in wrap_text_with_ansi(&head_parts, content_width) {
+            lines.push(panel.line(&part));
         }
 
         // Expanded: the full args JSON (indented, dim) above the result. The
@@ -509,12 +483,12 @@ impl Component for ToolExecutionComponent {
         if *expanded {
             if !args.is_empty() && args.trim() != "{}" {
                 let args_line = format!(
-                    "  {} {}",
+                    "{} {}",
                     colors.muted.fg("args:"),
                     colors.dim.fg(&pretty_args(&args))
                 );
-                for part in wrap_text_with_ansi(&args_line, width.max(1)) {
-                    lines.push(apply_background_to_line(&part, width, |s| bg.bg(s)));
+                for part in wrap_text_with_ansi(&args_line, content_width) {
+                    lines.push(panel.line(&part));
                 }
             }
         }
@@ -523,7 +497,10 @@ impl Component for ToolExecutionComponent {
         // payload, not a detail to hide behind expand). Long logical lines wrap
         // inside the panel instead of overflowing into the next terminal row.
         if let Some(ref r) = *result {
-            let body_width = width.saturating_sub(4).max(1);
+            // The gutter belongs to the content, not the panel's outer inset.
+            // Drop it only when it would leave no room for output text.
+            let gutter = !*result_markdown && content_width > 2;
+            let body_width = content_width - if gutter { 2 } else { 0 };
             // Markdown results are rendered by the markdown component, which
             // wraps and styles its own rows (tables, lists, inline code). The
             // plain path keeps the existing naive wrap so non-markdown tool
@@ -542,34 +519,30 @@ impl Component for ToolExecutionComponent {
                 visual_lines.len().min(OUTPUT_PREVIEW_LINES)
             };
             for part in visual_lines.iter().take(shown) {
-                let result_line = if *result_markdown {
-                    // Markdown carries its own styling; drop the `│` gutter so
-                    // tables keep clean box-drawing edges.
-                    format!("  {part}")
+                let result_line = if gutter {
+                    format!("{} {}", colors.dim.fg("│"), colors.tool_output.fg(part))
+                } else if *result_markdown {
+                    // Markdown carries its own styling, including table edges.
+                    part.clone()
                 } else {
-                    format!("  {} {}", colors.dim.fg("│"), colors.tool_output.fg(part))
+                    colors.tool_output.fg(part)
                 };
-                let result_line = apply_background_to_line(&result_line, width, |s| bg.bg(s));
-                lines.push(result_line);
+                lines.push(panel.line(&result_line));
             }
             let hidden = visual_lines.len().saturating_sub(shown);
             if hidden > 0 {
-                let hint = format!(
-                    "  {} … {hidden} more lines (Ctrl+O to expand)",
-                    colors.dim.fg("│")
-                );
-                let hint = colors.muted.fg(&hint);
-                lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
+                let hint = colors
+                    .muted
+                    .fg(&format!("… {hidden} more lines (Ctrl+O to expand)"));
+                for part in wrap_text_with_ansi(&hint, content_width) {
+                    lines.push(panel.line(&part));
+                }
             } else if *expanded && visual_lines.len() > OUTPUT_PREVIEW_LINES {
-                let hint = format!("  {} Ctrl+O to collapse", colors.dim.fg("│"));
-                let hint = colors.muted.fg(&hint);
-                lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
+                let hint = colors.muted.fg("Ctrl+O to collapse");
+                for part in wrap_text_with_ansi(&hint, content_width) {
+                    lines.push(panel.line(&part));
+                }
             }
-        } else if diff_lines.as_ref().map_or(true, |d| d.is_empty()) && !*expanded {
-            // No result yet, no diff, and collapsed: pad one bg-tinted row so
-            // the tool block still reads as a block (pi keeps the bg band).
-            let pad = apply_background_to_line("", width, |s| bg.bg(s));
-            lines.push(pad);
         }
 
         // A colored diff (from `render_diff`) is shown collapsed by default
@@ -585,15 +558,9 @@ impl Component for ToolExecutionComponent {
             };
             let shown = diff.iter().take(cap);
             for dl in shown {
-                // Diff lines are already complete (colors + content). Indent
-                // by 2 cols so the `+`/`-` gutter lines up under the header.
-                let body = strip_ansi(dl);
-                if body.is_empty() {
-                    lines.push(String::new());
-                } else {
-                    let indented = format!("  {}", dl);
-                    lines.push(truncate_to_width(&indented, width, "…"));
-                }
+                // Keep the diff's fixed gutter and clipping behavior, but put
+                // every row (including blanks) inside the themed panel surface.
+                lines.push(panel.line(&truncate_to_width(dl, content_width, "…")));
             }
             if total > cap {
                 let more = total - cap;
@@ -602,10 +569,38 @@ impl Component for ToolExecutionComponent {
                 } else {
                     format!("… {} more diff lines (Ctrl+O to expand)", more)
                 };
-                lines.push(format!("  {}", colors.muted.fg(&hint)));
+                for part in wrap_text_with_ansi(&colors.muted.fg(&hint), content_width) {
+                    lines.push(panel.line(&part));
+                }
             }
         }
 
+        lines.extend(std::iter::repeat(panel.blank()).take(panel.padding_y));
+        lines
+    }
+}
+
+impl Component for ToolExecutionComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        let status = *self.status.lock().unwrap();
+        let revision = self.revision.load(Ordering::Acquire);
+        let theme_revision = theme_revision();
+
+        // Only finished panels are immutable: running ones have a live timer.
+        let finished = matches!(status, ToolStatus::Completed | ToolStatus::Failed);
+        if finished {
+            if let Ok(cache) = self.cache.lock() {
+                if let Some(cached) = cache.as_ref() {
+                    if cached.width == width
+                        && cached.revision == revision
+                        && cached.theme_revision == theme_revision
+                    {
+                        return cached.lines.clone();
+                    }
+                }
+            }
+        }
+        let lines = self.render_panel(width, &theme());
         if finished {
             if let Ok(mut cache) = self.cache.lock() {
                 *cache = Some(ToolRenderCache {
@@ -618,7 +613,6 @@ impl Component for ToolExecutionComponent {
         } else if let Ok(mut cache) = self.cache.lock() {
             *cache = None;
         }
-
         lines
     }
 
@@ -1251,6 +1245,159 @@ mod tests {
         }
     }
     use super::*;
+
+    #[test]
+    fn generic_panels_share_themed_insets_in_every_state() {
+        let theme = Theme::default();
+        for status in [
+            ToolStatus::Pending,
+            ToolStatus::Running,
+            ToolStatus::Completed,
+            ToolStatus::Failed,
+        ] {
+            let tool = ToolExecutionComponent::new("edit", r#"{"path":"f.rs"}"#);
+            tool.set_result("updated", status == ToolStatus::Failed);
+            tool.set_diff(vec![
+                theme.colors.tool_diff_added.fg("+ new"),
+                String::new(),
+            ]);
+            *tool.status.lock().unwrap() = status;
+            let bg = match status {
+                ToolStatus::Pending | ToolStatus::Running => theme.colors.tool_pending_bg,
+                ToolStatus::Completed => theme.colors.tool_success_bg,
+                ToolStatus::Failed => theme.colors.tool_error_bg,
+            };
+            let lines = tool.render_panel(40, &theme);
+            let blank = bg.bg(&" ".repeat(40));
+            assert_eq!(lines[0], "", "outer spacer is not part of the panel");
+            assert_eq!(lines[1], blank);
+            assert_eq!(lines.last().unwrap(), &blank);
+            assert!(strip_ansi(&lines[2]).starts_with("  "));
+            assert!(lines
+                .iter()
+                .any(|line| strip_ansi(line).trim_end() == "  + new"));
+            for line in &lines[1..] {
+                let plain = strip_ansi(line);
+                assert!(line.starts_with(&bg.to_bg()));
+                assert_eq!(crate::utils::visible_width(line), 40);
+                assert!(
+                    plain.starts_with("  ") && plain.ends_with("  "),
+                    "{plain:?}"
+                );
+            }
+            // Diff foreground resets must restore the full panel background.
+            let diff = lines
+                .iter()
+                .find(|line| strip_ansi(line).contains("+ new"))
+                .unwrap();
+            assert!(diff.matches(&bg.to_bg()).count() > 1);
+        }
+    }
+
+    #[test]
+    fn generic_panel_spacing_is_configurable_without_global_mutation() {
+        let mut theme = Theme::default();
+        theme.spacing.tool_panel_padding_x = 4;
+        theme.spacing.tool_panel_padding_y = 2;
+        let tool = ToolExecutionComponent::new("edit", "{}");
+        tool.set_result("done", false);
+        tool.set_diff(vec!["+ new".into()]);
+        let lines = tool.render_panel(40, &theme);
+        let blank = theme.colors.tool_success_bg.bg(&" ".repeat(40));
+        assert_eq!(lines[1..3], [blank.clone(), blank.clone()]);
+        assert_eq!(lines[lines.len() - 2..], [blank.clone(), blank]);
+        assert!(strip_ansi(&lines[3]).starts_with("    ✓ edit"));
+        assert!(lines
+            .iter()
+            .any(|line| strip_ansi(line).trim_end() == "    │ done"));
+        assert!(lines
+            .iter()
+            .any(|line| strip_ansi(line).trim_end() == "    + new"));
+
+        theme.spacing.tool_panel_padding_x = 0;
+        theme.spacing.tool_panel_padding_y = 0;
+        let lines = tool.render_panel(40, &theme);
+        assert!(strip_ansi(&lines[1]).starts_with("✓ edit"));
+        assert_eq!(strip_ansi(lines.last().unwrap()).trim_end(), "+ new");
+    }
+
+    #[test]
+    fn generic_output_wraps_between_both_insets() {
+        let theme = Theme::default();
+        let output = "abcdefghijklmnop你好世界qrstuvwxyz";
+        let tool = ToolExecutionComponent::new("read", "{}");
+        tool.set_result(output, false);
+        for expanded in [false, true] {
+            tool.set_expanded(expanded);
+            let lines = tool.render_panel(12, &theme);
+            let reconstructed: String = lines
+                .iter()
+                .filter_map(|line| {
+                    let plain = strip_ansi(line);
+                    plain
+                        .strip_prefix("  │ ")
+                        .map(|body| body.trim_end().to_string())
+                })
+                .collect();
+            assert_eq!(reconstructed, output);
+            for line in &lines[1..] {
+                let plain = strip_ansi(line);
+                assert_eq!(crate::utils::visible_width(line), 12);
+                assert!(plain.starts_with("  ") && plain.ends_with("  "));
+            }
+        }
+    }
+
+    #[test]
+    fn generic_panels_handle_narrow_widths_and_large_padding() {
+        let mut theme = Theme::default();
+        theme.spacing.tool_panel_padding_x = usize::MAX;
+        let tool = ToolExecutionComponent::new("edit", r#"{"path":"很长的文件.rs"}"#);
+        tool.set_result("你好世界abcdefghijklmnop", false);
+        tool.set_diff(vec!["+ 中文abcdefghijklmnop".into()]);
+        for expanded in [false, true] {
+            tool.set_expanded(expanded);
+            for markdown in [false, true] {
+                tool.set_result_markdown(markdown);
+                for width in 0..=16 {
+                    let lines = tool.render_panel(width, &theme);
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|line| crate::utils::visible_width(line) <= width),
+                        "width {width}: {lines:?}"
+                    );
+                    if width == 0 {
+                        assert!(lines.is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expanded_args_wrap_and_diff_stays_inside_the_panel() {
+        let theme = Theme::default();
+        let tool = ToolExecutionComponent::new("edit", r#"{"path":"abcdefghijklmnop.rs"}"#);
+        let diff = "+ 你好abcdefghijklmnopqrst";
+        tool.set_result("done", false);
+        tool.set_diff(vec![theme.colors.tool_diff_added.fg(diff)]);
+        tool.set_expanded(true);
+        let lines = tool.render_panel(16, &theme);
+        let compact: String = strip_ansi(&lines.join("\n"))
+            .chars()
+            .filter(|ch| !ch.is_whitespace())
+            .collect();
+        assert!(compact.contains("abcdefghijklmnop.rs"));
+        assert!(compact.contains("+你好abc"));
+        assert!(compact.contains('…'));
+        assert!(compact.contains("args:"));
+        for line in &lines[1..] {
+            let plain = strip_ansi(line);
+            assert_eq!(crate::utils::visible_width(line), 16);
+            assert!(plain.starts_with("  ") && plain.ends_with("  "));
+        }
+    }
 
     #[test]
     fn test_tool_execution_basic() {
