@@ -534,9 +534,14 @@ impl ActionBridge {
         {
             return id as *mut c_void;
         }
-        let id = NEXT
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .expect("runtime handle space exhausted");
+        let mut id = NEXT.load(Ordering::Relaxed);
+        loop {
+            let next = id.checked_add(1).expect("runtime handle space exhausted");
+            match NEXT.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(current) => id = current,
+            }
+        }
         registry.insert(id, Arc::downgrade(self));
         id as *mut c_void
     }
