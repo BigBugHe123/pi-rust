@@ -1,6 +1,6 @@
 # rpi 使用手册
 
-这是一份面向使用者和扩展作者的 rpi 手册。rpi 是基于 Pi agent 设计的 Rust 原生 coding-agent：核心能力以 crate 形式提供，`rpi` 是开箱即用的 CLI。本文记录当前版本已经实现的命令和行为，随 `rpi-cli` 一起发布。
+这是一份面向使用者和扩展作者的 rpi 手册。rpi 起步于对 Mario Zechner 的 [Pi TypeScript SDK](https://github.com/earendil-works/pi) 的 Rust 重新实现，核心能力以 crate 形式提供，`rpi` 是开箱即用的 CLI。来源与许可说明见仓库根目录的 NOTICE。本文记录当前版本已经实现的命令和行为，随 `rpi-cli` 一起发布。
 
 ## 1. 安装
 
@@ -371,6 +371,43 @@ rpi dev
 
 安装后的动态库位于 `~/.rpi/agent/extensions`（或 `RPI_CODING_AGENT_DIR` 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 `rpi-cli` 的私有模块。
 
+### 网页搜索与抓取
+
+联网工具由独立的 [rpi-package 扩展](https://github.com/pi-rust/rpi-package) 提供，
+不属于 CLI 默认内置工具。按需安装后重启 rpi：
+
+```bash
+rpi install rpi-websearch
+rpi install rpi-webfetch
+```
+
+- `websearch` 返回搜索结果的标题、链接和摘要。
+- `webfetch` 提取公开 HTTP(S) 网页的可读文本；会拒绝私有地址和超限响应。
+- 这两个扩展不是交互式浏览器，不提供点击、登录流程或网页 JavaScript 执行。
+
+### 继承主会话配置的子 agent
+
+安装兼容版本的 `rpi-subagents` 并重启后，可通过 `delegate_task` 委派任务：
+
+```bash
+rpi install rpi-subagents
+```
+
+子 agent 使用主会话当前有效配置的快照：模型/provider 及其私有凭据绑定、thinking、
+系统提示词、资源、请求选项、启用的工具、项目 cwd 和审批 hook。它不是重新读取默认
+配置启动的 `rpi` 子进程；凭据不会通过插件 JSON 传递。
+
+子任务使用独立的内存 Session，**不复制或修改父聊天历史**。宿主 API 可进一步缩小
+工具集合，但不能扩大；子工具集中移除 `delegate_task`，并禁止通过别名递归委派。
+审批与 `ask_user` 沿用父 UI；没有交互消费者时保留明确拒绝/报错，不会默认放行。
+父运行结束或取消、会话切换以及所属插件卸载/reload 会取消子任务。
+这不是 OS 安全沙箱，允许的 shell 等工具仍保有正常能力。
+
+宿主与扩展需同时支持对应协议；旧宿主明确要求升级，不回退到默认配置的子进程。
+SDK 提供 `AgentHarness::create_child`，扩展通过 `GetExecutionContext` 和 `ChildAgent`
+runtime actions 接入。完整协议见仓库 `docs/extensions/subagents.md`：
+<https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/subagents.md>。
+
 ## 7. SDK 集成
 
 只需要嵌入 Agent 时，依赖 `rpi-agent` 和 `rpi-ai`；需要内置工具时再加入 `rpi-tools`；需要会话、压缩、skills 和上下文文件时加入 `rpi-harness`。
@@ -444,7 +481,15 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness →
 rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 ```
 
-发布前更新版本号和 `docs/release-vX.Y.Z.md`，确认 README、官网 `website/data/docs.json` 和本手册中的命令一致。官网是静态站点，文档文件提交到仓库后仍需按项目部署流程重新部署。
+日常贡献无需手动修改版本号。普通改动合并 `main` 并通过 CI 后，由自动化准备
+Release PR；只有合并符合条件的 Release PR 才会发布。发布记录统一维护在根目录
+`CHANGELOG.md`，不再新建 `docs/release-vX.Y.Z.md`。完整流程与纯文档不发布的处理方式
+见仓库 `docs/maintaining/releasing.md`：
+<https://github.com/bigfish1913/pi-rust/blob/main/docs/maintaining/releasing.md>。
+
+修改模型可读文档源 `docs/rpi-tool/` 后运行 `sh scripts/sync-embedded-docs.sh` 并提交
+生成的文档快照。仅更新文档不需要 bump 版本或打 tag。官网仍需单独部署，提交或合并
+文档不等于已经更新线上网站。
 
 ## 10. 文档查询入口
 
