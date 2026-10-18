@@ -200,13 +200,27 @@ impl<'de> Deserialize<'de> for ToolCallType {
 /// `TextContent | ImageContent | ThinkingContent | ToolCall` — assistant-side
 /// content blocks. User messages use only text/image; assistant messages may carry
 /// all four. Tagged via the `type` field so it round-trips the TS union exactly.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Content {
     Text(TextContent),
     Thinking(ThinkingContent),
     Image(ImageContent),
     ToolCall(ToolCall),
+}
+
+// Each concrete block already serializes its own `type` marker. Deriving an
+// internally tagged serializer here would emit that field a second time, which
+// raw JSON readers reject (a Value-based round-trip silently hides the bug).
+impl Serialize for Content {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Text(block) => block.serialize(serializer),
+            Self::Thinking(block) => block.serialize(serializer),
+            Self::Image(block) => block.serialize(serializer),
+            Self::ToolCall(block) => block.serialize(serializer),
+        }
+    }
 }
 
 impl Content {
