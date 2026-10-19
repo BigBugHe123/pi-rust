@@ -535,11 +535,16 @@ impl TuiAltScreen {
         true
     }
 
-    /// Re-read the terminal size and repaint when it differs from the geometry
-    /// currently on screen. Kept as the public name hosts and examples use;
-    /// [`TuiAltScreen::ensure_size`] is the implementation.
+    /// Re-read the cached terminal size and force a full alternate-screen repaint.
+    ///
+    /// Kept for existing hosts that call this from their resize-event handler.
+    /// Even an unchanged size can require repainting after terminal reflow;
+    /// use [`TuiAltScreen::ensure_size`] for periodic size checks instead.
     pub fn refresh_size(&self) {
-        self.ensure_size();
+        if let Ok(terminal) = self.terminal.lock() {
+            terminal.refresh_size();
+        }
+        self.note_resize();
     }
 
     /// A resize event reached the loop: schedule one full-screen repaint.
@@ -1649,6 +1654,40 @@ mod tests {
             frame.contains("\x1b[2J"),
             "a resize notification must repaint every row, got: {frame:?}"
         );
+    }
+
+    #[test]
+    fn legacy_refresh_size_repaints_a_same_size_resize_with_or_without_coalescing() {
+        for coalesced in [false, true] {
+            let terminal = ResizableTerminal::new(40, 8);
+            let output = terminal.output();
+            let tui = TuiAltScreen::new(Box::new(terminal), false, None);
+            tui.set_layout_root(Some(Arc::new(Text::new("stable frame", 0, 0))));
+            if coalesced {
+                tui.enable_render_coalescing();
+            }
+            tui.start_readerless();
+            output.lock().unwrap().clear();
+            let redraws = tui.full_redraws();
+
+            // Existing hosts call refresh_size from their Resize handler.
+            // An out-and-back drag can reflow the terminal without changing
+            // its final dimensions, so the legacy API must force a repaint.
+            tui.refresh_size();
+            if coalesced {
+                assert!(output.lock().unwrap().is_empty());
+                assert!(tui.flush_pending_render());
+            }
+            let frame = output.lock().unwrap().clone();
+            assert!(frame.contains("\x1b[2J"), "missing full repaint: {frame:?}");
+            assert_eq!(tui.full_redraws(), redraws + 1);
+
+            // Steady-state watchdog ticks must still leave the frame alone.
+            output.lock().unwrap().clear();
+            tui.ensure_size();
+            assert!(!tui.flush_pending_render());
+            assert!(output.lock().unwrap().is_empty());
+        }
     }
 
     #[test]
