@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/bigfish1913/pi-rust/compare/v0.6.1...v0.6.2) - 2026-10-19
+
+### Fixed
+
+- *(tui)* restore iTerm2 queue editing and cross-provider model cycling
+
 ## [0.6.1](https://github.com/bigfish1913/pi-rust/compare/v0.6.0...v0.6.1) - 2026-10-19
 
 ### Fixed
