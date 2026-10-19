@@ -1901,7 +1901,10 @@ pub async fn interactive_tui(
                 }
                 continue;
             };
-            let key = rpi_tui::terminal::normalize_key_event(key);
+            let key = rpi_tui::terminal::normalize_key_event_with_protocol(
+                key,
+                tui_for_key.terminal().info().supports_kitty_keyboard,
+            );
             // Diagnostic trace (off unless RPI_DEBUG_KEYS is set): records what
             // actually arrived before any routing decision, so a client that
             // sends LF for Enter is visible as `Char('j') mods=CONTROL`.
@@ -2316,63 +2319,39 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2f. Ctrl+P: cycle to the next model in the catalog after the one
-            //     currently tracked in `current_model_id`, apply it live via
-            //     `lane.set_model` (takes effect on the next user message — the
-            //     in-flight run's config is already snapshotted), and update the
-            //     footer. `set_model` is async so it runs on a spawned task.
-            if keybinding_matches(
+            // Cycle the authenticated catalog, including other providers. Resolve
+            // the anchor from the live lane so duplicate model ids stay distinct.
+            let cycle_forward = keybinding_matches(
                 &keybindings_for_key,
                 &key,
                 rpi_tui::keybindings::keys::MODEL_CYCLE_FORWARD,
-            ) {
-                let current = state_for_key.current_model_id();
-                // Cycle within the `/scoped-models` set (settings.json) when
-                // configured; otherwise the full catalog, restricted to the
-                // current provider (the lane cannot route another provider).
-                let scope = scoped_catalog(
-                    &ctx_for_key
-                        .model_catalog
-                        .read()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &current,
-                );
-                let scope = same_provider_catalog(&scope, &current);
-                if let Some(next) = cycle_next_model(&scope, &current) {
-                    state_for_key.set_current_model(&next);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.set_model(next).await;
-                    });
-                    tui_for_key.request_render_reusing_scroll_content();
-                }
-                continue;
-            }
-
-            // 2f-bis. Shift+Ctrl+P (Alt+P on Windows): cycle to the *previous*
-            //     model, the mirror of the Ctrl+P hotkey above.
-            if keybinding_matches(
+            );
+            let cycle_backward = keybinding_matches(
                 &keybindings_for_key,
                 &key,
                 rpi_tui::keybindings::keys::MODEL_CYCLE_BACKWARD,
-            ) {
-                let current = state_for_key.current_model_id();
-                let scope = scoped_catalog(
-                    &ctx_for_key
-                        .model_catalog
-                        .read()
-                        .unwrap_or_else(|error| error.into_inner()),
-                    &current,
-                );
-                let scope = same_provider_catalog(&scope, &current);
-                if let Some(prev) = cycle_prev_model(&scope, &current) {
-                    state_for_key.set_current_model(&prev);
-                    let lane = lane_for_key.clone();
-                    tokio::spawn(async move {
-                        let _ = lane.set_model(prev).await;
-                    });
-                    tui_for_key.request_render_reusing_scroll_content();
-                }
+            );
+            if cycle_forward || cycle_backward {
+                let catalog = ctx_for_key
+                    .model_catalog
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                let lane = lane_for_key.clone();
+                let state = state_for_key.clone();
+                let tui = tui_for_key.clone();
+                tokio::spawn(async move {
+                    match cycle_model(&lane, &catalog, cycle_backward).await {
+                        Ok(Some(model)) => {
+                            report_model_selection(&lane, &state, &tui, model, false).await;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            add_error_message(&state.chat_container, &error);
+                            tui.request_render(false);
+                        }
+                    }
+                });
                 continue;
             }
 
