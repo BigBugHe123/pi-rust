@@ -11,6 +11,13 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.6.1](https://github.com/bigfish1913/pi-rust/compare/v0.6.0...v0.6.1) - 2026-10-19
+
+### Fixed
+
+- *(tui)* repaint the frame when the terminal is resized
+- *(tui)* preserve legacy resize repaint behavior
+
 ## [0.6.0](https://github.com/bigfish1913/pi-rust/compare/v0.5.1...v0.6.0) - 2026-10-18
 
 ### Added
