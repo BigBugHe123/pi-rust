@@ -118,14 +118,19 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
         loop {
             match crossterm::event::poll(Duration::from_millis(100)) {
                 Ok(true) => {}
-                Ok(false) => continue,
+                // Watchdog: a resize event can be missed, and this picker owns
+                // no periodic tick of its own.
+                Ok(false) => {
+                    input_tui.ensure_size();
+                    continue;
+                }
                 Err(e) => return Err(format!("could not read terminal input: {e}")),
             }
             let event = crossterm::event::read()
                 .map_err(|e| format!("could not read terminal input: {e}"))?;
             match event {
-                Event::Resize(_, _) => {
-                    input_tui.refresh_size();
+                Event::Resize(..) => {
+                    input_tui.note_resize();
                 }
                 Event::Mouse(mouse) => {
                     let code = match mouse.kind {

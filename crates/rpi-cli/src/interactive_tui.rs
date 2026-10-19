@@ -1590,6 +1590,12 @@ pub async fn interactive_tui(
         interval.tick().await; // discard immediate
         loop {
             interval.tick().await;
+            // Size watchdog: re-read the window and repaint when it differs
+            // from what is on screen. A resize event is only a hint (on Windows
+            // its record can be delivered before the window rectangle moves),
+            // and a lost event would otherwise leave the fullscreen frame at the
+            // previous geometry for the rest of the session.
+            tui_tick.ensure_size();
             let side_changed = side_tick.lock().unwrap().sync(
                 &tui_tick,
                 &side_context,
@@ -1736,10 +1742,11 @@ pub async fn interactive_tui(
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
-            // handle it, so refresh the cached terminal size here and force a
-            // full redraw so the constrained layout re-fits the new dimensions.
-            if let Event::Resize(_cols, _rows) = ev {
-                tui_for_key.refresh_size();
+            // handle it: force one full-screen repaint. The renderer re-reads the
+            // window size itself; the event's own columns/rows are not used (on
+            // Windows they carry the console buffer size, not the window).
+            if let Event::Resize(..) = ev {
+                tui_for_key.note_resize();
                 continue;
             }
             // Mouse wheel scrolls the transcript (pi supports wheel
