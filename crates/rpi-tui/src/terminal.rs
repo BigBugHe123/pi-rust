@@ -149,7 +149,10 @@ pub trait Terminal: Send + Sync {
     fn exit_raw_mode(&self);
 
     /// Re-read the current terminal size into the cached [`TerminalInfo`].
-    /// Called on `Event::Resize` so subsequent renders use the new dimensions.
+    ///
+    /// Called by the renderer before laying out every frame and by the hosts'
+    /// size watchdog, so a window that changed without a usable resize event
+    /// still gets a correct frame.
     fn refresh_size(&self);
 
     /// Start terminal raw mode.
