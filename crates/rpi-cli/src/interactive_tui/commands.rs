@@ -139,20 +139,12 @@ impl SlashCommand for ModelCommand {
                     .unwrap_or_else(|error| error.into_inner()),
                 term,
             ) {
-                let model_id = model.id.clone();
-                ctx.state.set_current_model(&model);
                 let lane = ctx.lane.clone();
+                let state = ctx.state.clone();
+                let tui = ctx.tui.clone();
                 tokio::spawn(async move {
-                    let _ = lane.set_model(model).await;
+                    report_model_selection(&lane, &state, &tui, model, false).await;
                 });
-                add_note_message(
-                    &ctx.chat,
-                    &format!(
-                        "Model set to {} — applies to the next message.",
-                        short_model_name(&model_id)
-                    ),
-                );
-                ctx.tui.request_render(false);
                 return;
             }
         }
