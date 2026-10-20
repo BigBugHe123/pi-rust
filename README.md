@@ -19,7 +19,7 @@ by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
 infrastructure. See [Acknowledgements](#acknowledgements) and [NOTICE](NOTICE)
 for upstream attribution.
 
-Website: <https://rpi.laofu.online/> · Docs: <https://rpi.laofu.online/docs.html>
+Website: <https://rpi.bigfisharc.cn/> · Docs: <https://rpi.bigfisharc.cn/docs.html>
 
 ![rpi interactive session](docs/images/rpi-interactive.png)
 
@@ -290,7 +290,7 @@ The host loads project `.rpi/extensions`, then global
 
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
-an [online catalog](https://rpi.laofu.online/packages.html).
+an [online catalog](https://rpi.bigfisharc.cn/packages.html).
 
 ### Web access
 
