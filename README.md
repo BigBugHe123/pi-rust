@@ -305,31 +305,6 @@ Restart rpi after installation to load the tools. These extensions do not
 provide an interactive browser: clicking, login flows and page JavaScript
 execution require separate browser tooling.
 
-### Subagents with inherited configuration
-
-Install the companion `rpi-subagents` extension to expose `delegate_task`:
-
-```bash
-rpi install rpi-subagents
-```
-
-The host snapshots the parent's effective model/provider binding, thinking
-level, system prompt, resources, request options, active tools, project cwd and
-approval hooks. It does not reconstruct CLI defaults or pass credentials through
-plugin JSON. Each child runs in a separate in-memory session without copying or
-modifying the parent's conversation history.
-
-The host API can narrow the inherited tool set, never expand it; `delegate_task`
-is excluded and recursive delegation is rejected. Approvals use the parent's UI,
-and parent completion or cancellation stops the child. This is capability
-inheritance and session isolation, not an OS sandbox.
-
-Use a compatible host and subagent extension; unsupported hosts fail explicitly
-rather than falling back to a differently configured subprocess. The SDK entry
-point is `AgentHarness::create_child`; extensions use `GetExecutionContext` and
-`ChildAgent` runtime actions. See the [subagent protocol](docs/extensions/subagents.md)
-for lifecycle, limits and compatibility details.
-
 ### Authoring an extension
 
 ```rust
@@ -381,7 +356,6 @@ Start with the [documentation index](docs/README.md), grouped by feature.
 - [Architecture](docs/architecture/overview.md) — how the crates fit together and why
 - [Building an agent project](docs/agent/project-structure.md) — recommended structure
 - [Extension authoring](docs/extensions/authoring.md) — plugin templates and ABI rules
-- [Subagents](docs/extensions/subagents.md) — configuration inheritance, permissions and lifecycle
 - [Remote mode](docs/remote/user-guide.md) — protocol, tokens, limitations
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 - [docs.rs](https://docs.rs/rpi-cli) for per-crate API docs

@@ -80,7 +80,6 @@ pub struct HarnessActionHost {
     /// tool state keyed off the old id would otherwise keep serving the session
     /// it named before the swap.
     tool_context: rpi_extensions::ToolCallContext,
-    children: crate::child_agents::ChildAgents,
     side_questions: crate::side_questions::SideQuestions,
     #[allow(dead_code)]
     runtime: Handle,
@@ -108,7 +107,6 @@ impl HarnessActionHost {
                 cwd,
                 cli_flags,
                 tool_context,
-                children: crate::child_agents::ChildAgents::default(),
                 side_questions: crate::side_questions::SideQuestions::default(),
                 runtime,
             },
@@ -379,9 +377,6 @@ impl RuntimeActionHost for HarnessActionHost {
             .await
     }
 
-    fn cancel_child_agents(&self, owner: u64) {
-        self.children.cancel_owner(owner);
-    }
     fn replace_model_catalog(&self, models: Vec<rpi_ai::Model>) {
         self.set_catalog(models);
     }
@@ -402,22 +397,6 @@ impl RuntimeActionHost for HarnessActionHost {
         context["cwd"] = serde_json::json!(self.cwd);
         context["sessionId"] = serde_json::json!(harness.session().storage().metadata().id);
         Ok(context)
-    }
-
-    async fn child_agent(
-        &self,
-        owner: u64,
-        args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        if rpi_agent::tool_execution_scope::is_child_execution() {
-            return Err("recursive child agents are not allowed".into());
-        }
-        if args.get("op").and_then(serde_json::Value::as_str) == Some("start") {
-            self.children.handle(&self.harness()?, owner, args).await
-        } else {
-            // Reclamation must remain possible after the parent was dropped.
-            self.children.handle_existing(owner, args)
-        }
     }
 
     async fn get_cli_flag(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
@@ -665,9 +644,6 @@ impl RuntimeActionHost for HarnessActionHost {
         Err("reload not configured (no /reload callback on this bridge)".to_string())
     }
 }
-
-#[cfg(test)]
-mod lifetime_tests;
 
 #[cfg(test)]
 mod send_message_tests {

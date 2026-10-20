@@ -6,20 +6,6 @@ use tokio::sync::Notify;
 
 tokio::task_local! {
     static CURRENT: Arc<ToolExecutionScope>;
-    static INVOCATION_SIGNAL: tokio_util::sync::CancellationToken;
-}
-
-/// Bind a runtime action to the originating tool invocation, even after its
-/// dispatch has moved off the foreign thread. This is host-only state, not JSON.
-pub async fn with_invocation_signal<F: Future>(
-    signal: tokio_util::sync::CancellationToken,
-    future: F,
-) -> F::Output {
-    INVOCATION_SIGNAL.scope(signal, future).await
-}
-
-pub fn invocation_signal() -> Option<tokio_util::sync::CancellationToken> {
-    INVOCATION_SIGNAL.try_with(Clone::clone).ok()
 }
 
 /// Shared by a child's run, tools, providers and detached foreign callbacks.
@@ -103,26 +89,6 @@ mod tests {
         assert!(!is_child_execution());
         assert!(execution_context().is_none());
         assert!(track_background_tool().is_none());
-    }
-    #[tokio::test]
-    async fn invocation_cancellation_crosses_dispatch_without_changing_child_identity() {
-        let token = tokio_util::sync::CancellationToken::new();
-        assert!(invocation_signal().is_none());
-        let captured = with_invocation_signal(token.clone(), async {
-            assert!(!is_child_execution());
-            let child = Arc::new(ToolExecutionScope::default());
-            child
-                .run(async {
-                    assert!(is_child_execution());
-                    invocation_signal().unwrap()
-                })
-                .await
-        })
-        .await;
-        assert!(invocation_signal().is_none());
-        assert!(!captured.is_cancelled());
-        token.cancel();
-        assert!(captured.is_cancelled());
     }
     #[tokio::test]
     async fn dropping_the_foreground_scope_does_not_finish_its_background_work() {

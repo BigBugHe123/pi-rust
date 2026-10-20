@@ -11,8 +11,8 @@ pub struct WeakAgentHarness {
     bus: HarnessEventBus,
     lane: String,
     message_writes: Arc<tokio::sync::Mutex<()>>,
-    child_scope: Arc<Mutex<CancellationToken>>,
-    is_child: bool,
+    side_question_scope: Arc<Mutex<CancellationToken>>,
+    is_side_question: bool,
     max_turns: Option<u32>,
 }
 impl AgentHarness {
@@ -23,8 +23,8 @@ impl AgentHarness {
             bus: self.bus.clone(),
             lane: self.lane.clone(),
             message_writes: self.message_writes.clone(),
-            child_scope: self.child_scope.clone(),
-            is_child: self.is_child,
+            side_question_scope: self.side_question_scope.clone(),
+            is_side_question: self.is_side_question,
             max_turns: self.max_turns,
         }
     }
@@ -37,21 +37,20 @@ impl WeakAgentHarness {
             bus: self.bus.clone(),
             lane: self.lane.clone(),
             message_writes: self.message_writes.clone(),
-            child_scope: self.child_scope.clone(),
-            is_child: self.is_child,
+            side_question_scope: self.side_question_scope.clone(),
+            is_side_question: self.is_side_question,
             max_turns: self.max_turns,
         })
     }
 }
 impl Drop for HarnessInner {
     fn drop(&mut self) {
-        self.child_scope
+        self.side_question_scope
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .cancel();
         if let Some(active) = &self.active_run {
             active.signal.cancel();
-            active.children.cancel();
         }
     }
 }
@@ -60,11 +59,11 @@ impl Drop for HarnessInner {
 mod tests {
     use super::*;
     #[tokio::test]
-    async fn a_weak_runtime_binding_does_not_retain_the_last_owner_or_its_children() {
+    async fn a_weak_runtime_binding_does_not_retain_the_last_owner_or_side_questions() {
         let parent = AgentHarness::create(AgentHarnessOptions::default())
             .await
             .unwrap();
-        let scope = parent.snapshot_config().unwrap().child_scope;
+        let scope = parent.side_question_scope.lock().unwrap().child_token();
         let weak = parent.downgrade();
         let clone = weak.upgrade().unwrap();
         drop(parent);

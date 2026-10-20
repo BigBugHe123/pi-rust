@@ -5,7 +5,6 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Default)]
 struct Host {
-    calls: AtomicUsize,
     revoked: AtomicUsize,
     side_sinks: std::sync::Mutex<Vec<SideQuestionSink>>,
 }
@@ -70,19 +69,7 @@ impl RuntimeActionHost for Host {
     async fn reload(&self, _: Value) -> Result<Value, String> {
         unreachable!()
     }
-    async fn child_agent(&self, owner: u64, args: Value) -> Result<Value, String> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        assert!(
-            rpi_agent::tool_execution_scope::invocation_signal().is_some(),
-            "dispatch must retain the originating invocation's cancellation"
-        );
-        assert!(
-            args.get("__rpiRuntimeKey").is_none(),
-            "capabilities must not reach action payloads"
-        );
-        Ok(json!({"owner":owner}))
-    }
-    fn cancel_child_agents(&self, _: u64) {
+    fn cancel_side_questions(&self, _: u64) {
         self.revoked.fetch_add(1, Ordering::SeqCst);
     }
 }
@@ -90,7 +77,7 @@ fn call(id: usize, args: Value) -> (i32, Value) {
     let mut out = StbString::empty();
     let text = args.to_string();
     let rc = trampoline_runtime_action(
-        RuntimeActionId::ChildAgent.into(),
+        RuntimeActionId::GetExecutionContext.into(),
         StbStringRef::from_str(&text),
         &mut out,
         id as *mut c_void,
@@ -100,70 +87,6 @@ fn call(id: usize, args: Value) -> (i32, Value) {
         rpi_plugin_sdk::callbacks::OwnedString::from_raw(out, Some(crate::host_free_string))
     };
     (rc, serde_json::from_str(&owned.to_string_lossy()).unwrap())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn child_actions_require_a_live_parent_invocation_and_its_capability() {
-    let host = Arc::new(Host::default());
-    let root = ActionBridge::new(Handle::current(), host.clone());
-    let plugin = root.for_plugin("research");
-    let parent = plugin.for_invocation(false, CancellationToken::new());
-    let child = plugin.for_invocation(true, CancellationToken::new());
-    assert_eq!(
-        call(plugin.user_data() as usize, json!({"op":"start"})).0,
-        1
-    );
-    assert_eq!(
-        call(parent.user_data() as usize, json!({"op":"start"})).0,
-        1
-    );
-    assert_eq!(
-        call(
-            parent.user_data() as usize,
-            json!({"op":"start","__rpiRuntimeKey":"guessed"})
-        )
-        .0,
-        1
-    );
-    assert_eq!(
-        call(
-            child.user_data() as usize,
-            json!({"op":"start","__rpiRuntimeKey":child.invocation_key()})
-        )
-        .0,
-        1
-    );
-    // A child synchronous callback cannot spoof another invocation's ID/key.
-    {
-        let _guard = child.enter_invocation();
-        assert_eq!(
-            call(
-                parent.user_data() as usize,
-                json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()})
-            )
-            .0,
-            1
-        );
-    }
-    let accepted = call(
-        parent.user_data() as usize,
-        json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()}),
-    );
-    assert_eq!(accepted.0, 0);
-    assert_eq!(
-        accepted.1["owner"],
-        plugin.plugin_identity.as_ref().unwrap().0
-    );
-    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
-    parent.invocation.as_ref().unwrap().2.cancel();
-    assert_eq!(
-        call(
-            parent.user_data() as usize,
-            json!({"op":"start","__rpiRuntimeKey":parent.invocation_key()})
-        )
-        .0,
-        1
-    );
 }
 
 #[tokio::test]
@@ -203,7 +126,6 @@ async fn finishing_an_invocation_does_not_unload_its_plugin_owner() {
 }
 
 mod cancel_wait;
-mod cleanup;
 mod driver;
 mod pacing;
 mod streaming;

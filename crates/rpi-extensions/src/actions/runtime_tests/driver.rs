@@ -24,63 +24,6 @@ pub(super) extern "C" fn consume_execute(
     std::ptr::dangling_mut()
 }
 pub(super) extern "C" fn noop(_: StepHandle) {}
-static REGISTRATION: AtomicUsize = AtomicUsize::new(0);
-extern "C" fn delegate_poll(_: StepHandle, _: Option<ToolPartialCb>, _: *mut c_void) -> StepResult {
-    let (rc, _) = call(REGISTRATION.load(Ordering::SeqCst), json!({"op":"start"}));
-    StepResult::done(StbString::from_string(
-        json!({"content":[{"type":"text","text":rc.to_string()}]}).to_string(),
-    ))
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn child_alias_plugin_cannot_use_its_registration_to_delegate() {
-    let host = Arc::new(Host::default());
-    let root = ActionBridge::new(Handle::current(), host.clone());
-    let plugin = root.for_plugin("research");
-    REGISTRATION.store(plugin.user_data() as usize, Ordering::SeqCst);
-    let adapter = PluginToolAdapter::new(
-        schema(),
-        PluginToolHandle {
-            execute_fn: consume_execute,
-            poll_fn: delegate_poll,
-            cancel_fn: noop,
-            destroy_fn: noop,
-            plugin_free_string: crate::host_free_string,
-            runtime_handle: Some(plugin.user_data() as usize),
-        },
-        PluginKeepalive::empty(),
-    );
-    // Synchronous callbacks inherit a host invocation, so parent calls work
-    // without explicitly forwarding a capability through their JSON.
-    let parent = adapter
-        .execute(
-            "parent",
-            json!({}),
-            CancellationToken::new(),
-            Arc::new(|_| {}),
-        )
-        .await
-        .unwrap();
-    assert!(
-        matches!(&parent.content[0], rpi_agent::TextContentOrImage::Text(text) if text.text == "0")
-    );
-    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
-    let scope = Arc::new(ToolExecutionScope::default());
-    let child = scope
-        .run(adapter.execute(
-            "child",
-            json!({}),
-            CancellationToken::new(),
-            Arc::new(|_| {}),
-        ))
-        .await
-        .unwrap();
-    assert!(
-        matches!(&child.content[0], rpi_agent::TextContentOrImage::Text(text) if text.text == "1")
-    );
-    assert_eq!(host.calls.load(Ordering::SeqCst), 1);
-}
-
 static PHASE: AtomicUsize = AtomicUsize::new(0);
 static ENTERED: AtomicBool = AtomicBool::new(false);
 static RELEASE: AtomicBool = AtomicBool::new(false);

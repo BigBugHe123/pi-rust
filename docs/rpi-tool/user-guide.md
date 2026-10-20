@@ -385,29 +385,6 @@ rpi install rpi-webfetch
 - `webfetch` 提取公开 HTTP(S) 网页的可读文本；会拒绝私有地址和超限响应。
 - 这两个扩展不是交互式浏览器，不提供点击、登录流程或网页 JavaScript 执行。
 
-### 继承主会话配置的子 agent
-
-安装兼容版本的 `rpi-subagents` 并重启后，可通过 `delegate_task` 委派任务：
-
-```bash
-rpi install rpi-subagents
-```
-
-子 agent 使用主会话当前有效配置的快照：模型/provider 及其私有凭据绑定、thinking、
-系统提示词、资源、请求选项、启用的工具、项目 cwd 和审批 hook。它不是重新读取默认
-配置启动的 `rpi` 子进程；凭据不会通过插件 JSON 传递。
-
-子任务使用独立的内存 Session，**不复制或修改父聊天历史**。宿主 API 可进一步缩小
-工具集合，但不能扩大；子工具集中移除 `delegate_task`，并禁止通过别名递归委派。
-审批与 `ask_user` 沿用父 UI；没有交互消费者时保留明确拒绝/报错，不会默认放行。
-父运行结束或取消、会话切换以及所属插件卸载/reload 会取消子任务。
-这不是 OS 安全沙箱，允许的 shell 等工具仍保有正常能力。
-
-宿主与扩展需同时支持对应协议；旧宿主明确要求升级，不回退到默认配置的子进程。
-SDK 提供 `AgentHarness::create_child`，扩展通过 `GetExecutionContext` 和 `ChildAgent`
-runtime actions 接入。完整协议见仓库 `docs/extensions/subagents.md`：
-<https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/subagents.md>。
-
 ## 7. SDK 集成
 
 只需要嵌入 Agent 时，依赖 `rpi-agent` 和 `rpi-ai`；需要内置工具时再加入 `rpi-tools`；需要会话、压缩、skills 和上下文文件时加入 `rpi-harness`。

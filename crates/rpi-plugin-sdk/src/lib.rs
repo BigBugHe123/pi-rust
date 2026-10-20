@@ -379,13 +379,6 @@ pub struct StableToolSchema {
 /// project-scoped fallback when `sessionId` is missing rather than refusing to
 /// work.
 ///
-/// Plugins using host-managed child actions additionally receive per-call
-/// `runtimeHandle` (opaque integer) and `runtimeKey` (capability string). Worker
-/// threads use that handle as runtime_action's opaque user_data and include
-/// `__rpiRuntimeKey` in ChildAgent arguments. Never log, persist, expose to the
-/// model, or reuse these values across tool calls. Missing values mean the
-/// host cannot support worker-originated ChildAgent safely; fail closed.
-///
 /// **Consequence for plugin parameter types:** a plugin must tolerate unknown
 /// top-level keys in its arguments. Reading them out of a `serde_json::Value`
 /// does that naturally; a `#[serde(deny_unknown_fields)]` parameter struct
@@ -1062,11 +1055,6 @@ pub enum RuntimeActionId {
     /// Safe live execution metadata (no credentials, endpoints or headers).
     /// Args: `{}`; result: model identity, thinkingLevel, tools, cwd, sessionId.
     GetExecutionContext = 23,
-    /// Host-owned independent child run. `op`: start/poll/cancel/dispose.
-    /// Start: task, optional role/maxTurns/timeoutSeconds/tools/toolCallId.
-    /// Others: childId. Poll drains text deltas and returns status/result.
-    /// Handles are scoped to the calling plugin and must be disposed.
-    ChildAgent = 24,
     /// Read-only, host-managed side question. Registration-level commands may
     /// use start(question), status, cancel, hide and show. Never changes the
     /// main transcript or its queues. Presentation and execution stay in host.
@@ -1115,7 +1103,6 @@ impl TryFrom<u32> for RuntimeActionId {
             21 => Ok(Self::StdioLifecycle),
             22 => Ok(Self::UiComponent),
             23 => Ok(Self::GetExecutionContext),
-            24 => Ok(Self::ChildAgent),
             25 => Ok(Self::SideQuestion),
             other => Err(UnknownRuntimeActionId(other)),
         }
@@ -2019,14 +2006,18 @@ mod tests {
             RuntimeActionId::StdioLifecycle,
             RuntimeActionId::UiComponent,
             RuntimeActionId::GetExecutionContext,
-            RuntimeActionId::ChildAgent,
             RuntimeActionId::SideQuestion,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
-            assert_eq!(RuntimeActionId::try_from(raw as u32), Ok(expected));
-            assert_eq!(u32::from(expected), raw as u32);
+            let raw = if raw >= 24 { raw + 1 } else { raw } as u32;
+            assert_eq!(RuntimeActionId::try_from(raw), Ok(expected));
+            assert_eq!(u32::from(expected), raw);
         }
+        assert_eq!(
+            RuntimeActionId::try_from(24),
+            Err(UnknownRuntimeActionId(24))
+        );
         // One past the highest defined id is rejected (nothing is silently
         // accepted), and so is the u32 ceiling.
         assert_eq!(

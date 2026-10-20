@@ -12,8 +12,7 @@
 //!
 //! Synchronous tool callbacks inherit a host-owned invocation via a scoped
 //! thread-local; workers forward the invocation handle and capability injected
-//! into `__rpi`. ChildAgent rejects registration-only, cancelled and child
-//! invocations. A cached registration cannot override a child's driver scope.
+//! into `__rpi` for scoped runtime calls.
 //!
 //! [`ActionBridge`] captures a Tokio [`Handle`] at construction. Dispatch can
 //! therefore spawn from foreign threads and return over a standard synchronous
@@ -408,8 +407,6 @@ pub trait RuntimeActionHost: Send + Sync {
 
     /// Refresh the host-side model selector after provider packages reload.
     fn replace_model_catalog(&self, _models: Vec<rpi_ai::Model>) {}
-    /// Invalidate child handles owned by an unloading/reloaded plugin.
-    fn cancel_child_agents(&self, _owner: u64) {}
     /// `SendMessage` — Pi-compatible `triggerTurn` and `deliverAs` scheduling.
     /// Defaults append while idle and steer while running; explicit `true`
     /// starts an idle run, `false` only updates context, and `nextTurn` waits
@@ -478,15 +475,6 @@ pub trait RuntimeActionHost: Send + Sync {
         _args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         Err("execution context is not supported by this host".into())
-    }
-
-    /// Independent child lifecycle. `owner` is supplied by the bridge, NOT JSON.
-    async fn child_agent(
-        &self,
-        _owner: u64,
-        _args: serde_json::Value,
-    ) -> Result<serde_json::Value, String> {
-        Err("ChildAgent is not supported by this host".into())
     }
 
     /// `GetSessionBranch` — current main branch entries, oldest-first.
@@ -771,7 +759,6 @@ impl ActionBridge {
         // Host cancellation may contend with a job publishing through its
         // sink. Never invoke it while holding the sink's lifecycle gate.
         for owner in owners {
-            self.host.cancel_child_agents(owner);
             self.host.cancel_side_questions(owner);
         }
     }
@@ -914,7 +901,6 @@ async fn dispatch(
         RuntimeActionId::SetEditorText => editor_text.handle(args),
         RuntimeActionId::GetSessionBranch => host.get_session_branch(args).await,
         RuntimeActionId::GetExecutionContext => host.get_execution_context(args).await,
-        RuntimeActionId::ChildAgent => Err("ChildAgent requires a plugin bridge".into()),
         RuntimeActionId::SideQuestion => Err("SideQuestion requires a plugin bridge".into()),
         RuntimeActionId::StdioLifecycle => {
             Err("stdio lifecycle requires a plugin context".to_owned())
@@ -1016,7 +1002,6 @@ fn run_action(
     // Synchronous callbacks inherit the actual driver's invocation, not a
     // plugin-global registration pointer. Worker threads pass its opaque ID.
     let invocation = CURRENT_INVOCATION.with(|slot| slot.borrow().clone());
-    let invocation_thread = invocation.is_some();
     let bridge = invocation.or_else(|| ActionBridge::resolve_handle(user_data as usize));
     let Some(bridge) = bridge else {
         if !out.is_null() {
@@ -1059,7 +1044,7 @@ fn run_action(
             .unwrap_or_else(|_| serde_json::Value::Object(serde_json::Map::new()))
     };
 
-    let runtime_key = args
+    let _runtime_key = args
         .as_object_mut()
         .and_then(|args| args.remove("__rpiRuntimeKey"));
 
@@ -1121,44 +1106,6 @@ fn run_action(
             });
             bridge.runtime.spawn(async move {
                 let _ = tx.send(host.side_question(owner, args, sink).await);
-            });
-        }
-    } else if action == RuntimeActionId::ChildAgent {
-        // A registration handle cannot assert that it is a parent invocation.
-        // All child-originated invocations fail closed, regardless of tool name.
-        // Cancellation stops admission, not authenticated reclamation. The
-        // plugin's cancel/destroy path must still dispose its retained handles.
-        let cleanup = matches!(
-            args.get("op").and_then(serde_json::Value::as_str),
-            Some("poll" | "cancel" | "dispose")
-        );
-        let allowed = bridge
-            .invocation
-            .as_ref()
-            .is_some_and(|(child, key, signal)| {
-                !child
-                    && (cleanup || !signal.is_cancelled())
-                    && (invocation_thread
-                        || runtime_key.as_ref().and_then(serde_json::Value::as_str)
-                            == Some(key.as_str()))
-            });
-        if !allowed {
-            let _ = tx.send(Err("ChildAgent requires a live parent tool invocation; recursive child agents are not allowed".into()));
-        } else {
-            let owner = bridge.plugin_identity.as_ref().map_or(0, |(id, _)| *id);
-            let signal = bridge
-                .invocation
-                .as_ref()
-                .expect("authorized invocation")
-                .2
-                .clone();
-            bridge.runtime.spawn(async move {
-                let result = rpi_agent::tool_execution_scope::with_invocation_signal(
-                    signal,
-                    host.child_agent(owner, args),
-                )
-                .await;
-                let _ = tx.send(result);
             });
         }
     } else if action == RuntimeActionId::SetStatus {
@@ -2079,7 +2026,6 @@ impl Drop for ActionBridge {
         }
         if let Some((owner, _)) = &self.plugin_identity {
             self.ext_status.remove_owner(*owner);
-            self.host.cancel_child_agents(*owner);
             self.host.cancel_side_questions(*owner);
         }
     }

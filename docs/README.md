@@ -13,7 +13,6 @@
 | 长会话与上下文压缩 | [上下文压缩](agent/context-compaction.md) |
 | Rust 动态库扩展与 ABI | [扩展开发](extensions/authoring.md) |
 | 启动、会话与关闭事件 | [扩展生命周期](extensions/lifecycle.md) |
-| 子 agent 配置继承、权限与生命周期 | [宿主管理的子 agent](extensions/subagents.md) |
 | 无头服务端与远程 TUI | [远程模式](remote/user-guide.md) |
 | Agent 与扩展调试 | [Rust 调试指南](debugging/rust-debugging.md) |
 | 重复思考、取消与崩溃恢复排查 | [问题复盘](debugging/llm-repetition-forensics.md)（历史证据与修复过程） |

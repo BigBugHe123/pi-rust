@@ -8,7 +8,7 @@ use futures::FutureExt;
 use rpi_agent::{AgentEmitter, AgentEvent};
 use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, UserMessage, UserRole};
 use rpi_extensions::SideQuestionSink;
-use rpi_harness::agent_harness::{AgentHarness, ChildHarness, HarnessRunOutcome};
+use rpi_harness::agent_harness::{AgentHarness, HarnessRunOutcome, SideQuestionHarness};
 use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::session::DefaultIdGenerator;
 use rpi_harness::session::types::SessionMetadata;
@@ -80,7 +80,7 @@ struct ThreadState {
 }
 struct Prepared {
     job: Arc<Job>,
-    child: ChildHarness,
+    child: SideQuestionHarness,
 }
 struct Job {
     id: String,
@@ -643,7 +643,7 @@ async fn worker(thread: Arc<Thread>, _permit: OwnedSemaphorePermit) {
         }
     }
 }
-async fn run(child: ChildHarness, job: Arc<Job>, prompt: String, timeout: Duration) {
+async fn run(child: SideQuestionHarness, job: Arc<Job>, prompt: String, timeout: Duration) {
     let lane = child.harness.lane("main");
     let run = child
         .execution_scope

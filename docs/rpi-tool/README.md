@@ -281,31 +281,17 @@ Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
 an [online catalog](https://rpi.laofu.online/packages.html).
 
-### Optional web and subagent tools
+### Optional web tools
 
 ```bash
 rpi install rpi-websearch                # websearch: titles, URLs and snippets
 rpi install rpi-webfetch                 # webfetch: readable text from public pages
-rpi install rpi-subagents                # delegate_task: host-managed child agents
 ```
 
 Restart rpi after installation. These are independent extensions, not default
 CLI tools. Web search/fetch do not provide browser clicks, login flows or page
 JavaScript execution.
 
-Subagents inherit a snapshot of the parent's current model/provider binding,
-thinking level, prompt, resources, request options, active tools, cwd and
-approval hooks. Credentials stay inside the host. Children use independent
-in-memory sessions without copying or modifying the parent history; their tool
-set can only be narrowed, and recursive delegation is rejected. Parent approvals
-remain in effect, and parent completion or cancellation stops the child. This is
-not an OS sandbox. Use compatible host and extension versions; unsupported hosts
-fail explicitly rather than starting a subprocess with different defaults.
-
-The SDK entry point is `AgentHarness::create_child`; extensions use
-`GetExecutionContext` and `ChildAgent` runtime actions. See the
-[subagent protocol](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/subagents.md)
-for lifecycle, limits and compatibility details.
 
 ### Authoring an extension
 
@@ -356,7 +342,6 @@ required and none is loaded.
 - [Architecture](docs/architecture/overview.md) — how the crates fit together and why
 - [Building an agent project](docs/agent/project-structure.md) — recommended structure
 - [Extension authoring](docs/extensions/authoring.md) — plugin templates and ABI rules
-- [Subagents](https://github.com/bigfish1913/pi-rust/blob/main/docs/extensions/subagents.md) — configuration inheritance, permissions and lifecycle
 - [Remote mode](docs/remote/user-guide.md) — protocol, tokens, limitations
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md)
 - [docs.rs](https://docs.rs/rpi-cli) for per-crate API docs
