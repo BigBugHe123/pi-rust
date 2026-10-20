@@ -11,6 +11,13 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.6.3](https://github.com/bigfish1913/pi-rust/compare/v0.6.2...v0.6.3) - 2026-10-20
+
+### Other
+
+- update README website links to rpi.bigfisharc.cn
+- *(sdk)* consolidate provider bridge into optional SDK feature
+
 ## [0.6.2](https://github.com/bigfish1913/pi-rust/compare/v0.6.1...v0.6.2) - 2026-10-19
 
 ### Fixed
