@@ -1433,7 +1433,7 @@ where
             &effective_args.skill,
             &discovered.skill_paths,
             js_paths,
-            &package_paths,
+            package_paths,
         );
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
@@ -1451,7 +1451,7 @@ where
             &effective_args.prompt_template,
             &discovered.prompt_paths,
             js_paths,
-            &package_paths,
+            package_paths,
         );
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
@@ -2499,9 +2499,9 @@ pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
 /// content (a header-only session resumes to an empty transcript). Falls back to
 /// the newest overall when every session is empty, and `None` only when the
 /// list is empty.
-fn first_resumable_session<'a>(
-    metas: &'a [rpi_harness::session::jsonl::JsonlSessionMetadata],
-) -> Option<&'a rpi_harness::session::jsonl::JsonlSessionMetadata> {
+fn first_resumable_session(
+    metas: &[rpi_harness::session::jsonl::JsonlSessionMetadata],
+) -> Option<&rpi_harness::session::jsonl::JsonlSessionMetadata> {
     metas
         .iter()
         .find(|meta| !summarize_session_file(Path::new(&meta.path)).empty)

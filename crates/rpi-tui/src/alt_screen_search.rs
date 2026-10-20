@@ -8,6 +8,7 @@ use crate::utils::visible_width;
 
 /// Search state.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct SearchState {
     /// Current search query.
     pub query: String,
@@ -19,16 +20,6 @@ pub struct SearchState {
     pub active: bool,
 }
 
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            match_index: 0,
-            matches: Vec::new(),
-            active: false,
-        }
-    }
-}
 
 /// A search match.
 #[derive(Debug, Clone, Copy)]
@@ -323,7 +314,7 @@ impl AltScreenSearch {
             }
 
             if in_ansi {
-                if c == '\x07' || (c >= '@' && c <= '~' && c != '[') {
+                if c == '\x07' || (('@'..='~').contains(&c) && c != '[') {
                     in_ansi = false;
                 }
                 continue;

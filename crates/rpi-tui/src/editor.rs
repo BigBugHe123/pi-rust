@@ -47,7 +47,7 @@ pub struct EditorOptions {
 }
 
 /// Editor state.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct EditorState {
     /// Lines of text.
     lines: Vec<String>,
@@ -79,6 +79,28 @@ impl Default for EditorState {
             focused: false,
             history: Vec::new(),
             history_index: 0,
+        }
+    }
+}
+
+/// Owned paint inputs only: submitted history must never be copied for a frame.
+#[derive(Debug, PartialEq, Eq)]
+struct EditorRenderSnapshot {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+    selection_anchor: Option<(usize, usize)>,
+    focused: bool,
+}
+
+impl From<&EditorState> for EditorRenderSnapshot {
+    fn from(state: &EditorState) -> Self {
+        Self {
+            lines: state.lines.clone(),
+            cursor_row: state.cursor_row,
+            cursor_col: state.cursor_col,
+            selection_anchor: state.selection_anchor,
+            focused: state.focused,
         }
     }
 }
@@ -213,17 +235,17 @@ fn wrap_line_ranges(line: &str, max_width: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Insert the zero-width cursor marker at a visible column without slicing
+/// Insert `insert` (zero-width or not) at a visible column without slicing
 /// through ANSI escape sequences added for selection/placeholder styling.
-fn insert_cursor_marker(text: &str, column: usize) -> String {
-    let mut out = String::with_capacity(text.len() + CURSOR_MARKER.len());
+fn insert_at_visible_column(text: &str, column: usize, insert: &str) -> String {
+    let mut out = String::with_capacity(text.len() + insert.len());
     let mut visible = 0;
     let mut chars = text.char_indices().peekable();
     let mut inserted = false;
     while let Some((idx, ch)) = chars.next() {
         if ch == '\x1b' {
             out.push(ch);
-            while let Some((_, esc)) = chars.next() {
+            for (_, esc) in chars.by_ref() {
                 out.push(esc);
                 if esc == '\x07' || ('@'..='~').contains(&esc) {
                     break;
@@ -232,7 +254,7 @@ fn insert_cursor_marker(text: &str, column: usize) -> String {
             continue;
         }
         if !inserted && visible >= column {
-            out.push_str(CURSOR_MARKER);
+            out.push_str(insert);
             inserted = true;
         }
         out.push(ch);
@@ -240,9 +262,26 @@ fn insert_cursor_marker(text: &str, column: usize) -> String {
         let _ = idx;
     }
     if !inserted {
-        out.push_str(CURSOR_MARKER);
+        out.push_str(insert);
     }
     out
+}
+
+/// Insert the zero-width cursor marker at a visible column without slicing
+/// through ANSI escape sequences added for selection/placeholder styling.
+fn insert_cursor_marker(text: &str, column: usize) -> String {
+    insert_at_visible_column(text, column, CURSOR_MARKER)
+}
+
+/// A static, one-cell reverse-video caret block. Drawn instead of the
+/// hardware-cursor marker while the working indicator animates: the terminal
+/// cursor stays hidden (so it cannot blink in sync with the spinner), but the
+/// insertion point remains visible for typing.
+const STATIC_CARET: &str = "\x1b[7m \x1b[27m";
+
+/// Insert the static caret block at a visible column (see [`STATIC_CARET`]).
+fn insert_static_caret(text: &str, column: usize) -> String {
+    insert_at_visible_column(text, column, STATIC_CARET)
 }
 
 /// Editor - A multi-line text editor component.
@@ -561,6 +600,14 @@ impl Editor {
         }
     }
 
+    /// Copy only paint inputs and release the state mutex before rendering.
+    fn render_snapshot(&self) -> EditorRenderSnapshot {
+        self.state
+            .lock()
+            .map(|state| EditorRenderSnapshot::from(&*state))
+            .unwrap_or_else(|_| EditorRenderSnapshot::from(&EditorState::default()))
+    }
+
     /// Snapshot the current text + caret state (for undo/redo), including the
     /// folded-paste store so undo can bring a dropped paste back.
     fn snapshot_state(&self) -> EditorSnapshot {
@@ -715,7 +762,11 @@ impl Editor {
 
     /// The selection span on `row`, as `(start_col, end_col)` byte offsets,
     /// for render-time highlighting. `None` when the row is outside the span.
-    fn selection_span_on_row(&self, state: &EditorState, row: usize) -> Option<(usize, usize)> {
+    fn selection_span_on_row(
+        &self,
+        state: &EditorRenderSnapshot,
+        row: usize,
+    ) -> Option<(usize, usize)> {
         let (ar, ac) = state.selection_anchor?;
         let (br, bc) = (state.cursor_row, state.cursor_col);
         let (sr, sc, er, ec) = if (ar, ac) <= (br, bc) {
@@ -1389,8 +1440,20 @@ impl Editor {
 
 impl Component for Editor {
     fn render(&self, width: usize) -> Vec<String> {
-        let state = self.state.lock().map(|s| s.clone()).unwrap_or_default();
+        let state = self.render_snapshot();
         let mut content_lines = Vec::new();
+
+        // While a working indicator is embedded in the top border (the model is
+        // running), do NOT emit the hardware-cursor marker. The renderer treats
+        // a missing marker as "hide the terminal cursor"; emitting it while
+        // working made the visible caret be dragged to the animated spinner char
+        // and back to the prompt 12.5x/second, so it blinked in time with the
+        // spinner. Instead the caret is drawn as a static one-cell reverse-video
+        // block (see `STATIC_CARET`), mirroring upstream, so the insertion point
+        // stays visible for typing while the hardware cursor is left alone. The
+        // block occupies the cell already reserved by `right_pad_cursor`, i.e. no
+        // layout shift on toggle.
+        let working = self.working.lock().ok().is_some_and(|g| g.is_some());
 
         let pad = " ".repeat(self.options.padding_x);
         // `prompt` is no longer rendered (mirrors the TS editor, which draws a
@@ -1477,7 +1540,11 @@ impl Component for Editor {
                             .to_string()
                             .as_str(),
                     );
-                    rendered = insert_cursor_marker(&rendered, self.options.padding_x + cursor_col);
+                    rendered = if working {
+                        insert_static_caret(&rendered, self.options.padding_x + cursor_col)
+                    } else {
+                        insert_cursor_marker(&rendered, self.options.padding_x + cursor_col)
+                    };
                 }
 
                 content_lines.push(rendered);
@@ -1535,7 +1602,7 @@ impl Component for Editor {
             let plain = format!(" {} {} {} ", spinner_char, working.message, elapsed_str);
             let indicator_width = crate::ansi::visible_width(&plain);
 
-            if width >= indicator_width + 1 {
+            if width > indicator_width {
                 let colored = format!(
                     " {} {} {} ",
                     colors.accent.fg(&spinner_char.to_string()),
@@ -1593,6 +1660,84 @@ impl Focusable for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_snapshot_is_independent_of_submitted_history() {
+        let editor = Editor::simple();
+        editor.set_text("读 draft\nsecond line");
+        editor.set_focused(true);
+        editor.set_cursor(0, 3);
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::SHIFT,
+        ));
+        let snapshot = editor.render_snapshot();
+        let rendered = editor.render(12);
+        assert!(rendered.iter().any(|line| line.contains("\x1b[7m")));
+        assert!(rendered.iter().any(|line| line.contains(CURSOR_MARKER)));
+
+        // Grow retained history to 16 MiB without changing any paint input.
+        // Comparing the entire snapshot is deterministic, not a timing gate.
+        {
+            let mut state = editor.state.lock().unwrap();
+            state.history = vec!["h".repeat(4096); 4096];
+            state.history_index = state.history.len();
+        }
+        for width in [12, 40] {
+            let before = editor.render_snapshot();
+            let _ = editor.render(width);
+            assert_eq!(before, snapshot);
+            assert_eq!(editor.render_snapshot(), snapshot);
+        }
+        assert_eq!(editor.render(12), rendered);
+        {
+            let state = editor.state.try_lock().expect("snapshot releases mutex");
+            assert_eq!(state.history.len(), 4096);
+            assert_eq!(state.history_index, 4096);
+            assert!(state
+                .history
+                .iter()
+                .all(|entry| entry.len() == 4096 && entry.bytes().all(|byte| byte == b'h')));
+        }
+
+        // The snapshot owns its draft, independently of later editor changes.
+        editor.set_text("changed");
+        assert_eq!(snapshot.lines, ["读 draft", "second line"]);
+        assert_eq!((snapshot.cursor_row, snapshot.cursor_col), (1, 3));
+        assert_eq!(snapshot.selection_anchor, Some((0, 3)));
+        assert!(snapshot.focused);
+    }
+
+    #[test]
+    fn rendering_retains_submissions_and_draft_navigation() {
+        let editor = Editor::simple();
+        for prompt in ["first submitted prompt", "second submitted prompt"] {
+            editor.set_text(prompt);
+            editor.submit();
+            let _ = editor.render(20);
+        }
+        editor.set_text("first line\nsecond line");
+        editor.set_cursor(1, 4);
+        let _ = editor.render(10);
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Up,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(editor.cursor_position(), (0, 4));
+        let _ = editor.render(40);
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Down,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(editor.cursor_position(), (1, 4));
+        assert_eq!(editor.get_text(), "first line\nsecond line");
+        let state = editor.state.lock().unwrap();
+        assert_eq!(
+            state.history,
+            ["first submitted prompt", "second submitted prompt"]
+        );
+        assert_eq!(state.history_index, 2);
+    }
 
     #[test]
     fn working_spinner_advances_per_render_not_per_timer() {
@@ -1701,6 +1846,73 @@ mod tests {
         let before = editor.working().expect("working").frame;
         let _ = editor.render(60);
         assert_eq!(editor.working().expect("working").frame, before + 1);
+    }
+
+    #[test]
+    fn no_hardware_cursor_marker_while_working() {
+        // Regression: while the working spinner animates in the editor's top
+        // border, a focused editor must NOT emit the hardware-cursor marker.
+        // The renderer treats a missing marker as "hide the terminal cursor";
+        // emitting it made the visible caret get dragged to the animated
+        // spinner char and back to the prompt on every 80ms repaint, so it
+        // blinked in time with the spinner. With the marker dropped the cursor
+        // stays hidden the whole working period (a `\e[?25l` no-op once hidden)
+        // and re-appears when the model finishes (`set_working(None)`). The
+        // insertion point is still visible as a static one-cell reverse-video
+        // caret block (`STATIC_CARET`), so typing during a run keeps its caret.
+        use crate::component::Component;
+        let editor = Editor::simple();
+        editor.set_focused(true);
+        editor.insert("echo hi");
+
+        // Idle + focused: the caret marker is present so IME typing positions
+        // the candidate window, and no static block is drawn on top of it.
+        let idle = editor.render(20);
+        assert!(
+            idle.iter().any(|line| line.contains(CURSOR_MARKER)),
+            "focused idle editor should emit the cursor marker"
+        );
+        assert!(
+            !idle.iter().any(|line| line.contains(STATIC_CARET)),
+            "focused idle editor must not draw the static caret block"
+        );
+
+        // Working: the marker must disappear — so the renderer hides the
+        // hardware cursor instead of re-anchoring it to the caret every frame
+        // — and the static caret block takes its place.
+        editor.set_working(Some(WorkingState {
+            frame: 0,
+            started_at: std::time::Instant::now(),
+            message: "Working…".to_string(),
+        }));
+        let working = editor.render(20);
+        assert!(
+            !working.iter().any(|line| line.contains(CURSOR_MARKER)),
+            "working editor must not emit the cursor marker"
+        );
+        assert!(
+            working.iter().any(|line| line.contains(STATIC_CARET)),
+            "working editor must draw the static caret block"
+        );
+        assert!(
+            !editor
+                .render(20)
+                .iter()
+                .any(|line| line.contains(CURSOR_MARKER)),
+            "the marker must stay gone across successive working frames"
+        );
+
+        // Back to idle: the marker returns and the block is gone.
+        editor.set_working(None);
+        let idle_again = editor.render(20);
+        assert!(
+            idle_again.iter().any(|line| line.contains(CURSOR_MARKER)),
+            "idle editor should emit the cursor marker again"
+        );
+        assert!(
+            !idle_again.iter().any(|line| line.contains(STATIC_CARET)),
+            "idle editor must not draw the static caret block"
+        );
     }
 
     #[test]

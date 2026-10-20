@@ -542,11 +542,10 @@ fn find_line_comment(line: &str) -> Option<usize> {
         match ch {
             '\\' if in_str => esc = true,
             '"' => in_str = !in_str,
-            '/' if !in_str => {
-                if line.as_bytes().get(i + 1) == Some(&b'/') {
+            '/' if !in_str
+                && line.as_bytes().get(i + 1) == Some(&b'/') => {
                     return Some(i);
                 }
-            }
             _ => {}
         }
     }
@@ -740,9 +739,9 @@ fn resolve_template(
     for part in parts {
         match part {
             TemplatePart::Literal(s) => out.push_str(&s),
-            TemplatePart::Env(name) => match env_lookup(&name, env_overlay) {
-                Some(v) => out.push_str(&v),
-                None => return None,
+            TemplatePart::Env(name) => {
+                let v = env_lookup(&name, env_overlay)?;
+                out.push_str(&v)
             },
         }
     }

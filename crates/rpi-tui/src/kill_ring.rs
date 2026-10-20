@@ -12,6 +12,7 @@ const MAX_KILL_RING_SIZE: usize = 64;
 
 /// Options for pushing to the kill ring.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub struct PushOptions {
     /// Whether to prepend to the current entry (for backward kills).
     pub prepend: bool,
@@ -19,14 +20,6 @@ pub struct PushOptions {
     pub accumulate: bool,
 }
 
-impl Default for PushOptions {
-    fn default() -> Self {
-        Self {
-            prepend: false,
-            accumulate: false,
-        }
-    }
-}
 
 /// Kill ring for storing killed (deleted) text.
 #[derive(Debug, Clone)]
