@@ -2426,21 +2426,12 @@ name = "rpi-plugin-sdk"
 version = "0.6.2"
 dependencies = [
  "libc",
- "serde_json",
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "rpi-provider-runtime"
-version = "0.6.2"
-dependencies = [
  "reqwest",
  "rpi-ai",
- "rpi-plugin-sdk",
  "serde",
  "serde_json",
  "tokio",
- "tokio-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
