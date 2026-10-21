@@ -55,23 +55,28 @@ impl Provider for Fixture {
         tokio::spawn(async move {
             prod.push(AssistantMessageEvent::Start {
                 partial: Arc::new(message.clone()),
-            });
+            })
+            .await;
             message.content.push(Content::text(""));
             prod.push(AssistantMessageEvent::TextStart {
                 content_index: 0,
                 partial: Arc::new(message.clone()),
-            });
+            })
+            .await;
             for start in (0..bytes).step_by(chunk) {
                 let delta = "x".repeat(chunk.min(bytes - start));
                 let Content::Text(text) = &mut message.content[0] else {
                     unreachable!()
                 };
                 text.text.push_str(&delta);
-                if !prod.push(AssistantMessageEvent::TextDelta {
-                    content_index: 0,
-                    delta,
-                    partial: Arc::new(message.clone()),
-                }) {
+                if !prod
+                    .push(AssistantMessageEvent::TextDelta {
+                        content_index: 0,
+                        delta,
+                        partial: Arc::new(message.clone()),
+                    })
+                    .await
+                {
                     return;
                 }
             }
@@ -79,12 +84,14 @@ impl Provider for Fixture {
                 content_index: 0,
                 content: "x".repeat(bytes),
                 partial: Arc::new(message.clone()),
-            });
+            })
+            .await;
             message.stop_reason = rpi_ai::StopReason::Stop;
             prod.push(AssistantMessageEvent::Done {
                 reason: rpi_ai::DoneReason::Stop,
                 message,
-            });
+            })
+            .await;
         });
         stream
     }
@@ -234,7 +241,7 @@ fn offline_provider_pipeline() {
     let allocated_bytes = BYTES.load(Ordering::Relaxed) - before_bytes;
     let peak = PEAK.load(Ordering::Relaxed);
     let wire = WIRE.load(Ordering::Relaxed);
-    let queue: Option<(usize, usize)> = None;
+    let queue = Some(super::queue::peak_occupancy());
     let queue = serde_json::to_string(&queue).unwrap();
     println!("RPI_BENCH {{\"bytes\":{bytes},\"chunk\":{chunk},\"streams\":{concurrency},\"delay_ms\":{delay},\"result_only\":{result_only},\"sdk_only\":{sdk_only},\"elapsed_s\":{elapsed},\"allocations\":{allocations},\"allocated_bytes\":{allocated_bytes},\"peak_live_bytes\":{peak},\"wire_bytes\":{wire},\"bridge_peak_count_bytes\":{queue}}}");
 }
