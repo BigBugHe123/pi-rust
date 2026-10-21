@@ -617,12 +617,19 @@ fn reasoning_counts_toward_max_tokens(model: &Model) -> bool {
 /// the request reserves the level's reasoning budget on top of the answer
 /// allowance, which is the same shape Anthropic gets from
 /// `adjust_max_tokens_for_thinking`.
+///
+/// A caller-pinned `opts.max_tokens` is sent verbatim: whoever computed it owns
+/// the reasoning headroom, so this rule never stacks a second time.
 fn resolve_max_tokens(model: &Model, opts: &SimpleStreamOptions) -> u64 {
-    let base = opts.max_tokens.unwrap_or(model.max_tokens);
-    if !reasoning_counts_toward_max_tokens(model) {
-        return base;
-    }
-    base.saturating_add(thinking_budget(opts))
+    let Some(pinned) = opts.max_tokens else {
+        let base = model.max_tokens;
+        return if reasoning_counts_toward_max_tokens(model) {
+            base.saturating_add(thinking_budget(opts))
+        } else {
+            base
+        };
+    };
+    pinned
 }
 
 fn max_tokens_field(model: &Model) -> &'static str {
@@ -1456,13 +1463,13 @@ mod tests {
         let body = build_request(&model, &context, &off);
         assert_eq!(body["max_completion_tokens"], 1024);
 
-        // A caller-pinned ceiling still gets the headroom: it pins the answer
-        // allowance, not the reasoning spend.
+        // A caller-pinned ceiling is sent verbatim: it already carries whatever
+        // reasoning headroom its owner wanted.
         let mut pinned = SimpleStreamOptions::default();
         pinned.reasoning = Some(ThinkingLevel::Low);
         pinned.max_tokens = Some(4096);
         let body = build_request(&model, &context, &pinned);
-        assert_eq!(body["max_completion_tokens"], 4096 + 2048);
+        assert_eq!(body["max_completion_tokens"], 4096);
 
         // Custom per-level budgets are honoured.
         let mut custom = SimpleStreamOptions::default();
