@@ -11,6 +11,19 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.8.0](https://github.com/bigfish1913/pi-rust/compare/v0.7.1...v0.8.0) - 2026-10-22
+
+### Fixed
+
+- *(cli)* say why a response stopped when the provider hit max_tokens
+- *(ai)* never stack the reasoning headroom on a caller-pinned maxTokens
+- *(ai)* reserve reasoning headroom when a gateway shares the completion budget
+
+### Other
+
+- compact exactly reconstructible provider text deltas
+- use the current stream API in compaction fixtures
+
 ## [0.7.1](https://github.com/bigfish1913/pi-rust/compare/v0.7.0...v0.7.1) - 2026-10-21
 
 ### Fixed
