@@ -63,6 +63,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 base64 = "0.22"
 png = "0.18"
 ciborium = "0.2"
+rkyv = { version = "0.7.45", default-features = false, features = ["std", "size_32", "archive_le", "strict", "validation"] }
 tempfile = "3"
 regex = "1"
 semver = "1"

@@ -21,6 +21,7 @@ categories = ["api-bindings", "development-tools::ffi"]
 serde_json = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 ciborium = { workspace = true, optional = true }
+rkyv = { workspace = true, optional = true }
 
 # Provider authoring helpers are opt-in; the ABI core stays independent of rpi-ai.
 rpi-ai = { workspace = true, optional = true, features = ["providers"] }
@@ -43,6 +44,17 @@ json = ["dep:serde_json"]
 # Compact, length-bounded binary payloads for high-frequency extension data.
 # This is additive: JSON remains the default wire format and fallback.
 binary = ["json", "dep:serde", "dep:ciborium"]
+# Zero-copy archived payloads for trusted, schema-stable hot paths. The
+# validated view borrows directly from the aligned archive buffer.
+zero-copy = ["dep:rkyv"]
 provider = ["json", "dep:rpi-ai", "dep:tokio", "dep:serde", "dep:reqwest"]
 process = ["dep:windows-sys", "dep:libc"]
 stdio = ["dep:windows-sys", "dep:libc"]
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "zero_copy"
+harness = false
+required-features = ["zero-copy"]
