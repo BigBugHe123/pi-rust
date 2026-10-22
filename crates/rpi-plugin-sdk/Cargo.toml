@@ -53,8 +53,10 @@ stdio = ["dep:windows-sys", "dep:libc"]
 
 [dev-dependencies]
 criterion = "0.5"
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [[bench]]
 name = "zero_copy"
 harness = false
-required-features = ["zero-copy"]
+required-features = ["zero-copy", "binary"]

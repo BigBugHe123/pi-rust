@@ -1,8 +1,10 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use rkyv::{Archive, Serialize};
+use rkyv::{Archive, Serialize as RkyvSerialize};
+use rpi_plugin_sdk::binary::{self, BinaryOptions};
 use rpi_plugin_sdk::zero_copy::{self, ZeroCopyOptions};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Archive, Serialize)]
+#[derive(Debug, Clone, Archive, RkyvSerialize, Serialize, Deserialize)]
 #[archive(check_bytes)]
 struct ZeroCopyPayload {
     request_id: String,
@@ -23,18 +25,42 @@ fn sample() -> ZeroCopyPayload {
 }
 
 fn bench_zero_copy(c: &mut Criterion) {
-    let options = ZeroCopyOptions::default();
+    let binary_options = BinaryOptions::default();
+    let zero_copy_options = ZeroCopyOptions::default();
     let value = sample();
-    let bytes = zero_copy::encode(&value, &options).unwrap();
-    eprintln!("zero-copy archive size: {} bytes", bytes.len());
+    let json_bytes = serde_json::to_vec(&value).unwrap();
+    let binary_bytes = binary::encode(&value, &binary_options).unwrap();
+    let zero_copy_bytes = zero_copy::encode(&value, &zero_copy_options).unwrap();
+    eprintln!(
+        "payload sizes: json={} bytes, cbor={} bytes, zero-copy={} bytes",
+        json_bytes.len(),
+        binary_bytes.len(),
+        zero_copy_bytes.len()
+    );
 
-    let mut group = c.benchmark_group("zero_copy");
-    group.bench_function("encode", |b| {
-        b.iter(|| zero_copy::encode(black_box(&value), &options).unwrap())
+    let mut group = c.benchmark_group("serialization_comparison");
+    group.bench_function("json_encode", |b| {
+        b.iter(|| serde_json::to_vec(black_box(&value)).unwrap())
     });
-    group.bench_function("validate_and_read", |b| {
+    group.bench_function("cbor_encode", |b| {
+        b.iter(|| binary::encode(black_box(&value), &binary_options).unwrap())
+    });
+    group.bench_function("zero_copy_encode", |b| {
+        b.iter(|| zero_copy::encode(black_box(&value), &zero_copy_options).unwrap())
+    });
+    group.bench_function("json_decode", |b| {
+        b.iter(|| serde_json::from_slice::<ZeroCopyPayload>(black_box(&json_bytes)).unwrap())
+    });
+    group.bench_function("cbor_decode", |b| {
         b.iter(|| {
-            let archived = zero_copy::view::<ZeroCopyPayload>(black_box(&bytes), &options).unwrap();
+            binary::decode::<ZeroCopyPayload>(black_box(&binary_bytes), &binary_options).unwrap()
+        })
+    });
+    group.bench_function("zero_copy_validate_and_read", |b| {
+        b.iter(|| {
+            let archived =
+                zero_copy::view::<ZeroCopyPayload>(black_box(&zero_copy_bytes), &zero_copy_options)
+                    .unwrap();
             black_box((
                 archived.bytes,
                 archived.flags.len(),
@@ -42,8 +68,9 @@ fn bench_zero_copy(c: &mut Criterion) {
             ))
         })
     });
-    group.bench_function("read_validated_archive", |b| {
-        let archived = zero_copy::view::<ZeroCopyPayload>(&bytes, &options).unwrap();
+    let archived =
+        zero_copy::view::<ZeroCopyPayload>(&zero_copy_bytes, &zero_copy_options).unwrap();
+    group.bench_function("zero_copy_read_validated", |b| {
         b.iter(|| {
             black_box((
                 archived.bytes,
