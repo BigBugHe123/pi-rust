@@ -2660,6 +2660,15 @@ fn assistant_error_text_keeps_terminal_provider_diagnostic_visible() {
         assistant_error_text(&aborted).as_deref(),
         Some("Request aborted.")
     );
+
+    // A truncated turn keeps its text but still needs a visible reason: without
+    // one the transcript looks like the message was interrupted.
+    let mut truncated = aborted;
+    truncated.stop_reason = StopReason::Length;
+    truncated.content = vec![rpi_ai::types::Content::text("half an answer")];
+    let note = assistant_error_text(&truncated).expect("length must be surfaced");
+    assert!(note.contains("truncated"), "{note}");
+    assert!(note.contains("max_tokens"), "{note}");
 }
 
 #[test]
