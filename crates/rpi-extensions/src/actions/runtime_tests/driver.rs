@@ -24,6 +24,14 @@ pub(super) extern "C" fn consume_execute(
     std::ptr::dangling_mut()
 }
 pub(super) extern "C" fn noop(_: StepHandle) {}
+extern "C" fn slow_set_waker(
+    _: StepHandle,
+    cb: Option<rpi_plugin_sdk::ToolWakeCb>,
+    _: *mut c_void,
+) {
+    gate(if cb.is_some() { 3 } else { 4 });
+}
+
 static PHASE: AtomicUsize = AtomicUsize::new(0);
 static ENTERED: AtomicBool = AtomicBool::new(false);
 static RELEASE: AtomicBool = AtomicBool::new(false);
@@ -60,7 +68,10 @@ extern "C" fn slow_destroy(_: StepHandle) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dropped_future_retains_owned_id_library_and_cleanup_until_every_foreign_phase_returns() {
-    for phase in 0..3 {
+    for (wake, phase) in (0..3)
+        .map(|phase| (false, phase))
+        .chain((0..5).map(|phase| (true, phase)))
+    {
         PHASE.store(phase, Ordering::SeqCst);
         ENTERED.store(false, Ordering::SeqCst);
         RELEASE.store(false, Ordering::SeqCst);
@@ -71,6 +82,7 @@ async fn dropped_future_retains_owned_id_library_and_cleanup_until_every_foreign
             schema(),
             PluginToolHandle {
                 execute_fn: slow_execute,
+                set_waker_fn: if wake { Some(slow_set_waker) } else { None },
                 poll_fn: slow_poll,
                 cancel_fn: noop,
                 destroy_fn: slow_destroy,
