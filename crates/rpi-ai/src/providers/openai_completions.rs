@@ -409,7 +409,7 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
     if supports_streaming_usage(model) {
         body.insert("stream_options".into(), json!({ "include_usage": true }));
     }
-    let max_tokens = opts.max_tokens.unwrap_or(model.max_tokens);
+    let max_tokens = resolve_max_tokens(model, opts);
     if max_tokens > 0 {
         body.insert(max_tokens_field(model).into(), Value::from(max_tokens));
     }
@@ -578,6 +578,58 @@ fn requires_thinking_as_text(model: &Model) -> bool {
     compat(model)
         .and_then(|compat| compat.requires_thinking_as_text)
         .unwrap_or(false)
+}
+
+/// The reasoning budget a request with the active thinking level should leave
+/// room for, in tokens. `0` when thinking is off.
+fn thinking_budget(opts: &SimpleStreamOptions) -> u64 {
+    let level = crate::providers::anthropic::build_params::clamp_reasoning(opts.reasoning_level());
+    if level == ThinkingLevel::Off {
+        return 0;
+    }
+    let defaults = crate::providers::anthropic::build_params::default_thinking_budgets();
+    let budgets = opts.thinking_budgets.unwrap_or(defaults);
+    match level {
+        ThinkingLevel::Minimal => budgets.minimal.or(defaults.minimal),
+        ThinkingLevel::Low => budgets.low.or(defaults.low),
+        ThinkingLevel::Medium => budgets.medium.or(defaults.medium),
+        _ => budgets.high.or(defaults.high),
+    }
+    .unwrap_or(0)
+}
+
+/// Whether this model's `max_tokens` covers hidden reasoning tokens too.
+fn reasoning_counts_toward_max_tokens(model: &Model) -> bool {
+    model.reasoning
+        && compat(model)
+            .and_then(|compat| compat.reasoning_counts_toward_max_tokens)
+            .unwrap_or(false)
+}
+
+/// Resolve the `max_tokens` / `max_completion_tokens` value for one request.
+///
+/// `Model::max_tokens` describes the visible *answer* allowance. Gateways that
+/// bill hidden reasoning tokens inside that same budget (DeepSeek's reasoning
+/// models, and relays that copy them) would otherwise spend it on the chain of
+/// thought: the stream ends with `finish_reason: "length"` and an empty or
+/// clipped answer, indistinguishable from an interrupted message. For models
+/// that declare [`reasoning_counts_toward_max_tokens`](crate::model::OpenaiCompletionsCompat::reasoning_counts_toward_max_tokens)
+/// the request reserves the level's reasoning budget on top of the answer
+/// allowance, which is the same shape Anthropic gets from
+/// `adjust_max_tokens_for_thinking`.
+///
+/// A caller-pinned `opts.max_tokens` is sent verbatim: whoever computed it owns
+/// the reasoning headroom, so this rule never stacks a second time.
+fn resolve_max_tokens(model: &Model, opts: &SimpleStreamOptions) -> u64 {
+    let Some(pinned) = opts.max_tokens else {
+        let base = model.max_tokens;
+        return if reasoning_counts_toward_max_tokens(model) {
+            base.saturating_add(thinking_budget(opts))
+        } else {
+            base
+        };
+    };
+    pinned
 }
 
 fn max_tokens_field(model: &Model) -> &'static str {
@@ -1383,6 +1435,73 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "xhigh");
         assert_eq!(body["max_completion_tokens"], 1024);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn reasoning_that_shares_the_completion_budget_reserves_answer_room() {
+        // DeepSeek's reasoning models bill the chain of thought inside
+        // `max_tokens`. Sending only the answer allowance made long thinking
+        // sessions end with `finish_reason: "length"` and no visible text, so
+        // the level's reasoning budget is added on top when the model opts in.
+        let mut model = model();
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            OpenaiCompletionsCompat {
+                reasoning_counts_toward_max_tokens: Some(true),
+                ..Default::default()
+            },
+        ));
+        let context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+
+        let mut opts = SimpleStreamOptions::default();
+        opts.reasoning = Some(ThinkingLevel::High);
+        let body = build_request(&model, &context, &opts);
+        assert_eq!(body["max_completion_tokens"], 1024 + 16_384);
+
+        // Thinking off keeps the plain answer allowance.
+        let mut off = SimpleStreamOptions::default();
+        off.reasoning = Some(ThinkingLevel::Off);
+        let body = build_request(&model, &context, &off);
+        assert_eq!(body["max_completion_tokens"], 1024);
+
+        // A caller-pinned ceiling is sent verbatim: it already carries whatever
+        // reasoning headroom its owner wanted.
+        let mut pinned = SimpleStreamOptions::default();
+        pinned.reasoning = Some(ThinkingLevel::Low);
+        pinned.max_tokens = Some(4096);
+        let body = build_request(&model, &context, &pinned);
+        assert_eq!(body["max_completion_tokens"], 4096);
+
+        // Custom per-level budgets are honoured.
+        let mut custom = SimpleStreamOptions::default();
+        custom.reasoning = Some(ThinkingLevel::High);
+        custom.thinking_budgets = Some(crate::types::ThinkingBudgets {
+            high: Some(24_000),
+            ..Default::default()
+        });
+        let body = build_request(&model, &context, &custom);
+        assert_eq!(body["max_completion_tokens"], 1024 + 24_000);
+    }
+
+    #[test]
+    fn models_without_the_shared_budget_flag_keep_their_ceiling() {
+        // The compat flag is opt-in: every other gateway keeps sending exactly
+        // the configured cap, even with thinking enabled.
+        let mut model = model();
+        assert!(model.compat.is_none());
+        let context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
+        let mut opts = SimpleStreamOptions::default();
+        opts.reasoning = Some(ThinkingLevel::High);
+        let body = build_request(&model, &context, &opts);
+        assert_eq!(body["max_completion_tokens"], 1024);
+
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            OpenaiCompletionsCompat {
+                reasoning_counts_toward_max_tokens: Some(false),
+                ..Default::default()
+            },
+        ));
+        let body = build_request(&model, &context, &opts);
+        assert_eq!(body["max_completion_tokens"], 1024);
     }
 
     #[test]
