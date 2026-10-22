@@ -503,16 +503,18 @@ async fn run_inner() -> i32 {
                     // `rpi --connect` talks to. The extension `UiDialog`
                     // mailbox is bridged over the same channel so a permission
                     // gate can ask the client mid-run.
+                    // Release the extension session lock before the RPC loop awaits.
+                    // ToolCall hooks need the same lock to dispatch approvals.
+                    let oauth_snapshot = {
+                        let session = reload_context.extension_session.lock().unwrap();
+                        session.snapshot_arc()
+                    };
                     crate::modes::rpc(
                         &harness,
                         Some(event_rx),
                         model_catalog,
                         reload_context.ui_dialog.clone(),
-                        reload_context
-                            .extension_session
-                            .lock()
-                            .unwrap()
-                            .snapshot_arc(),
+                        oauth_snapshot,
                     )
                     .await
                 };
