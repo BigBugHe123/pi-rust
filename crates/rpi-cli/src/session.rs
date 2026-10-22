@@ -189,9 +189,13 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     }
 }
 
-/// The default session directory is `<cwd>/.rpi/sessions`.
+/// The default session directory is `<cwd>/.rpi/sessions`, unless
+/// `RPI_CODING_AGENT_SESSION_DIR` is set (in which case its value is used).
 pub fn default_session_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".rpi").join("sessions")
+    std::env::var("RPI_CODING_AGENT_SESSION_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| cwd.join(".rpi").join("sessions"))
 }
 
 /// Extensions are loaded exactly once before model resolution. Their action
@@ -3925,6 +3929,16 @@ mod tests {
         assert_eq!(default_session_dir(cwd), cwd.join(".rpi/sessions"));
         std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
         assert_eq!(default_session_dir(cwd), cwd.join(".rpi/sessions"));
+    }
+
+    #[test]
+    fn default_session_dir_uses_env_var() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        let custom = tmp.path().join("custom_sessions");
+        std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", custom.to_str().unwrap());
+        assert_eq!(default_session_dir(cwd), custom);
+        std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
