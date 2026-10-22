@@ -80,8 +80,6 @@ pub mod process;
 pub mod provider;
 #[cfg(feature = "stdio")]
 pub mod stdio;
-#[cfg(feature = "zero-copy")]
-pub mod zero_copy;
 
 // ---------------------------------------------------------------------------
 // StbString — owned UTF-8 crossing as ptr+len with an explicit free
