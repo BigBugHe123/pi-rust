@@ -782,6 +782,11 @@ pub async fn build_prepared(
         ),
         stream_options: AgentHarnessStreamOptions {
             timeout: args.timeout,
+            stream_idle_timeout: args.stream_idle_timeout.or_else(|| {
+                saved_settings
+                    .stream_idle_timeout
+                    .map(std::time::Duration::from_secs)
+            }),
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,

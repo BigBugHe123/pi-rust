@@ -1195,7 +1195,8 @@ async fn run_stream(
             return;
         }
     };
-    let mut events = SseEventStream::new(response, opts.signal.clone());
+    let mut events = SseEventStream::new(response, opts.signal.clone())
+        .with_idle_timeout(opts.stream_idle_timeout());
     let mut state =
         ResponsesStreamState::with_tools(&ctx.tools, supports_openai_grammar_tools(model));
     // The stream contract exposes a pending assistant message immediately after

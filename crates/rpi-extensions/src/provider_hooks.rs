@@ -169,6 +169,7 @@ impl ProviderHooks for ExtensionProviderHooks {
             "pricingAvailable": model.has_pricing(),
             "apiKey": opts.api_key,
             "timeoutMs": opts.timeout.map(|d| d.as_millis() as u64),
+            "streamIdleTimeoutMs": opts.stream_idle_timeout.map(|d| d.as_millis() as u64),
             "headers": opts.headers,
             "metadata": opts.metadata,
             "maxTokens": opts.max_tokens,

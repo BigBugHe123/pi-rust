@@ -193,6 +193,8 @@ pub struct SseEventStream {
     buffer: String,
     utf8_buffer: Vec<u8>,
     signal: CancellationToken,
+    idle_timeout: Option<std::time::Duration>,
+    last_bytes_at: tokio::time::Instant,
     done: bool,
 }
 
@@ -204,8 +206,17 @@ impl SseEventStream {
             buffer: String::new(),
             utf8_buffer: Vec::new(),
             signal,
+            idle_timeout: Some(crate::provider::DEFAULT_STREAM_IDLE_TIMEOUT),
+            last_bytes_at: tokio::time::Instant::now(),
             done: false,
         }
+    }
+
+    /// Set the maximum silence between body chunks. `None` or zero disables
+    /// the watchdog. SSE comments and partial frames count as activity.
+    pub fn with_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
+        self.idle_timeout = timeout.filter(|value| !value.is_zero());
+        self
     }
 
     /// Pull the next SSE event, or `Ok(None)` when the body is exhausted (after
@@ -263,6 +274,17 @@ impl SseEventStream {
                     });
                 }
                 next = self.bytes_stream.next() => next,
+                _ = async {
+                    match self.idle_timeout.and_then(|timeout| self.last_bytes_at.checked_add(timeout)) {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    return Err(AiError::Http {
+                        status: Some(408),
+                        message: "stream idle timeout: no response bytes received; retry the request or increase --stream-idle-timeout".into(),
+                    });
+                }
             };
 
             match next {
@@ -299,6 +321,9 @@ impl SseEventStream {
                     });
                 }
                 Some(Ok(chunk)) => {
+                    if !chunk.is_empty() {
+                        self.last_bytes_at = tokio::time::Instant::now();
+                    }
                     append_utf8_chunk(&mut self.buffer, &mut self.utf8_buffer, &chunk);
                 }
             }
@@ -432,6 +457,90 @@ pub async fn iterate_anthropic_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn idle_test_stream() -> (tokio::sync::mpsc::Sender<Bytes>, SseEventStream) {
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Bytes>(8);
+        let chunks = futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver.recv().await.map(|chunk| (Ok(chunk), receiver))
+        })
+        .boxed();
+        let stream = SseEventStream {
+            bytes_stream: chunks,
+            state: SseDecoderState::new(),
+            buffer: String::new(),
+            utf8_buffer: Vec::new(),
+            signal: CancellationToken::new(),
+            idle_timeout: Some(std::time::Duration::from_secs(5)),
+            last_bytes_at: tokio::time::Instant::now(),
+            done: false,
+        };
+        (sender, stream)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_interrupts_a_stream_stalled_mid_response() {
+        let (sender, mut stream) = idle_test_stream();
+        sender
+            .send(Bytes::from_static(b"data: first\n\n"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "first");
+        // A partial frame is also network activity, but cannot mask a later stall.
+        sender
+            .send(Bytes::from_static(b"data: partial"))
+            .await
+            .unwrap();
+        let start = tokio::time::Instant::now();
+        let error = stream.next_event().await.unwrap_err();
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(5));
+        assert!(error.to_string().contains("stream idle timeout"));
+        assert!(error.is_retryable());
+        assert!(!error.is_abort());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_resets_on_comments_and_partial_frames() {
+        let (sender, mut stream) = idle_test_stream();
+        let writer = tokio::spawn(async move {
+            for chunk in [": keepalive\n\n", "data: ", "still ", "working\n\n"] {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                sender.send(Bytes::from(chunk)).await.unwrap();
+            }
+        });
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            stream.next_event().await.unwrap().unwrap().data,
+            "still working"
+        );
+        assert_eq!(start.elapsed(), std::time::Duration::from_secs(12));
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disabled_idle_timeout_allows_long_silence() {
+        let (sender, stream) = idle_test_stream();
+        let mut stream = stream.with_idle_timeout(Some(std::time::Duration::ZERO));
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            sender
+                .send(Bytes::from_static(b"data: late\n\n"))
+                .await
+                .unwrap();
+        });
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "late");
+        writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_an_expired_idle_deadline() {
+        let (_sender, mut stream) = idle_test_stream();
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        stream.signal.cancel();
+        assert!(matches!(
+            stream.next_event().await,
+            Err(AiError::Abort { .. })
+        ));
+    }
 
     fn decode_all(input: &str) -> Vec<ServerSentEvent> {
         let mut state = SseDecoderState::new();

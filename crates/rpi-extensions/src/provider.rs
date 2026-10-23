@@ -420,6 +420,7 @@ fn options_json(opts: &SimpleStreamOptions) -> serde_json::Value {
     serde_json::json!({
         "apiKey": opts.api_key,
         "timeoutMs": opts.timeout.map(|d| d.as_millis() as u64),
+        "streamIdleTimeoutMs": opts.stream_idle_timeout.map(|d| d.as_millis() as u64),
         "maxRetries": opts.max_retries,
         "maxRetryDelayMs": opts.max_retry_delay.map(|d| d.as_millis() as u64),
         "headers": opts.headers,

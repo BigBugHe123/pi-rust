@@ -169,6 +169,8 @@ pub enum AgentHarnessToolContextSource<T: Send + Sync + 'static> {
 #[derive(Debug, Clone, Default)]
 pub struct AgentHarnessStreamOptions {
     pub timeout: Option<std::time::Duration>,
+    /// Maximum silence between streamed body bytes; zero disables it.
+    pub stream_idle_timeout: Option<std::time::Duration>,
     pub max_retries: Option<u32>,
     pub max_retry_delay: Option<std::time::Duration>,
     pub headers: Option<BTreeMap<String, String>>,
@@ -185,6 +187,9 @@ impl AgentHarnessStreamOptions {
     pub fn merge_into(&self, mut base: SimpleStreamOptions) -> SimpleStreamOptions {
         if self.timeout.is_some() {
             base.timeout = self.timeout;
+        }
+        if self.stream_idle_timeout.is_some() {
+            base.stream_idle_timeout = self.stream_idle_timeout;
         }
         if self.max_retries.is_some() {
             base.max_retries = self.max_retries;
@@ -220,6 +225,8 @@ impl AgentHarnessStreamOptions {
 #[derive(Debug, Clone, Default)]
 pub struct AgentHarnessStreamOptionsPatch {
     pub timeout: Option<Option<std::time::Duration>>,
+    /// Pin or unpin the stream idle timeout; an explicit zero disables it.
+    pub stream_idle_timeout: Option<Option<std::time::Duration>>,
     pub max_retries: Option<Option<u32>>,
     pub max_retry_delay: Option<Option<std::time::Duration>>,
     /// `None` = leave; `Some(map)` = merge, with inner `None` deleting keys.
@@ -234,6 +241,9 @@ impl AgentHarnessStreamOptionsPatch {
     pub fn apply(&self, opts: &mut AgentHarnessStreamOptions) {
         if let Some(v) = self.timeout {
             opts.timeout = v;
+        }
+        if let Some(v) = self.stream_idle_timeout {
+            opts.stream_idle_timeout = v;
         }
         if let Some(v) = self.max_retries {
             opts.max_retries = v;
@@ -521,5 +531,22 @@ mod tests {
         let retry = RetryPolicy::default();
         assert!(retry.enabled);
         assert_eq!(retry.max_retries, 10);
+    }
+
+    #[test]
+    fn stream_idle_timeout_survives_harness_merge_and_patches() {
+        use std::time::Duration;
+        let mut options = super::AgentHarnessStreamOptions {
+            stream_idle_timeout: Some(Duration::from_secs(17)),
+            ..Default::default()
+        };
+        let merged = options.merge_into(rpi_ai::SimpleStreamOptions::default());
+        assert_eq!(merged.stream_idle_timeout(), Some(Duration::from_secs(17)));
+        super::AgentHarnessStreamOptionsPatch {
+            stream_idle_timeout: Some(Some(Duration::ZERO)),
+            ..Default::default()
+        }
+        .apply(&mut options);
+        assert_eq!(options.merge_into(merged).stream_idle_timeout(), None);
     }
 }
