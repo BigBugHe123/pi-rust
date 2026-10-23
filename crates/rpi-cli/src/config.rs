@@ -1070,6 +1070,37 @@ pub(crate) mod test_support {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
     }
+
+    /// Isolate session-directory overrides while holding the shared env lock.
+    /// Restore the inherited value before releasing the lock, even on unwind.
+    pub(crate) struct SessionDirEnv {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl SessionDirEnv {
+        pub(crate) fn new(directory: Option<&std::path::Path>) -> Self {
+            let guard = env_lock().lock().unwrap();
+            let previous = std::env::var_os("RPI_CODING_AGENT_SESSION_DIR");
+            match directory {
+                Some(directory) => std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", directory),
+                None => std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR"),
+            }
+            Self {
+                _guard: guard,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for SessionDirEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", value),
+                None => std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR"),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

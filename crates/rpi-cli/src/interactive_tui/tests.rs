@@ -917,6 +917,7 @@ fn verbose_overrides_quiet_startup_listing() {
 
 #[test]
 fn resume_command_omits_the_default_session_dir() {
+    let _env = crate::config::test_support::SessionDirEnv::new(None);
     let cwd = std::path::Path::new("/proj/demo");
     assert_eq!(format_resume_command("", cwd, None), None);
     assert_eq!(

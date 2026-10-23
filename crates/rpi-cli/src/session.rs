@@ -3863,6 +3863,7 @@ mod tests {
 
     #[test]
     fn select_latest_for_continue_and_resume() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args {
             continue_session: true,
             ..Args::default()
@@ -3885,6 +3886,7 @@ mod tests {
 
     #[test]
     fn select_by_id_for_session_flag() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args {
             session: Some("01a02ece".into()),
             ..Args::default()
@@ -3898,6 +3900,7 @@ mod tests {
 
     #[test]
     fn select_new_with_custom_dir() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args {
             session_dir: Some(PathBuf::from("/tmp/sess")),
             ..Args::default()
@@ -3911,6 +3914,7 @@ mod tests {
 
     #[test]
     fn select_new_default_dir() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args::default();
         let cwd = Path::new("/proj");
         match select_session(&args, cwd) {
@@ -3923,6 +3927,7 @@ mod tests {
 
     #[test]
     fn default_session_dir_only_uses_rpi() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
@@ -3936,9 +3941,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let custom = tmp.path().join("custom_sessions");
-        std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", custom.to_str().unwrap());
+        let _env = crate::config::test_support::SessionDirEnv::new(Some(&custom));
         assert_eq!(default_session_dir(cwd), custom);
-        std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
