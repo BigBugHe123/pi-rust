@@ -73,6 +73,8 @@ def normalize_release(root, tags):
     series = config["workspace"].get("metadata", {}).get("release", {}).get("series")
     if series is None:
         return proposed
+    if f"v{proposed}" in tags:
+        raise ValueError("cannot normalize an already published release")
     version = series_version(proposed, series, tags)
     if version == proposed:
         return version

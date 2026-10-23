@@ -177,6 +177,19 @@ serde = "1"
                 automation.normalize_release(root, ["v0.8.0"])
             self.assertEqual(manifest.read_text(encoding="utf-8"), original)
 
+    def test_published_notes_cannot_be_retargeted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "Cargo.toml"
+            manifest.write_text('[workspace.package]\nversion = "0.8.0"\n'
+                                '[workspace.metadata.release]\nseries = "0.8"\n', encoding="utf-8")
+            changelog = root / "CHANGELOG.md"
+            original = "## [0.8.0]\n\nPublished notes\n"
+            changelog.write_text(original, encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "already published"):
+                automation.normalize_release(root, ["v0.8.0"])
+            self.assertEqual(changelog.read_text(encoding="utf-8"), original)
+
 
 class ChannelReadinessTests(unittest.TestCase):
     def setUp(self):
