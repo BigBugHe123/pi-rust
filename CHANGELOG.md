@@ -11,6 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.1...v0.9.0) - 2026-10-23
+
+### Added
+
+- *(ai)* add stream idle timeout and model compat diagnostics
+
+### Fixed
+
+- *(cli)* preserve session roots and safely fork and import logs
+- *(providers)* close cancellation and compat diagnostic gaps
+- *(providers)* preserve manifest diagnostics and thinking constraints
+- *(ai)* dispatch CR-delimited SSE frames without waiting for bytes
+- *(ai)* preserve initial SSE events after a UTF-8 BOM
+- *(ai)* merge and remove HTTP headers case insensitively
+- *(ai)* classify retries and honor SSE control boundaries
+- *(extensions)* saturate oversized stream idle durations
+
+### Other
+
+- consolidate provider transport and session fixes
+- *(cli)* isolate and restore session directory overrides
+
 ## [0.8.1](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.8.1) - 2026-10-23
 
 ### Added
