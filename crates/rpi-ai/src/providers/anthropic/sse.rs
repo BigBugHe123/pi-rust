@@ -223,6 +223,13 @@ impl SseEventStream {
     /// the trailing flush). Mirrors one iteration of `iterateSseMessages`.
     pub async fn next_event(&mut self) -> Result<Option<ServerSentEvent>, AiError> {
         loop {
+            // One body chunk may contain several complete events. Cancellation
+            // must win before dispatching buffered events as well as body reads.
+            if self.signal.is_cancelled() {
+                return Err(AiError::Abort {
+                    message: "Request was aborted".to_string(),
+                });
+            }
             // Try to flush a complete event from already-buffered lines first.
             // Take ownership of the buffer so we can mutate `self` while
             // dispatching on the borrowed slice (mirrors the TS string cursor).
@@ -529,6 +536,21 @@ mod tests {
         });
         assert_eq!(stream.next_event().await.unwrap().unwrap().data, "late");
         writer.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_events_already_buffered_from_the_same_chunk() {
+        let (sender, mut stream) = idle_test_stream();
+        sender
+            .send(Bytes::from_static(b"data: first\n\ndata: second\n\n"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "first");
+        stream.signal.cancel();
+        assert!(matches!(
+            stream.next_event().await,
+            Err(AiError::Abort { .. })
+        ));
     }
 
     #[tokio::test(start_paused = true)]

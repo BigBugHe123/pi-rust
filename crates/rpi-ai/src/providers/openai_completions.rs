@@ -226,6 +226,9 @@ async fn run_stream(
                 state.finish(producer, model);
                 return;
             }
+            // Named keepalives and empty data frames carry no JSON payload.
+            // Their bytes still refresh the shared SSE idle watchdog.
+            Ok(Some(event)) if event.data.trim().is_empty() => continue,
             Ok(Some(event)) => match serde_json::from_str::<Value>(&event.data) {
                 Ok(chunk) => {
                     if let Some(message) = chunk

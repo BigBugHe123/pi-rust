@@ -65,7 +65,8 @@ impl From<&AiError> for ProviderRequestError {
                 message: other.to_string(),
                 retry_after: None,
                 retry_after_ms: None,
-                x_should_retry: None,
+                // Missing HTTP status is retryable only for transport errors.
+                x_should_retry: Some("false".into()),
             },
         }
     }
@@ -189,10 +190,10 @@ where
                 if retries_remaining == 0 {
                     return Err(err);
                 }
-                let req_err = ProviderRequestError::from(&err);
-                if !req_err.is_retryable() {
+                if !err.is_retryable() {
                     return Err(err);
                 }
+                let req_err = ProviderRequestError::from(&err);
 
                 let retry_index = max_retries - retries_remaining;
                 retries_remaining -= 1;
@@ -233,6 +234,47 @@ mod tests {
         .await;
         assert!(matches!(result, Err(AiError::Abort { .. })));
         assert_eq!(attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_http_errors_are_returned_without_retrying() {
+        for error in [
+            AiError::Auth {
+                message: "invalid credentials".into(),
+            },
+            AiError::Abort {
+                message: "provider cancelled".into(),
+            },
+            AiError::Schema {
+                message: "invalid request".into(),
+            },
+            AiError::Provider {
+                code: "invalid_model".into(),
+                message: "invalid model".into(),
+            },
+            AiError::Sse {
+                message: "invalid event".into(),
+            },
+            AiError::Usage {
+                message: "invalid usage".into(),
+            },
+        ] {
+            assert!(!ProviderRequestError::from(&error).is_retryable());
+            let attempts = AtomicU32::new(0);
+            let result = retry_provider_request::<(), _, _>(
+                || {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    let error = error.clone();
+                    async { Err(error) }
+                },
+                Some(1),
+                None,
+                &CancellationToken::new(),
+            )
+            .await;
+            assert_eq!(result, Err(error.clone()));
+            assert_eq!(attempts.load(Ordering::SeqCst), 1, "{error}");
+        }
     }
 
     #[tokio::test]
