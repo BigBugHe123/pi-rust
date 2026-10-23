@@ -11,6 +11,27 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.8.1](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.8.1) - 2026-10-23
+
+### Added
+
+- *(extensions)* drive wake-capable tools without idle blocking workers
+
+### Fixed
+
+- *(tui)* preserve working caret and isolate theme cache revisions
+- *(rpc)* release extension session lock before awaiting RPC
+- keep wake token allocation compatible with stable Rust
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into codex/fix-pr74-cursor
+- Merge branch 'main' into ui
+- add RPI_CODING_AGENT_SESSION_DIR env config
+- share transcript rows and slice the viewport in fullscreen
+- measure idle tool workers and check Windows ownership
+- *(harness)* serialize run budget environment tests
+
 ## [0.8.0](https://github.com/bigfish1913/pi-rust/compare/v0.7.1...v0.8.0) - 2026-10-22
 
 ### Fixed
