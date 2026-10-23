@@ -1049,10 +1049,10 @@ impl AssistantMessageEvent {
     }
 }
 
-/// Accounted in-memory payload, without serialization or allocation. Shared
-/// snapshots are charged for each queued event. This is a queue budget, not RSS:
-/// capacities, allocator overhead and consumer-held/final messages are excluded.
 impl AssistantMessageEvent {
+    /// Accounted in-memory payload, without serialization or allocation. Shared
+    /// snapshots are charged for each queued event. This is a queue budget, not RSS:
+    /// capacities, allocator overhead and consumer-held/final messages are excluded.
     pub fn accounted_payload_bytes(&self) -> usize {
         let extra = match self {
             Self::TextDelta { delta, .. }

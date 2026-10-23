@@ -11,7 +11,9 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 
+/// Maximum queued nonterminal events under the default limits.
 pub const DEFAULT_EVENT_CAPACITY: usize = 64;
+/// Default budget for accounted queued payload, excluding terminal events.
 pub const DEFAULT_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 struct QueuedEvent {
