@@ -153,12 +153,11 @@ pub enum SessionSelection {
 
 /// Decide the session selection from parsed args + the resolved cwd.
 pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
-    if args.no_session {
-        return SessionSelection::Ephemeral;
-    }
-    // `--session-dir` wins; then the saved `sessionDir` (upstream's key, same
-    // format as the flag); then the built-in default. Keep this directory on
-    // restore selections too, not only on fresh sessions.
+    select_session_in_dir(args, configured_session_dir(args, cwd))
+}
+
+/// Resolve the root once at startup; runtime actions retain this selection.
+pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
     let dir = args
         .session_dir
         .clone()
@@ -168,6 +167,22 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
                 .and_then(|settings| settings.session_dir)
         })
         .unwrap_or_else(|| default_session_dir(cwd));
+    // Relative roots belong to the launch project, even if an extension later
+    // changes the process working directory.
+    if dir.is_relative() && !dir.has_root() {
+        cwd.join(dir)
+    } else {
+        dir
+    }
+}
+
+fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
+    if args.no_session {
+        return SessionSelection::Ephemeral;
+    }
+    // `--session-dir` wins; then the saved `sessionDir` (upstream's key, same
+    // format as the flag); then the built-in default. Keep this directory on
+    // restore selections too, not only on fresh sessions.
     if args.continue_session || args.resume {
         return SessionSelection::Latest { dir };
     }
@@ -202,6 +217,7 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
     pub extension_session: ExtensionSession,
+    session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     tool_context: rpi_extensions::ToolCallContext,
     action_host: Arc<crate::extensions_actions::HarnessActionHost>,
@@ -218,6 +234,7 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
+    let session_dir = configured_session_dir(args, cwd);
     let cwd_str = cwd.to_string_lossy().to_string();
     let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
     if !project_trusted && args.verbose {
@@ -254,7 +271,7 @@ pub fn prepare_extensions(
         args.unknown_flags.clone(),
         tool_context.clone(),
     );
-    let action_host = Arc::new(action_host);
+    let action_host = Arc::new(action_host.with_session_dir(session_dir.clone()));
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
     // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
@@ -302,6 +319,7 @@ pub fn prepare_extensions(
         report_deferred_renderers(&extension_session);
     }
     Ok(PreparedExtensions {
+        session_dir,
         runtime,
         tool_context,
         action_host,
@@ -369,6 +387,7 @@ pub async fn build_prepared(
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        session_dir,
         runtime,
         tool_context,
         action_host,
@@ -405,7 +424,7 @@ pub async fn build_prepared(
     let active = filter_active_tool_names(active_tool_names(&tools, args), args);
 
     // ---- Session storage ----
-    let selection = select_session(args, cwd);
+    let selection = select_session_in_dir(args, session_dir.clone());
     let session = build_session(&selection, &cwd_str).await?;
     // Plugin tools now know which session they serve: `todo` and friends key
     // their per-session state off it. A session without an id (ephemeral) leaves
@@ -885,6 +904,10 @@ pub async fn build_prepared(
     // NOT held here (the TUI already owns a `&AgentHarness` / clone at the call
     // site — passing it into `reload_extension_resources` keeps this structfree
     // of a harness back-reference so it can be `Clone` into the reload callback).
+    // Retain the resolved root in the existing args snapshot so reload never
+    // reselects it from mutable settings or environment variables.
+    let mut reload_args = args.clone();
+    reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
@@ -894,7 +917,7 @@ pub async fn build_prepared(
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
-        args: args.clone(),
+        args: reload_args,
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
@@ -1047,7 +1070,8 @@ pub struct ReloadContext {
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
     /// not pick up argv changes mid-session, which is the right contract — pi's
-    /// `/reload` re-runs discovery with the same config).
+    /// `/reload` re-runs discovery with the same config). `session_dir` holds
+    /// the resolved startup root, including saved settings/environment defaults.
     pub args: Args,
     /// The resolved model + thinking level (the harness's active model stays
     /// unless `set_model` changed it; reload does not touch the model).
@@ -1075,6 +1099,16 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+}
+
+impl ReloadContext {
+    pub(crate) fn session_dir(&self) -> PathBuf {
+        // The fallback also supports contexts constructed by embedding hosts.
+        self.args
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| configured_session_dir(&self.args, &self.cwd))
+    }
 }
 
 /// Dispatch a no-payload lifecycle event (e.g. `SessionStart`, `SessionShutdown`,
@@ -1286,7 +1320,7 @@ where
                 &_cell,
                 Arc::new(harness.clone()),
             );
-            Arc::new(action_host)
+            Arc::new(action_host.with_session_dir(ctx.session_dir()))
         }
     };
 
@@ -2124,7 +2158,7 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             let Some(meta) = first_resumable_session(&metas) else {
                 return Err(BuildError::SessionNotFound {
                     requested: "the most recent session".to_string(),
-                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                    dir: dir.display().to_string(),
                 });
             };
             open_session(meta, cwd).await
@@ -2134,7 +2168,7 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             .map_err(|e| match e {
                 OpenError::NotFound { requested } => BuildError::SessionNotFound {
                     requested,
-                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                    dir: dir.display().to_string(),
                 },
                 OpenError::Other(msg) => BuildError::SessionOpen(msg),
             }),
@@ -2239,7 +2273,7 @@ pub async fn list_session_metadata(
     list_session_metadata_in_dir(cwd, &dir).await
 }
 
-async fn list_session_metadata_in_dir(
+pub(crate) async fn list_session_metadata_in_dir(
     cwd: &str,
     dir: &Path,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
@@ -2520,7 +2554,11 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
     open_session_by_id_in_dir(id, cwd, &dir).await
 }
 
-async fn open_session_by_id_in_dir(id: &str, cwd: &str, dir: &Path) -> Result<Session, OpenError> {
+pub(crate) async fn open_session_by_id_in_dir(
+    id: &str,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Session, OpenError> {
     let metas = list_session_metadata_in_dir(cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
@@ -2610,11 +2648,11 @@ pub(crate) async fn set_active_session(
 pub(crate) async fn fork_session_storage(
     harness: &AgentHarness,
     cwd: &str,
+    dir: &Path,
 ) -> Result<Session, String> {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2626,7 +2664,7 @@ pub(crate) async fn fork_session_storage(
     // The fork needs the rich JSONL metadata (with the on-disk path); resolve
     // it from the session list by the current session's id.
     let id = harness.session().storage().metadata().id.clone();
-    let metas = list_session_metadata(cwd)
+    let metas = list_session_metadata_in_dir(cwd, dir)
         .await
         .map_err(|e| e.to_string())?;
     let Some(source) = metas.iter().find(|m| m.id == id) else {
@@ -2647,6 +2685,86 @@ pub(crate) async fn fork_session_storage(
         .map_err(|e| e.to_string())?;
     claim_session_lock(&fork_storage.jsonl_metadata().path)?;
     Ok(Session::new(Arc::new(fork_storage), None))
+}
+
+/// Validate a private copy before publishing it in the repo's normal cwd
+/// directory. Keep the imported identity/history and never overwrite a saved
+/// session (including when the source is already inside this repository).
+pub(crate) async fn import_session_file(
+    source: &Path,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Session, String> {
+    use rpi_harness::session::jsonl::{
+        JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage,
+    };
+    use rpi_tools::FileSystem;
+
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        Path::new(cwd).join(dir)
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let staged = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|e| e.to_string())?
+        .into_temp_path();
+    std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+    let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
+    let validated = JsonlSessionStorage::load(
+        fs.clone(),
+        &staged.to_string_lossy(),
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    )
+    .await
+    .map_err(|e| format!("invalid session import: {e}"))?;
+    let mut metadata = validated.jsonl_metadata().clone();
+    drop(validated);
+    if list_session_metadata_in_dir(cwd, &dir)
+        .await
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|saved| saved.id == metadata.id)
+    {
+        return Err(format!(
+            "session {} already exists in {}",
+            metadata.id,
+            dir.display()
+        ));
+    }
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs,
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(SystemClock),
+        ids: Arc::new(DefaultIdGenerator::new()),
+    });
+    // Let the repository validate the id and choose its canonical destination.
+    let destination = repo
+        .create_typed(&JsonlSessionCreateOptions {
+            id: Some(metadata.id.clone()),
+            parent_session_id: metadata.parent_session_id.clone(),
+            cwd: cwd.to_string(),
+            metadata: metadata.metadata.clone(),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = destination.jsonl_metadata().path.clone();
+    drop(destination);
+    if let Err(error) = claim_session_lock(&path) {
+        // Another process owns this destination; leave its file intact.
+        return Err(error);
+    }
+    if let Err(error) = staged.persist(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("publish import: {error}"));
+    }
+    metadata.path = path;
+    let storage = repo
+        .open_by_jsonl_metadata(&metadata)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Session::new(Arc::new(storage), None))
 }
 
 /// Session logs this process has claimed, so re-claiming is a no-op.
@@ -2835,6 +2953,9 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
     }
     Some(text)
 }
+
+#[cfg(test)]
+mod runtime_session_tests;
 
 #[cfg(test)]
 mod tests {

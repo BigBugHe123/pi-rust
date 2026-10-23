@@ -651,10 +651,12 @@ async fn resolve_resume(parsed: &mut Args, cwd: &Path) -> Option<i32> {
         return Some(EXIT_USAGE);
     }
 
-    match crate::resume_picker::select(cwd).await {
+    let session_dir = crate::session::configured_session_dir(parsed, cwd);
+    match crate::resume_picker::select_in_dir(cwd, &session_dir).await {
         Ok(Some(id)) => {
             parsed.resume = false;
             parsed.session = Some(id);
+            parsed.session_dir = Some(session_dir);
             None
         }
         Ok(None) => Some(0),
