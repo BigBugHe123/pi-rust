@@ -11,7 +11,7 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
-## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.1...v0.9.0) - 2026-10-23
+## [0.8.2](https://github.com/bigfish1913/pi-rust/compare/v0.8.1...v0.8.2) - 2026-10-23
 
 ### Added
 
