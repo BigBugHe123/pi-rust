@@ -329,7 +329,8 @@ async fn saturated_pipeline_cancels_uncommitted_content_and_frees_every_frame() 
             push_terminal(&mut prod, message).await;
         });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while state.calls.load(Ordering::SeqCst) < 65 {
+            // Two bridge dequeues prove the deferred usage frame was applied.
+            while state.calls.load(Ordering::SeqCst) < 67 {
                 tokio::task::yield_now().await;
             }
         })
