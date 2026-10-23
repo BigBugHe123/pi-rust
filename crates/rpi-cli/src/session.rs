@@ -1444,11 +1444,11 @@ where
         }
         old_session
     };
-    // Plugin callbacks may call host actions; release session locks first.
-    old_session.begin_shutdown();
     if let Some(old_b) = old_bridge {
         old_b.invalidate();
     }
+    // Shutdown callbacks see stale host actions and run outside session locks.
+    old_session.begin_shutdown();
 
     // The session was swapped atomically above; expose its matching bridge.
     *ctx.action_bridge.lock().unwrap() = Some(Arc::clone(&fresh_bridge));
