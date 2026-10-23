@@ -410,14 +410,7 @@ pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
     let path = models_path()?;
     match read_text_with_fallback(path, None)? {
         Some((path, text)) => {
-            let config = parse_models_json(&text).map_err(|source| ConfigError::Json {
-                path: path.clone(),
-                source,
-            })?;
-            for warning in model_compat_warnings(&config) {
-                eprintln!("warning: {}: {warning}", path.display());
-            }
-            Ok(config)
+            parse_models_json(&text).map_err(|source| ConfigError::Json { path, source })
         }
         None => Ok(ModelsConfig::default()),
     }
@@ -471,13 +464,26 @@ pub fn model_compat_warnings(config: &ModelsConfig) -> Vec<String> {
                     .map(|_| ())
             };
             if let Err(error) = parsed {
+                // Serde's full error may echo a malformed value, including a
+                // credential accidentally pasted into a boolean field.
+                let error = error.to_string();
+                let expected = error
+                    .rsplit_once(", expected ")
+                    .map_or("a valid compat object", |(_, expected)| expected);
                 warnings.push(format!(
-                    "{context}: invalid configuration ({error}); compat ignored"
+                    "{context}: invalid configuration; expected {expected}; compat ignored"
                 ));
             }
         }
     }
     warnings
+}
+
+/// Emit diagnostics after extension manifests have supplied missing API names.
+pub(crate) fn warn_model_compat(config: &ModelsConfig) {
+    for warning in model_compat_warnings(config) {
+        eprintln!("warning: models.json: {warning}");
+    }
 }
 
 fn normalize_completions_compat(mut value: serde_json::Value) -> serde_json::Value {
@@ -1552,8 +1558,10 @@ mod tests {
         assert!(!warnings[0].contains("secret-fixture-value"));
 
         config.providers["deepseek"].models[0].compat =
-            Some(serde_json::json!({"requiresReasoningContent": "yes"}));
-        assert!(model_compat_warnings(&config)[0].contains("invalid configuration"));
+            Some(serde_json::json!({"requiresReasoningContent": "secret-fixture-token"}));
+        let warning = &model_compat_warnings(&config)[0];
+        assert!(warning.contains("invalid configuration"));
+        assert!(!warning.contains("secret-fixture-token"));
         config.providers["deepseek"].models[0].compat =
             Some(serde_json::json!({"thinkingFormat": "unsupported"}));
         assert!(model_compat_warnings(&config)[0].contains("invalid configuration"));

@@ -421,12 +421,20 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
         && compat(model).and_then(|c| c.thinking_format)
             == Some(crate::model::OpenaiThinkingFormat::Deepseek)
     {
-        let thinking = if opts.reasoning_level() == ThinkingLevel::Off {
-            "disabled"
-        } else {
-            "enabled"
-        };
-        body.insert("thinking".into(), json!({ "type": thinking }));
+        let enabled = opts.reasoning_level() != ThinkingLevel::Off;
+        let can_disable = !matches!(
+            model
+                .thinking_level_map
+                .as_ref()
+                .and_then(|map| map.get(&ThinkingLevel::Off)),
+            Some(None)
+        );
+        if enabled || can_disable {
+            body.insert(
+                "thinking".into(),
+                json!({ "type": if enabled { "enabled" } else { "disabled" } }),
+            );
+        }
     }
     if model.reasoning && supports_reasoning_effort(model) {
         if let Some(effort) = reasoning_effort(model, opts.reasoning_level()) {
@@ -1619,6 +1627,12 @@ mod tests {
         assert_eq!(request["messages"][1]["reasoning_content"], "");
         let off = build_request(&model, &context, &SimpleStreamOptions::default());
         assert_eq!(off["thinking"]["type"], "disabled");
+        model.thinking_level_map = Some(BTreeMap::from([(ThinkingLevel::Off, None)]));
+        assert!(
+            build_request(&model, &context, &SimpleStreamOptions::default())
+                .get("thinking")
+                .is_none()
+        );
         model.compat = None;
         assert!(build_request(&model, &context, &options)
             .get("thinking")

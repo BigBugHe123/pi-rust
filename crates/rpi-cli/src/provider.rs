@@ -312,6 +312,7 @@ fn resolve_with_factories(
     // gateway available or become that gateway's provider default.
     let mut models_cfg = config::load_models_config()?;
     apply_manifest_defaults(&mut models_cfg, &factories.manifests);
+    config::warn_model_compat(&models_cfg);
     let canonical_cli_provider = cli_provider
         .map(|requested| canonicalize_cli_provider(requested, &models_cfg))
         .transpose()?;
@@ -816,6 +817,7 @@ pub(crate) fn execution_catalog_with_manifests(
 ) -> Result<Vec<Model>, config::ConfigError> {
     let mut cfg = config::load_models_config()?;
     apply_manifest_defaults(&mut cfg, manifests);
+    config::warn_model_compat(&cfg);
     let mut catalog = build_catalog(&cfg, manifests);
     catalog.sort_by(|a, b| {
         a.provider
@@ -1389,6 +1391,42 @@ mod tests {
     use super::*;
     use crate::args::{parse_thinking_level, VALID_THINKING_LEVELS};
     use crate::config::test_support::env_lock;
+
+    #[test]
+    fn extension_api_defaults_are_resolved_before_compat_diagnostics() {
+        let mut cfg: config::ModelsConfig = serde_json::from_value(serde_json::json!({
+            "providers": {"proxy": {"models": [{"id":"custom", "compat": {
+                "thinkingFormat":"deepseek", "requiresReasoningContentOnAssistantMessages":true,
+                "misspelledFlag":true
+            }}]}}
+        }))
+        .unwrap();
+        let model = Model::new(
+            "default",
+            "Default",
+            rpi_ai::Api::OpenaiCompletions,
+            "proxy",
+            "http://127.0.0.1/v1",
+        );
+        apply_manifest_defaults(
+            &mut cfg,
+            &[rpi_extensions::ProviderManifest {
+                id: "proxy".into(),
+                models: vec![model],
+                api_key_env: None,
+                requires_auth: false,
+            }],
+        );
+        let warnings = config::model_compat_warnings(&cfg);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("misspelledFlag"));
+        let models = config::provider_to_models("proxy", &cfg.providers["proxy"]).unwrap();
+        let Some(rpi_ai::StreamingProtocolCompat::OpenaiCompletions(compat)) = &models[0].compat
+        else {
+            panic!("extension protocol must retain model overrides");
+        };
+        assert_eq!(compat.requires_reasoning_content, Some(true));
+    }
 
     /// Scope a test to a throwaway config dir + clear the `ANTHROPIC_*` env
     /// vars, restoring both on drop. Holds the shared env lock for its whole
