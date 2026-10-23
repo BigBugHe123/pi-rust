@@ -128,15 +128,10 @@ fn next_line_break_index(text: &str) -> Option<usize> {
 }
 
 /// Split the first complete line off `text`, consuming a trailing `\r\n` or
-/// single `\r`/`\n`. A `\r` at the end of a body chunk is ambiguous: it may be
-/// the first half of `\r\n`, so it stays buffered until the next chunk unless
-/// `allow_trailing_cr` is set for EOF processing. Mirrors `consumeLine` while
-/// preserving line boundaries across HTTP chunks.
-fn consume_line(text: &str, allow_trailing_cr: bool) -> Option<(&str, &str)> {
+/// single `\r`/`\n`. A trailing `\r` completes a line immediately; the stream
+/// suppresses a possible leading `\n` in the next HTTP chunk.
+fn consume_line(text: &str) -> Option<(&str, &str)> {
     let idx = next_line_break_index(text)?;
-    if !allow_trailing_cr && idx + 1 == text.len() && text.as_bytes().get(idx) == Some(&b'\r') {
-        return None;
-    }
     let mut next = idx + 1;
     if text.as_bytes().get(idx) == Some(&b'\r') && text.as_bytes().get(next) == Some(&b'\n') {
         next += 1;
@@ -200,6 +195,7 @@ pub struct SseEventStream {
     state: SseDecoderState,
     buffer: String,
     utf8_buffer: Vec<u8>,
+    skip_lf: bool,
     signal: CancellationToken,
     idle_timeout: Option<std::time::Duration>,
     last_bytes_at: tokio::time::Instant,
@@ -213,6 +209,7 @@ impl SseEventStream {
             state: SseDecoderState::new(),
             buffer: String::new(),
             utf8_buffer: Vec::new(),
+            skip_lf: false,
             signal,
             idle_timeout: Some(crate::provider::DEFAULT_STREAM_IDLE_TIMEOUT),
             last_bytes_at: tokio::time::Instant::now(),
@@ -244,7 +241,16 @@ impl SseEventStream {
             let buffer = std::mem::take(&mut self.buffer);
             let mut leftover = buffer;
             let mut produced = None;
-            while let Some((line, rest)) = consume_line(&leftover, self.done) {
+            while !leftover.is_empty() {
+                // A CR already terminated the previous line, even when it was
+                // the last byte received. Swallow only its optional LF partner.
+                if std::mem::take(&mut self.skip_lf) && leftover.starts_with('\n') {
+                    leftover.remove(0);
+                }
+                let Some((line, rest)) = consume_line(&leftover) else {
+                    break;
+                };
+                self.skip_lf = rest.is_empty() && leftover.ends_with('\r');
                 let line_owned = line.to_string();
                 leftover = rest.to_string();
                 if let Some(event) = self.state.decode_line(&line_owned) {
@@ -484,6 +490,7 @@ mod tests {
             state: SseDecoderState::new(),
             buffer: String::new(),
             utf8_buffer: Vec::new(),
+            skip_lf: false,
             signal: CancellationToken::new(),
             idle_timeout: Some(std::time::Duration::from_secs(5)),
             last_bytes_at: tokio::time::Instant::now(),
@@ -529,6 +536,40 @@ mod tests {
         assert_eq!(events[1].data, "later");
         for prefix in ["\n", ": comment\n", "\u{feff}"] {
             assert!(decode_all(&format!("{prefix}\u{feff}data: ignored\n\n")).is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cr_delimited_frames_are_dispatched_before_more_bytes_or_eof() {
+        let (sender, mut stream) = idle_test_stream();
+        sender
+            .send(Bytes::from_static(b"data: first\r\r"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "first");
+        sender
+            .send(Bytes::from_static(b"data: second\r\r"))
+            .await
+            .unwrap();
+        assert_eq!(stream.next_event().await.unwrap().unwrap().data, "second");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_line_endings_preserve_multiline_frames_when_every_byte_is_a_chunk() {
+        for ending in ["\r", "\r\n", "\n"] {
+            let (sender, mut stream) = idle_test_stream();
+            let data = format!("event: message{ending}data: one{ending}data: two{ending}{ending}data: later{ending}{ending}");
+            let writer = tokio::spawn(async move {
+                for byte in data.bytes() {
+                    sender.send(Bytes::from(vec![byte])).await.unwrap();
+                }
+            });
+            let first = stream.next_event().await.unwrap().unwrap();
+            assert_eq!(first.event.as_deref(), Some("message"));
+            assert_eq!(first.data, "one\ntwo", "ending={ending:?}");
+            assert_eq!(stream.next_event().await.unwrap().unwrap().data, "later");
+            assert!(stream.next_event().await.unwrap().is_none());
+            writer.await.unwrap();
         }
     }
 
@@ -663,12 +704,12 @@ mod tests {
     }
 
     #[test]
-    fn keeps_trailing_cr_until_the_next_chunk() {
-        assert!(consume_line("data: value\r", false).is_none());
-
-        let (line, rest) = consume_line("data: value\r\n", false).unwrap();
-        assert_eq!(line, "data: value");
-        assert!(rest.is_empty());
+    fn cr_and_crlf_both_complete_a_line_immediately() {
+        for text in ["data: value\r", "data: value\r\n"] {
+            let (line, rest) = consume_line(text).unwrap();
+            assert_eq!(line, "data: value");
+            assert!(rest.is_empty());
+        }
     }
 
     #[test]
@@ -676,7 +717,7 @@ mod tests {
         let mut state = SseDecoderState::new();
         let mut buffer = "event: message_start\rdata: {}\r".to_string();
         let mut events = Vec::new();
-        while let Some((line, rest)) = consume_line(&buffer, true) {
+        while let Some((line, rest)) = consume_line(&buffer) {
             let line = line.to_string();
             buffer = rest.to_string();
             if let Some(event) = state.decode_line(&line) {
