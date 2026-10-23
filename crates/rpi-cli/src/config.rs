@@ -479,13 +479,6 @@ pub fn model_compat_warnings(config: &ModelsConfig) -> Vec<String> {
     warnings
 }
 
-/// Emit diagnostics after extension manifests have supplied missing API names.
-pub(crate) fn warn_model_compat(config: &ModelsConfig) {
-    for warning in model_compat_warnings(config) {
-        eprintln!("warning: models.json: {warning}");
-    }
-}
-
 fn normalize_completions_compat(mut value: serde_json::Value) -> serde_json::Value {
     if let Some(fields) = value.as_object_mut() {
         if let Some(alias) = fields.remove("requiresReasoningContentOnAssistantMessages") {

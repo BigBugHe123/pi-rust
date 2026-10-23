@@ -1478,6 +1478,15 @@ where
     let context_block = format_project_context(&context_files);
 
     let mut details: Vec<String> = Vec::new();
+    if let Some(resolved) = &refreshed {
+        warnings |= !resolved.compat_warnings.is_empty();
+        details.extend(
+            resolved
+                .compat_warnings
+                .iter()
+                .map(|warning| format!("warning: models.json: {warning}")),
+        );
+    }
     if !skill_diags.is_empty() || !prompt_diags.is_empty() || !resource_diags.is_empty() {
         warnings = true;
         // Collect formatted diagnostics for the caller to surface in its UI

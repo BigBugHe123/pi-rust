@@ -151,8 +151,8 @@ async fn abortable_sleep(delay: Duration, token: &CancellationToken) -> Result<(
 /// - `max_retries = None` → no retries (one attempt).
 /// - Retries only on retryable `ProviderRequestError`s (status 408/409/429/>=500
 ///   or transport-level), respecting `retry-after` headers up to `max_retry_delay`.
-/// - Aborts between attempts honour `token`; a cancelled retry surfaces
-///   `AiError::Abort`.
+/// - Cancellation interrupts an in-flight attempt (including HTTP error-body
+///   reads) and retry backoff; a cancelled retry surfaces `AiError::Abort`.
 ///
 /// The request closure returns `Result<T, AiError>`; `AiError::Http` is the
 /// retryable arm and carries the status. Other `AiError` variants abort the
@@ -171,7 +171,14 @@ where
     let mut retries_remaining = max_retries;
 
     loop {
-        match request().await {
+        let result = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Err(AiError::Abort {
+                message: "Request aborted".to_string(),
+            }),
+            result = async { request().await } => result,
+        };
+        match result {
             Ok(v) => return Ok(v),
             Err(err) => {
                 if token.is_cancelled() {
@@ -207,6 +214,25 @@ mod tests {
             status,
             message: "boom".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_pre_cancelled_request_does_not_start_an_attempt() {
+        let token = CancellationToken::new();
+        token.cancel();
+        let attempts = AtomicU32::new(0);
+        let result = retry_provider_request(
+            || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                async { Ok(42) }
+            },
+            Some(3),
+            None,
+            &token,
+        )
+        .await;
+        assert!(matches!(result, Err(AiError::Abort { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

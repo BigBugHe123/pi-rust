@@ -417,11 +417,12 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
     if let Some(temperature) = opts.temperature {
         body.insert("temperature".into(), Value::from(temperature));
     }
-    if model.reasoning
-        && compat(model).and_then(|c| c.thinking_format)
-            == Some(crate::model::OpenaiThinkingFormat::Deepseek)
+    if compat(model).and_then(|c| c.thinking_format)
+        == Some(crate::model::OpenaiThinkingFormat::Deepseek)
     {
-        let enabled = opts.reasoning_level() != ThinkingLevel::Off;
+        // An explicitly configured DeepSeek format must also disable the
+        // endpoint's default thinking when the catalog marks a model non-reasoning.
+        let enabled = model.reasoning && opts.reasoning_level() != ThinkingLevel::Off;
         let can_disable = !matches!(
             model
                 .thinking_level_map
@@ -1637,6 +1638,22 @@ mod tests {
         assert!(build_request(&model, &context, &options)
             .get("thinking")
             .is_none());
+    }
+
+    #[test]
+    fn deepseek_format_explicitly_disables_thinking_for_non_reasoning_models() {
+        let mut model = model();
+        model.reasoning = false;
+        model.compat = Some(StreamingProtocolCompat::OpenaiCompletions(
+            serde_json::from_value(json!({"thinkingFormat":"deepseek"})).unwrap(),
+        ));
+        let request = build_request(
+            &model,
+            &Context::new(vec![]),
+            &SimpleStreamOptions::default(),
+        );
+        assert_eq!(request["thinking"]["type"], "disabled");
+        assert!(request.get("reasoning_effort").is_none());
     }
 
     #[test]

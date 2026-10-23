@@ -146,11 +146,49 @@ async fn run_case(settings_idle: u64, cli_idle: Option<u64>, stall: bool) {
         .unwrap();
     assert!(status.success(), "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("Recovered."), "{stdout}\n{stderr}");
-    assert!(
-        stderr.contains("unknown field \"unknownFixtureFlag\""),
+    assert_eq!(
+        stderr
+            .matches("unknown field \"unknownFixtureFlag\"")
+            .count(),
+        1,
         "{stderr}"
     );
     assert_eq!(server.await.unwrap(), if stall { 2 } else { 1 });
+}
+
+#[tokio::test]
+async fn model_listing_reports_compat_warnings_once() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = root.path().join("agent");
+    std::fs::create_dir(&agent).unwrap();
+    std::fs::write(agent.join("models.json"), json!({"providers":{"fixture":{
+        "api":"openai-completions", "models":[{"id":"test", "compat":{"unknownListingFlag":true}}]
+    }}}).to_string()).unwrap();
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_rpi"))
+        .current_dir(root.path())
+        .env("RPI_CODING_AGENT_DIR", agent)
+        .args([
+            "--offline",
+            "--package-only",
+            "--no-extensions",
+            "--list-models",
+            "fixture",
+        ])
+        .stdin(Stdio::null())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("test"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("unknown field \"unknownListingFlag\"")
+            .count(),
+        1,
+        "{stderr}"
+    );
 }
 
 #[tokio::test]
