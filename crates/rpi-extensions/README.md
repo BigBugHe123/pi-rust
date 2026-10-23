@@ -95,3 +95,9 @@ cleanup thread before unloading the library. A failed finish permanently
 retains the DLL and callback context and emits a diagnostic; cleanup has no
 unload timeout. The same ownership path handles partial registration failure
 and ordinary session teardown.
+
+This changes the published Rust `LoadedPlugin` layout: `library` is now a
+`ManuallyDrop<Library>`, and private ownership fields prevent external struct
+literals or field moves. Use `load_one` and retain the returned owner until all
+plugin calls finish. This source API change needs a breaking release; compiled
+plugins keep their existing ABI compatibility.

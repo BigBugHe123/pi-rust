@@ -330,7 +330,9 @@ Client construction keeps the existing proxy and idle-timeout rules and
 propagates errors. API keys and request headers stay on each request.
 
 The optional `PluginApi::register_plugin_lifecycle` slot follows the tool wake
-slot without changing earlier offsets. Register a pair of hooks for each owned resource context:
+slot without changing earlier offsets or the ABI version. Rust `PluginApi`
+struct literals must add `register_plugin_lifecycle: None` (or their registrar).
+Register a pair of hooks for each owned resource context:
 `begin_shutdown` must be idempotent and return without joining workers, and
 `finish_shutdown` joins and releases all work on a blocking cleanup thread.
 A zero finish status guarantees that no background plugin code can run again.

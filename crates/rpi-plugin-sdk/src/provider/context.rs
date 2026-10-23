@@ -21,6 +21,7 @@ fn record_resource_build(runtime: bool) {
     });
 }
 
+/// Construct a request-specific provider using registration-scoped resources.
 pub type ContextFactory =
     fn(&ProviderContext, &Model, &SimpleStreamOptions) -> Result<Arc<dyn Provider>, String>;
 
@@ -48,6 +49,7 @@ pub struct ProviderContext {
 }
 
 impl ProviderContext {
+    /// Create an idle context; runtime and clients are initialized on demand.
     pub fn new() -> Self {
         Self::default()
     }
@@ -83,6 +85,7 @@ impl ProviderContext {
         Ok(client)
     }
 
+    /// Construct an OpenAI-compatible provider with a pooled client and request credentials.
     pub fn completions(
         &self,
         model: &Model,
