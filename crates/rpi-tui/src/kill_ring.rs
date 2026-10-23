@@ -11,15 +11,13 @@ use std::collections::VecDeque;
 const MAX_KILL_RING_SIZE: usize = 64;
 
 /// Options for pushing to the kill ring.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct PushOptions {
     /// Whether to prepend to the current entry (for backward kills).
     pub prepend: bool,
     /// Whether to accumulate with the previous entry (for consecutive kills).
     pub accumulate: bool,
 }
-
 
 /// Kill ring for storing killed (deleted) text.
 #[derive(Debug, Clone)]

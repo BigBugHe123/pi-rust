@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::utils::visible_width;
 
 /// Search state.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SearchState {
     /// Current search query.
     pub query: String,
@@ -19,7 +18,6 @@ pub struct SearchState {
     /// Whether search is active.
     pub active: bool,
 }
-
 
 /// A search match.
 #[derive(Debug, Clone, Copy)]

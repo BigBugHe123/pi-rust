@@ -35,13 +35,11 @@ fn char_count(value: &str) -> usize {
 }
 
 /// Input state for undo.
-#[derive(Debug, Clone)]
-#[derive(Default)]
+#[derive(Debug, Clone, Default)]
 struct InputState {
     value: String,
     cursor: usize,
 }
-
 
 /// Last action type for kill ring coalescing.
 #[derive(Debug, Clone, Copy, PartialEq)]

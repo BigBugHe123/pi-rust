@@ -62,7 +62,7 @@ pub(super) fn invoke_extension_command(
                 Some(rpi_extensions::host_free_string),
             )
         };
-        
+
         if rc == 0 {
             Some(out.to_string_lossy())
         } else {

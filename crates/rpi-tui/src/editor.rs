@@ -235,10 +235,10 @@ fn wrap_line_ranges(line: &str, max_width: usize) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// Insert `insert` (zero-width or not) at a visible column without slicing
+/// Insert the zero-width cursor marker at a visible column without slicing
 /// through ANSI escape sequences added for selection/placeholder styling.
-fn insert_at_visible_column(text: &str, column: usize, insert: &str) -> String {
-    let mut out = String::with_capacity(text.len() + insert.len());
+fn insert_cursor_marker(text: &str, column: usize) -> String {
+    let mut out = String::with_capacity(text.len() + CURSOR_MARKER.len());
     let mut visible = 0;
     let mut chars = text.char_indices().peekable();
     let mut inserted = false;
@@ -254,7 +254,7 @@ fn insert_at_visible_column(text: &str, column: usize, insert: &str) -> String {
             continue;
         }
         if !inserted && visible >= column {
-            out.push_str(insert);
+            out.push_str(CURSOR_MARKER);
             inserted = true;
         }
         out.push(ch);
@@ -262,26 +262,9 @@ fn insert_at_visible_column(text: &str, column: usize, insert: &str) -> String {
         let _ = idx;
     }
     if !inserted {
-        out.push_str(insert);
+        out.push_str(CURSOR_MARKER);
     }
     out
-}
-
-/// Insert the zero-width cursor marker at a visible column without slicing
-/// through ANSI escape sequences added for selection/placeholder styling.
-fn insert_cursor_marker(text: &str, column: usize) -> String {
-    insert_at_visible_column(text, column, CURSOR_MARKER)
-}
-
-/// A static, one-cell reverse-video caret block. Drawn instead of the
-/// hardware-cursor marker while the working indicator animates: the terminal
-/// cursor stays hidden (so it cannot blink in sync with the spinner), but the
-/// insertion point remains visible for typing.
-const STATIC_CARET: &str = "\x1b[7m \x1b[27m";
-
-/// Insert the static caret block at a visible column (see [`STATIC_CARET`]).
-fn insert_static_caret(text: &str, column: usize) -> String {
-    insert_at_visible_column(text, column, STATIC_CARET)
 }
 
 /// Editor - A multi-line text editor component.
@@ -1443,18 +1426,8 @@ impl Component for Editor {
         let state = self.render_snapshot();
         let mut content_lines = Vec::new();
 
-        // While a working indicator is embedded in the top border (the model is
-        // running), do NOT emit the hardware-cursor marker. The renderer treats
-        // a missing marker as "hide the terminal cursor"; emitting it while
-        // working made the visible caret be dragged to the animated spinner char
-        // and back to the prompt 12.5x/second, so it blinked in time with the
-        // spinner. Instead the caret is drawn as a static one-cell reverse-video
-        // block (see `STATIC_CARET`), mirroring upstream, so the insertion point
-        // stays visible for typing while the hardware cursor is left alone. The
-        // block occupies the cell already reserved by `right_pad_cursor`, i.e. no
-        // layout shift on toggle.
-        let working = self.working.lock().ok().is_some_and(|g| g.is_some());
-
+        // Keep the cursor marker while working: layout uses it to keep the
+        // draft caret visible, and the terminal uses it for IME positioning.
         let pad = " ".repeat(self.options.padding_x);
         // `prompt` is no longer rendered (mirrors the TS editor, which draws a
         // bordered box with padding-only lines and no `> ` prefix — see
@@ -1540,11 +1513,7 @@ impl Component for Editor {
                             .to_string()
                             .as_str(),
                     );
-                    rendered = if working {
-                        insert_static_caret(&rendered, self.options.padding_x + cursor_col)
-                    } else {
-                        insert_cursor_marker(&rendered, self.options.padding_x + cursor_col)
-                    };
+                    rendered = insert_cursor_marker(&rendered, self.options.padding_x + cursor_col);
                 }
 
                 content_lines.push(rendered);
@@ -1849,69 +1818,84 @@ mod tests {
     }
 
     #[test]
-    fn no_hardware_cursor_marker_while_working() {
-        // Regression: while the working spinner animates in the editor's top
-        // border, a focused editor must NOT emit the hardware-cursor marker.
-        // The renderer treats a missing marker as "hide the terminal cursor";
-        // emitting it made the visible caret get dragged to the animated
-        // spinner char and back to the prompt on every 80ms repaint, so it
-        // blinked in time with the spinner. With the marker dropped the cursor
-        // stays hidden the whole working period (a `\e[?25l` no-op once hidden)
-        // and re-appears when the model finishes (`set_working(None)`). The
-        // insertion point is still visible as a static one-cell reverse-video
-        // caret block (`STATIC_CARET`), so typing during a run keeps its caret.
-        use crate::component::Component;
-        let editor = Editor::simple();
+    fn working_caret_preserves_draft_text_and_input_position() {
+        for (draft, column) in [("abcdef", 2), ("中文草稿", "中文".len())] {
+            for width in [12, 40] {
+                let editor = Editor::simple();
+                editor.set_focused(true);
+                editor.set_text(draft);
+                editor.set_cursor(0, column);
+                let idle = editor.render(width);
+                let position = crate::extract_cursor_position(&idle, idle.len());
+                assert!(position.is_some());
+                let content = crate::strip_ansi(&idle[1].replace(CURSOR_MARKER, ""));
+                assert_eq!(content.trim_end(), draft);
+
+                editor.set_working(Some(WorkingState {
+                    frame: 0,
+                    started_at: std::time::Instant::now(),
+                    message: "Working".to_string(),
+                }));
+                for _ in 0..2 {
+                    let working = editor.render(width);
+                    assert_eq!(
+                        crate::extract_cursor_position(&working, working.len()),
+                        position,
+                        "working frames must retain the layout and IME cursor position"
+                    );
+                    assert_eq!(
+                        crate::strip_ansi(&working[1].replace(CURSOR_MARKER, "")),
+                        content,
+                        "drawing the working caret must not shift the draft"
+                    );
+                }
+                editor.set_working(None);
+                let idle_again = editor.render(width);
+                assert_eq!(
+                    crate::extract_cursor_position(&idle_again, idle_again.len()),
+                    position
+                );
+                assert_eq!(editor.get_text(), draft);
+                assert_eq!(editor.cursor_position(), (0, column));
+
+                editor.set_focused(false);
+                assert!(crate::extract_cursor_position(&editor.render(width), 20).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn working_caret_keeps_the_last_draft_line_in_a_constrained_viewport() {
+        let editor = Arc::new(Editor::simple());
         editor.set_focused(true);
-        editor.insert("echo hi");
+        editor.set_text("line0\nline1\nline2\nline3\nline4\nline5\nline6\nline7");
+        editor.set_cursor(7, "line7".len());
+        let idle = crate::render_layout_frame(editor.clone(), 20, 4);
+        assert!(idle.root.line_offset > 0);
+        assert!(idle.lines.iter().any(|line| line.contains("line7")));
+        let position = crate::extract_cursor_position(&idle.lines, idle.height);
+        assert!(position.is_some());
 
-        // Idle + focused: the caret marker is present so IME typing positions
-        // the candidate window, and no static block is drawn on top of it.
-        let idle = editor.render(20);
-        assert!(
-            idle.iter().any(|line| line.contains(CURSOR_MARKER)),
-            "focused idle editor should emit the cursor marker"
-        );
-        assert!(
-            !idle.iter().any(|line| line.contains(STATIC_CARET)),
-            "focused idle editor must not draw the static caret block"
-        );
-
-        // Working: the marker must disappear — so the renderer hides the
-        // hardware cursor instead of re-anchoring it to the caret every frame
-        // — and the static caret block takes its place.
         editor.set_working(Some(WorkingState {
             frame: 0,
             started_at: std::time::Instant::now(),
-            message: "Working…".to_string(),
+            message: "Working".to_string(),
         }));
-        let working = editor.render(20);
-        assert!(
-            !working.iter().any(|line| line.contains(CURSOR_MARKER)),
-            "working editor must not emit the cursor marker"
-        );
-        assert!(
-            working.iter().any(|line| line.contains(STATIC_CARET)),
-            "working editor must draw the static caret block"
-        );
-        assert!(
-            !editor
-                .render(20)
-                .iter()
-                .any(|line| line.contains(CURSOR_MARKER)),
-            "the marker must stay gone across successive working frames"
-        );
-
-        // Back to idle: the marker returns and the block is gone.
+        for _ in 0..2 {
+            let working = crate::render_layout_frame(editor.clone(), 20, 4);
+            assert_eq!(working.root.line_offset, idle.root.line_offset);
+            assert!(working.lines.iter().any(|line| line.contains("line7")));
+            assert_eq!(
+                crate::extract_cursor_position(&working.lines, working.height),
+                position
+            );
+        }
         editor.set_working(None);
-        let idle_again = editor.render(20);
-        assert!(
-            idle_again.iter().any(|line| line.contains(CURSOR_MARKER)),
-            "idle editor should emit the cursor marker again"
-        );
-        assert!(
-            !idle_again.iter().any(|line| line.contains(STATIC_CARET)),
-            "idle editor must not draw the static caret block"
+        let idle_again = crate::render_layout_frame(editor.clone(), 20, 4);
+        assert_eq!(idle_again.root.line_offset, idle.root.line_offset);
+        assert_eq!(
+            crate::extract_cursor_position(&idle_again.lines, idle_again.height),
+            position
         );
     }
 

@@ -95,8 +95,7 @@ impl Default for SelectListTheme {
 }
 
 /// Layout options for select list.
-#[derive(Clone)]
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SelectListLayoutOptions {
     /// Minimum width for the primary column.
     pub min_primary_column_width: Option<usize>,
@@ -105,7 +104,6 @@ pub struct SelectListLayoutOptions {
     /// Custom truncation function.
     pub truncate_primary: Option<Arc<dyn Fn(&str, usize, usize) -> String + Send + Sync>>,
 }
-
 
 /// SelectList component.
 pub struct SelectList {
@@ -590,9 +588,7 @@ impl Component for SelectList {
 
 /// Normalize text to a single line.
 fn normalize_single_line(text: &str) -> String {
-    text.replace(['\r', '\n'], " ")
-        .trim()
-        .to_string()
+    text.replace(['\r', '\n'], " ").trim().to_string()
 }
 
 #[cfg(test)]

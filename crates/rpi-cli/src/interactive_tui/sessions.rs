@@ -489,7 +489,7 @@ pub(super) fn invoke_extension_renderer(
                     Some(renderer.plugin_free_string),
                 )
             };
-            
+
             if rc == 0 {
                 Some(out.to_string_lossy())
             } else {

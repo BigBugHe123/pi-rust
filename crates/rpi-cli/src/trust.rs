@@ -34,7 +34,6 @@ pub enum TrustDecision {
     Undecided,
 }
 
-
 /// Trust configuration for a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProjectTrust {

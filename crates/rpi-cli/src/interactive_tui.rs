@@ -2395,7 +2395,9 @@ pub async fn interactive_tui(
                         state
                             .footer
                             .set_thinking_level(Some(thinking_level_name(next)));
-                        if let Some(tui) = state.tui.as_ref() { tui.request_render(false) }
+                        if let Some(tui) = state.tui.as_ref() {
+                            tui.request_render(false)
+                        }
                     }
                 });
                 continue;
