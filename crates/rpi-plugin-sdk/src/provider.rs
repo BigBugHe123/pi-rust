@@ -84,6 +84,9 @@ fn options(value: &serde_json::Value) -> SimpleStreamOptions {
     let mut options = SimpleStreamOptions::default();
     options.api_key = value["apiKey"].as_str().map(str::to_string);
     options.timeout = value["timeoutMs"].as_u64().map(Duration::from_millis);
+    options.stream_idle_timeout = value["streamIdleTimeoutMs"]
+        .as_u64()
+        .map(Duration::from_millis);
     options.max_retry_delay = value["maxRetryDelayMs"].as_u64().map(Duration::from_millis);
     options.max_retries = value["maxRetries"].as_u64().and_then(|n| n.try_into().ok());
     options.max_tokens = value["maxTokens"].as_u64();
@@ -446,11 +449,14 @@ mod tests {
     }
     #[test]
     fn options_preserve_provider_controls() {
-        let options = options(&serde_json::json!({"apiKey":"key","timeoutMs":42,
+        let options = options(
+            &serde_json::json!({"apiKey":"key","timeoutMs":42,"streamIdleTimeoutMs":11,
             "maxRetries":3,"maxRetryDelayMs":17,"reasoning":"Xhigh","maxTokens":80,
-            "headers":{"x-custom":"value"},"cacheRetention":"Long","sessionId":"s"}));
+            "headers":{"x-custom":"value"},"cacheRetention":"Long","sessionId":"s"}),
+        );
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.timeout, Some(Duration::from_millis(42)));
+        assert_eq!(options.stream_idle_timeout, Some(Duration::from_millis(11)));
         assert_eq!(options.max_retries, Some(3));
         assert_eq!(options.max_retry_delay, Some(Duration::from_millis(17)));
         assert_eq!(options.reasoning, Some(rpi_ai::ThinkingLevel::Xhigh));

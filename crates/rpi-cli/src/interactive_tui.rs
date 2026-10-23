@@ -1191,6 +1191,7 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
+        session_dir: reload_context.session_dir(),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3352,7 +3353,7 @@ pub async fn interactive_tui(
     // a terminal that scrolled away can be recovered. Mirrors
     // `formatResumeCommand` (id + `--session-dir` only when non-default).
     let session_id = harness.session().storage().metadata().id;
-    if let Some(command) = format_resume_command(&session_id, &cwd, args.session_dir.as_deref()) {
+    if let Some(command) = format_resume_command(&session_id, &cwd, Some(&state.session_dir)) {
         println!("\x1b[2mTo resume this session:\x1b[0m {command}");
     }
     println!("\nGoodbye!");
