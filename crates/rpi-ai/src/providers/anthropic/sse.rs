@@ -44,6 +44,7 @@ pub struct ServerSentEvent {
 /// Accumulator state for the line-buffered decoder. Mirrors `SseDecoderState`.
 #[derive(Debug, Default)]
 pub struct SseDecoderState {
+    started: bool,
     event: Option<String>,
     data: Vec<String>,
     raw: Vec<String>,
@@ -57,6 +58,13 @@ impl SseDecoderState {
     /// Process one complete line. Returns `Some(event)` when the line is empty
     /// (the flush trigger) and a pending event exists. Mirrors `decodeSseLine`.
     pub fn decode_line(&mut self, line: &str) -> Option<ServerSentEvent> {
+        // SSE's UTF-8 decoding strips exactly one leading BOM. Complete lines
+        // reach this decoder only after fragmented code points are reassembled.
+        let line = if std::mem::replace(&mut self.started, true) {
+            line
+        } else {
+            line.strip_prefix('\u{feff}').unwrap_or(line)
+        };
         if line.is_empty() {
             return self.flush();
         }
@@ -482,6 +490,46 @@ mod tests {
             done: false,
         };
         (sender, stream)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn leading_bom_does_not_drop_the_first_event_when_split_across_chunks() {
+        for split in 0..=3 {
+            let (sender, mut stream) = idle_test_stream();
+            let bom = b"\xef\xbb\xbf";
+            sender
+                .send(Bytes::copy_from_slice(&bom[..split]))
+                .await
+                .unwrap();
+            sender
+                .send(Bytes::copy_from_slice(&bom[split..]))
+                .await
+                .unwrap();
+            sender
+                .send(Bytes::from_static(b"data: first\n\ndata: second\n\n"))
+                .await
+                .unwrap();
+            drop(sender);
+            assert_eq!(
+                stream.next_event().await.unwrap().unwrap().data,
+                "first",
+                "split={split}"
+            );
+            assert_eq!(stream.next_event().await.unwrap().unwrap().data, "second");
+            assert!(stream.next_event().await.unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn only_one_bom_at_the_start_of_the_stream_is_stripped() {
+        let events = decode_all("\u{feff}event: message\ndata: \u{feff}payload\n\n\u{feff}data: ignored\n\ndata: later\n\n");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.as_deref(), Some("message"));
+        assert_eq!(events[0].data, "\u{feff}payload");
+        assert_eq!(events[1].data, "later");
+        for prefix in ["\n", ": comment\n", "\u{feff}"] {
+            assert!(decode_all(&format!("{prefix}\u{feff}data: ignored\n\n")).is_empty());
+        }
     }
 
     #[tokio::test(start_paused = true)]
