@@ -45,7 +45,8 @@ pub struct SimpleStreamOptions {
     pub max_retries: Option<u32>,
     /// Cap on the total backoff between retries. `None` = 60s.
     pub max_retry_delay: Option<Duration>,
-    /// Extra HTTP headers to send (merged over provider defaults).
+    /// Extra HTTP headers to send (merged over provider defaults by
+    /// case-insensitive header name).
     pub headers: Option<BTreeMap<String, String>>,
     /// Free-form provider metadata (request id, trace id, …). Anthropic reads
     /// `user_id` for abuse tracking; faux ignores it.
@@ -130,10 +131,45 @@ impl SimpleStreamOptions {
     }
 }
 
+/// Replace or remove every spelling of an HTTP header name. Header values and
+/// the selected spelling are preserved; metadata keys remain case-sensitive.
+pub fn set_http_header(headers: &mut BTreeMap<String, String>, name: &str, value: Option<&str>) {
+    headers.retain(|existing, _| !existing.eq_ignore_ascii_case(name));
+    if let Some(value) = value {
+        headers.insert(name.to_owned(), value.to_owned());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SimpleStreamOptions, DEFAULT_LLM_API_TIMEOUT};
     use std::time::Duration;
+
+    #[test]
+    fn header_patches_replace_and_delete_names_without_case_sensitivity() {
+        let mut options = super::SimpleStreamOptions {
+            headers: Some(std::collections::BTreeMap::from([
+                ("Authorization".into(), "Bearer Old".into()),
+                ("X-Tenant".into(), "tenant".into()),
+            ])),
+            ..Default::default()
+        };
+        super::SimpleStreamOptionsPatch {
+            headers: Some(std::collections::BTreeMap::from([
+                ("authorization".into(), Some("Bearer New".into())),
+                ("x-tenant".into(), None),
+            ])),
+            ..Default::default()
+        }
+        .apply(&mut options);
+        assert_eq!(
+            options.headers,
+            Some(std::collections::BTreeMap::from([(
+                "authorization".into(),
+                "Bearer New".into()
+            )]))
+        );
+    }
 
     #[test]
     fn llm_api_timeout_defaults_to_ten_minutes() {
@@ -403,10 +439,7 @@ impl SimpleStreamOptionsPatch {
         if let Some(patch) = &self.headers {
             let mut map = opts.headers.take().unwrap_or_default();
             for (k, v) in patch {
-                match v {
-                    Some(val) => map.insert(k.clone(), val.clone()),
-                    None => map.remove(k),
-                };
+                set_http_header(&mut map, k, v.as_deref());
             }
             opts.headers = if map.is_empty() { None } else { Some(map) };
         }

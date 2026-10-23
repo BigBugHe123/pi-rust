@@ -201,7 +201,7 @@ impl AgentHarnessStreamOptions {
         if let Some(h) = &self.headers {
             let mut merged = base.headers.unwrap_or_default();
             for (k, v) in h {
-                merged.insert(k.clone(), v.clone());
+                rpi_ai::provider::set_http_header(&mut merged, k, Some(v));
             }
             base.headers = Some(merged);
         }
@@ -220,8 +220,8 @@ impl AgentHarnessStreamOptions {
 }
 
 /// Per-request stream-option patch returned by provider hooks. Mirrors TS
-/// `AgentHarnessStreamOptionsPatch` — `None` means "leave unchanged", an empty
-/// `Some(map)` means "clear".
+/// `AgentHarnessStreamOptionsPatch` — outer `None` leaves a field unchanged;
+/// map entries merge, and inner `None` deletes that entry.
 #[derive(Debug, Clone, Default)]
 pub struct AgentHarnessStreamOptionsPatch {
     pub timeout: Option<Option<std::time::Duration>>,
@@ -254,14 +254,7 @@ impl AgentHarnessStreamOptionsPatch {
         if let Some(patch) = &self.headers {
             let mut map = opts.headers.take().unwrap_or_default();
             for (k, v) in patch {
-                match v {
-                    Some(val) => {
-                        map.insert(k.clone(), val.clone());
-                    }
-                    None => {
-                        map.remove(k);
-                    }
-                }
+                rpi_ai::provider::set_http_header(&mut map, k, v.as_deref());
             }
             opts.headers = if map.is_empty() { None } else { Some(map) };
         }
@@ -531,6 +524,44 @@ mod tests {
         let retry = RetryPolicy::default();
         assert!(retry.enabled);
         assert_eq!(retry.max_retries, 10);
+    }
+
+    #[test]
+    fn header_overlays_and_removals_use_case_insensitive_names() {
+        use std::collections::BTreeMap;
+        let mut overlay = super::AgentHarnessStreamOptions {
+            headers: Some(BTreeMap::from([(
+                "authorization".into(),
+                "Bearer Override".into(),
+            )])),
+            metadata: Some(BTreeMap::from([(
+                "tenant".into(),
+                "metadata override".into(),
+            )])),
+            ..Default::default()
+        };
+        let base = rpi_ai::SimpleStreamOptions {
+            headers: Some(BTreeMap::from([(
+                "Authorization".into(),
+                "Bearer Base".into(),
+            )])),
+            metadata: Some(BTreeMap::from([("Tenant".into(), "metadata base".into())])),
+            ..Default::default()
+        };
+        let merged = overlay.merge_into(base);
+        assert_eq!(merged.headers, overlay.headers);
+        assert_eq!(
+            merged.metadata.unwrap().len(),
+            2,
+            "metadata names retain their case-sensitive semantics"
+        );
+        super::AgentHarnessStreamOptionsPatch {
+            headers: Some(BTreeMap::from([("AUTHORIZATION".into(), None)])),
+            ..Default::default()
+        }
+        .apply(&mut overlay);
+        assert_eq!(overlay.headers, None);
+        assert_eq!(overlay.metadata.unwrap().len(), 1);
     }
 
     #[test]

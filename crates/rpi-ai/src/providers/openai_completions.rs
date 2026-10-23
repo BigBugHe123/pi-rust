@@ -144,10 +144,13 @@ async fn run_stream(
     let mut state = StreamState::new(model);
     let api_key = resolve_api_key(&provider_key, opts, allow_env_api_key);
 
-    let mut headers = model.headers.clone().unwrap_or_default();
-    if let Some(extra) = &opts.headers {
+    let mut headers = BTreeMap::new();
+    for extra in [model.headers.as_ref(), opts.headers.as_ref()]
+        .into_iter()
+        .flatten()
+    {
         for (name, value) in extra {
-            headers.insert(name.clone(), value.clone());
+            crate::provider::set_http_header(&mut headers, name, Some(value));
         }
     }
     apply_api_key(&mut headers, api_key);
