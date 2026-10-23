@@ -801,6 +801,11 @@ pub async fn build_prepared(
         ),
         stream_options: AgentHarnessStreamOptions {
             timeout: args.timeout,
+            stream_idle_timeout: args.stream_idle_timeout.or_else(|| {
+                saved_settings
+                    .stream_idle_timeout
+                    .map(std::time::Duration::from_secs)
+            }),
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,
@@ -1507,6 +1512,15 @@ where
     let context_block = format_project_context(&context_files);
 
     let mut details: Vec<String> = Vec::new();
+    if let Some(resolved) = &refreshed {
+        warnings |= !resolved.compat_warnings.is_empty();
+        details.extend(
+            resolved
+                .compat_warnings
+                .iter()
+                .map(|warning| format!("warning: models.json: {warning}")),
+        );
+    }
     if !skill_diags.is_empty() || !prompt_diags.is_empty() || !resource_diags.is_empty() {
         warnings = true;
         // Collect formatted diagnostics for the caller to surface in its UI
