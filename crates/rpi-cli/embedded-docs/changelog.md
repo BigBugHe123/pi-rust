@@ -11,6 +11,21 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.8.4](https://github.com/bigfish1913/pi-rust/compare/v0.8.3...v0.8.4) - 2026-10-23
+
+### Added
+
+- apply lossless backpressure throughout provider streaming
+
+### Fixed
+
+- drain queued assistant events before terminal delivery
+
+### Other
+
+- *(ai)* clarify bounded stream API and async production
+- *(extensions)* await applied metadata before saturation cancellation
+
 ## [0.8.3](https://github.com/bigfish1913/pi-rust/compare/v0.8.2...v0.8.3) - 2026-10-23
 
 ### Added
