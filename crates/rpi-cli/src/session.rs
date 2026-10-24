@@ -2870,8 +2870,10 @@ async fn open_session(
     Ok(Session::new(storage_arc, None))
 }
 
-/// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`.
-fn ephemeral_session() -> Session {
+/// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`
+/// and for `/new` inside such a run — an ephemeral launch keeps swapping in
+/// in-memory sessions, never a JSONL file.
+pub(crate) fn ephemeral_session() -> Session {
     let storage = Arc::new(InMemorySessionStorage::new(
         SessionMetadata {
             id: "ephemeral".into(),
