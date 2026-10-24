@@ -746,12 +746,25 @@ fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
                     .await
                     .unwrap();
                 assert!(note.contains("second/shared"));
+                assert!(
+                    note.contains("Not saved as the default"),
+                    "the note should say the switch was not persisted: {note}"
+                );
                 assert_eq!(lane.get_model().await.unwrap(), second);
                 assert!(
                     strip_ansi(&state.footer.render(120).join("\n")).contains("(second) shared")
                 );
                 let saved = crate::settings::load_settings().unwrap();
-                assert_eq!(saved.default_provider.as_deref(), Some("second"));
+                assert_eq!(
+                    saved.default_provider.as_deref(),
+                    None,
+                    "a session-scoped switch must not save a default provider"
+                );
+                assert_eq!(
+                    saved.default_model.as_deref(),
+                    None,
+                    "a session-scoped switch must not save a default model"
+                );
                 assert_eq!(
                     cycle_model(&lane, &catalog, true).await.unwrap().unwrap(),
                     first
@@ -785,6 +798,41 @@ fn hot_cycle_crosses_providers_and_anchors_duplicate_ids_to_the_live_lane() {
                     crate::settings::load_settings().unwrap().default_provider,
                     saved.default_provider
                 );
+            });
+    });
+}
+
+/// The only path allowed to touch `settings.json`: `/settings` → Default model
+/// passes `save_default = true` and must still persist the pair.
+#[test]
+fn explicit_default_model_selection_still_persists() {
+    with_isolated_config_dir(|| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let harness = AgentHarness::create(Default::default()).await.unwrap();
+                let lane: Arc<dyn AgentLane> = harness.lane("main");
+                let state = test_tui_state();
+                let model = rpi_ai::Model::new(
+                    "saved-model",
+                    "Saved",
+                    rpi_ai::Api::OpenaiCompletions,
+                    "saved",
+                    "http://saved.invalid",
+                );
+                lane.set_model(model.clone()).await.unwrap();
+                let note = apply_model_selection(&lane, &state, model.clone(), true)
+                    .await
+                    .unwrap();
+                assert!(note.contains("saved/saved-model"), "{note}");
+                assert!(note.contains("Default saved."), "{note}");
+                assert_eq!(lane.get_model().await.unwrap(), model);
+                let saved = crate::settings::load_settings().unwrap();
+                assert_eq!(saved.default_provider.as_deref(), Some("saved"));
+                assert_eq!(saved.default_model.as_deref(), Some("saved-model"));
+                harness.close().await.unwrap();
             });
     });
 }
