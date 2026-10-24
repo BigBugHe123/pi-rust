@@ -27,6 +27,58 @@ struct State {
     peak_count: usize,
     peak_bytes: usize,
 }
+
+// Only combine deltas that are already queued. This introduces no flush timer:
+// a lone chunk is delivered immediately. Authoritative snapshots, metadata and
+// unfamiliar fields stay separate, as do changes of content block or kind.
+const MAX_DELTA_BATCH_BYTES: usize = 4096;
+
+fn delta_identity(chunk: &StreamChunk) -> Option<(&str, u64, &str)> {
+    let object = chunk.as_object()?;
+    if object.len() != 3 {
+        return None;
+    }
+    let kind = object.get("type")?.as_str()?;
+    if !matches!(kind, "text_delta" | "thinking_delta") {
+        return None;
+    }
+    Some((
+        kind,
+        object.get("contentIndex")?.as_u64()?,
+        object.get("delta")?.as_str()?,
+    ))
+}
+
+impl State {
+    fn pop_batch(&mut self) -> Option<StreamChunk> {
+        let (mut chunk, bytes) = self.chunks.pop_front()?;
+        self.bytes -= bytes;
+        while let (Some((kind, index, delta)), Some((next, _))) =
+            (delta_identity(&chunk), self.chunks.front())
+        {
+            let Some((next_kind, next_index, next_delta)) = delta_identity(next) else {
+                break;
+            };
+            if kind != next_kind
+                || index != next_index
+                || delta.len().saturating_add(next_delta.len()) > MAX_DELTA_BATCH_BYTES
+            {
+                break;
+            }
+            let (mut next, bytes) = self.chunks.pop_front().unwrap();
+            self.bytes -= bytes;
+            let serde_json::Value::String(next_delta) =
+                next.as_object_mut().unwrap().remove("delta").unwrap()
+            else {
+                unreachable!("delta_identity checked the string")
+            };
+            if let serde_json::Value::String(delta) = &mut chunk["delta"] {
+                delta.push_str(&next_delta);
+            }
+        }
+        Some(chunk)
+    }
+}
 pub(super) struct Queue {
     state: Mutex<State>,
     capacity: usize,
@@ -123,8 +175,7 @@ impl Receiver {
                 if state.cancelled || !state.consumer_open {
                     return None;
                 }
-                if let Some((chunk, bytes)) = state.chunks.pop_front() {
-                    state.bytes -= bytes;
+                if let Some(chunk) = state.pop_batch() {
                     self.queue.writable.notify_all();
                     return Some(chunk);
                 }
@@ -168,6 +219,96 @@ impl Drop for Receiver {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    fn delta(kind: &str, index: u64, text: &str) -> StreamChunk {
+        serde_json::json!({"type":kind,"contentIndex":index,"delta":text})
+    }
+
+    #[tokio::test]
+    async fn queued_unicode_deltas_share_a_snapshot_boundary_without_waiting_for_more() {
+        for kind in ["text_delta", "thinking_delta"] {
+            let (tx, mut rx) = channel(8, 4096, Arc::new(ProviderControlState::default()));
+            for text in ["hello", "", " 🐈"] {
+                tx.send(delta(kind, 2, text), 64).unwrap();
+            }
+            // Keep the sender open: a ready batch must not wait for another chunk.
+            let chunk = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(chunk, delta(kind, 2, "hello 🐈"));
+            {
+                let state = rx.queue.state.lock().unwrap();
+                assert!(state.chunks.is_empty());
+                assert_eq!(state.bytes, 0);
+            }
+            drop(tx);
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn batching_preserves_snapshot_metadata_block_and_unknown_field_boundaries() {
+        let mut authoritative = delta("text_delta", 0, "replace");
+        authoritative["partial"] = serde_json::json!({"content":[]});
+        let mut unfamiliar = delta("text_delta", 0, "future");
+        unfamiliar["signature"] = serde_json::json!("must survive");
+        for boundary in [
+            authoritative,
+            unfamiliar,
+            delta("text_delta", 1, "next block"),
+            delta("thinking_delta", 0, "thinking"),
+            delta("toolcall_delta", 0, "{}"),
+            serde_json::json!({"type":"usage","usage":{"input":3}}),
+            serde_json::json!({"type":"text_delta","contentIndex":0,"delta":null}),
+            serde_json::json!({"type":"text_delta","delta":"missing index"}),
+        ] {
+            let (tx, mut rx) = channel(4, 4096, Arc::new(ProviderControlState::default()));
+            let first = delta("text_delta", 0, "a");
+            let last = delta("text_delta", 0, "b");
+            for chunk in [&first, &boundary, &last] {
+                tx.send(chunk.clone(), 100).unwrap();
+            }
+            drop(tx);
+            assert_eq!(rx.recv().await, Some(first));
+            assert_eq!(rx.recv().await, Some(boundary));
+            assert_eq!(rx.recv().await, Some(last));
+            assert!(rx.recv().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn batches_respect_the_byte_cap_and_cancellation() {
+        let control = Arc::new(ProviderControlState::default());
+        let (tx, mut rx) = channel(8, 65536, Arc::clone(&control));
+        let text = "x".repeat(MAX_DELTA_BATCH_BYTES / 2);
+        for _ in 0..3 {
+            tx.send(delta("text_delta", 0, &text), text.len()).unwrap();
+        }
+        assert_eq!(
+            rx.recv().await,
+            Some(delta("text_delta", 0, &text.repeat(2)))
+        );
+        assert_eq!(rx.queue.state.lock().unwrap().bytes, text.len());
+        control.cancel();
+        assert!(
+            rx.recv().await.is_none(),
+            "cancelled queued content is not forwarded"
+        );
+        rx.close();
+        assert_eq!(rx.queue.state.lock().unwrap().bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_oversized_delta_is_delivered_unchanged() {
+        let (tx, mut rx) = channel(2, 128, Arc::new(ProviderControlState::default()));
+        let large = delta("text_delta", 0, &"x".repeat(MAX_DELTA_BATCH_BYTES + 1));
+        tx.send(large.clone(), MAX_DELTA_BATCH_BYTES + 1).unwrap();
+        assert_eq!(rx.recv().await, Some(large));
+        let small = delta("text_delta", 0, "next");
+        tx.send(small.clone(), 4).unwrap();
+        assert_eq!(rx.recv().await, Some(small));
+    }
 
     #[tokio::test]
     async fn capacity_one_dequeues_losslessly_and_wakes_blocking_producer() {

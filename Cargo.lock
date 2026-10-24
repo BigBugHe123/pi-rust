@@ -2494,6 +2494,7 @@ dependencies = [
  "rpi-extensions",
  "rpi-harness",
  "rpi-plugin-sdk",
+ "rpi-runtime",
  "rpi-telemetry",
  "rpi-tools",
  "rpi-tui",
@@ -2569,6 +2570,21 @@ dependencies = [
  "serde_json",
  "tokio",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rpi-runtime"
+version = "0.8.4"
+dependencies = [
+ "async-trait",
+ "indexmap 2.14.2",
+ "reqwest",
+ "rpi-ai",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

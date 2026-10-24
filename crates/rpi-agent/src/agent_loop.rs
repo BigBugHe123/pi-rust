@@ -509,7 +509,7 @@ async fn stream_assistant_response(
                             // streaming delta, and the provider already built the
                             // snapshot it hands us.
                             message: Arc::clone(partial),
-                            assistant_message_event: event.clone(),
+                            assistant_message_event: event,
                         },
                     )
                     .await;

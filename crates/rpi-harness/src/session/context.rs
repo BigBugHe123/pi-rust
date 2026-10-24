@@ -74,22 +74,26 @@ impl std::fmt::Debug for SessionContextBuildOptions {
 /// after it; if no compaction, keep all entries. Mirrors
 /// `defaultContextEntryTransform`.
 pub fn default_context_entry_transform(path_entries: &[Entry]) -> Vec<Entry> {
-    let mut compaction_index = None;
-    for (i, entry) in path_entries.iter().enumerate().rev() {
-        if matches!(entry, Entry::Compaction(_)) {
-            compaction_index = Some(i);
-            break;
-        }
+    default_context_entries(path_entries).to_vec()
+}
+
+fn default_context_entries(path_entries: &[Entry]) -> &[Entry] {
+    let start = path_entries
+        .iter()
+        .rposition(|entry| matches!(entry, Entry::Compaction(_)))
+        .unwrap_or(0);
+    &path_entries[start..]
+}
+
+fn context_entries<'a>(
+    path_entries: &'a [Entry],
+    options: &SessionContextBuildOptions,
+) -> std::borrow::Cow<'a, [Entry]> {
+    let mut entries = std::borrow::Cow::Borrowed(default_context_entries(path_entries));
+    for transform in &options.entry_transforms {
+        entries = std::borrow::Cow::Owned(transform(&entries));
     }
-    match compaction_index {
-        None => path_entries.to_vec(),
-        Some(i) => {
-            let mut out = Vec::with_capacity(path_entries.len() - i);
-            out.push(path_entries[i].clone());
-            out.extend(path_entries[i + 1..].iter().cloned());
-            out
-        }
-    }
+    entries
 }
 
 /// `buildContextEntries` — apply the default transform, then each caller
@@ -98,11 +102,7 @@ pub fn build_context_entries(
     path_entries: &[Entry],
     options: &SessionContextBuildOptions,
 ) -> Vec<Entry> {
-    let mut entries = default_context_entry_transform(path_entries);
-    for transform in &options.entry_transforms {
-        entries = transform(&entries);
-    }
-    entries
+    context_entries(path_entries, options).into_owned()
 }
 
 /// `sessionEntryToContextMessages` — project one entry to context messages.
@@ -207,7 +207,7 @@ pub fn build_session_context(
     options: &SessionContextBuildOptions,
 ) -> SessionContext {
     let mut ctx = derive_session_context_state(path_entries);
-    let context_entries = build_context_entries(path_entries, options);
+    let context_entries = context_entries(path_entries, options);
     let mut messages = Vec::new();
     for (index, entry) in context_entries.iter().enumerate() {
         messages.extend(session_entry_to_context_messages(

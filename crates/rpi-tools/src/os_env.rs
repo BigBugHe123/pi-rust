@@ -64,6 +64,8 @@ struct ShellConfig {
     transport: CommandTransport,
 }
 
+mod append;
+
 /// Environment variables the **host** sets for its own runtime plumbing, which
 /// must not be handed to a shell it spawns.
 ///
@@ -393,6 +395,13 @@ async fn kill_process_tree(pid: u32) {
 
 #[async_trait]
 impl FileSystem for OsExecutionEnv {
+    async fn open_append_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
+        let path = Self::resolve_path(&self.cwd, path);
+        Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
+    }
     fn cwd(&self) -> &Path {
         &self.cwd
     }

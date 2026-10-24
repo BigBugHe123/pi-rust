@@ -176,23 +176,31 @@ async fn run_stream(
     // Callers can override this through SimpleStreamOptions when needed.
     let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
+    let mut request = http.post(&url).timeout(timeout);
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let request = match super::request::PreparedJsonRequest::new(request, &body) {
+        Ok(request) => request,
+        Err(error) => {
+            state
+                .error(
+                    producer,
+                    format!("failed to encode request: {error}"),
+                    false,
+                )
+                .await;
+            return;
+        }
+    };
+    drop(body);
     let response = retry_provider_request(
         move || {
-            let http = http.clone();
-            let url = url.clone();
-            let body = body.clone();
-            let headers = headers.clone();
+            let request = request.clone();
             let signal = signal.clone();
             async move {
-                let mut request = http.post(&url).timeout(timeout);
-                for (name, value) in headers {
-                    request = request.header(name, value);
-                }
                 let response = tokio::select! {
-                    result = request.json(&body).send() => result.map_err(|error| AiError::Http {
-                        status: None,
-                        message: format!("http transport error: {error}"),
-                    })?,
+                    result = request.send() => result?,
                     _ = signal.cancelled() => return Err(AiError::Abort {
                         message: "Request aborted".into(),
                     }),

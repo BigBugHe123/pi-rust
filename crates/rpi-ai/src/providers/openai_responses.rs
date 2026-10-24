@@ -1205,9 +1205,26 @@ async fn run_stream(
     let url = responses_url(&model.base_url);
     let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
-    let response = retry_provider_request(move || { let http=http.clone(); let url=url.clone(); let body=body.clone(); let headers=headers.clone(); let signal=signal.clone(); async move {
-        let mut req=http.post(&url).json(&body).timeout(timeout); for (k,v) in headers { req=req.header(k,v); }
-        let response = tokio::select! { r=req.send()=>r.map_err(|e| AiError::Http{status:None,message:e.to_string()})?, _=signal.cancelled()=>return Err(AiError::Abort{message:"Request aborted".into()})};
+    let mut builder = http.post(&url).timeout(timeout);
+    for (name, value) in headers {
+        builder = builder.header(name, value);
+    }
+    let request = match super::request::PreparedJsonRequest::new(builder, &body) {
+        Ok(request) => request,
+        Err(error) => {
+            emit_error(
+                p,
+                &mut out,
+                format!("failed to encode request: {error}"),
+                false,
+            )
+            .await;
+            return;
+        }
+    };
+    drop(body);
+    let response = retry_provider_request(move || { let request=request.clone(); let signal=signal.clone(); async move {
+        let response = tokio::select! { r=request.send()=>r?, _=signal.cancelled()=>return Err(AiError::Abort{message:"Request aborted".into()})};
         if response.status().is_success() { Ok(response) } else { let status=response.status().as_u16(); let msg=response.text().await.unwrap_or_default(); Err(AiError::Http{status:Some(status),message:msg}) }
     }}, opts.max_retries, opts.max_retry_delay, &opts.signal).await;
     let response = match response {

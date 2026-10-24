@@ -30,6 +30,21 @@ impl std::fmt::Debug for ExecutionBinding {
 pub(super) fn descriptor(model: &Model) -> Model {
     let mut model = model.clone();
     model.headers = None;
+    // Endpoint userinfo, queries and fragments can carry credentials too. Only
+    // the private binding needs the complete URL; public routing uses identity.
+    if let Ok(mut url) = reqwest::Url::parse(&model.base_url) {
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            let _ = url.set_username("");
+            let _ = url.set_password(None);
+            url.set_query(None);
+            url.set_fragment(None);
+            model.base_url = url.into();
+        }
+    }
     model
 }
 
@@ -43,7 +58,7 @@ impl ExecutionBinding {
         }
     }
 
-    pub fn models(&self) -> &[Model] {
+    pub fn descriptors(&self) -> &[Model] {
         &self.descriptors
     }
 

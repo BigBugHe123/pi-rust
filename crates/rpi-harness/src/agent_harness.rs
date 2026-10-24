@@ -2078,10 +2078,7 @@ impl AgentHarness {
         }
         // Prepare everything against a pinned target before publishing the swap.
         // A failed read must leave the old session and its queues untouched.
-        let target = Session::new(
-            session.storage(),
-            Some(Arc::clone(self.session.id_generator())),
-        );
+        let target = session.pin(Arc::clone(self.session.id_generator()));
         let lanes = target.get_lanes().await.map_err(session_to_harness_err)?;
         if !lanes.iter().any(|lane| lane.lane == self.lane) {
             return Err(HarnessError::io(
@@ -2120,7 +2117,7 @@ impl AgentHarness {
             scope.cancel();
             *scope = CancellationToken::new();
         }
-        self.session.set_storage(target.storage());
+        self.session.rebind_to(&target);
         Ok(())
     }
 
@@ -2958,7 +2955,10 @@ impl AgentHarness {
                 match provider {
                     Some(p) => {
                         let model = model.clone();
-                        let mut ctx = ctx.clone();
+                        // Hooks usually observe the context without replacing it.
+                        // Keep the history borrowed until an actual patch needs
+                        // a private mutable copy for this request.
+                        let mut ctx = std::borrow::Cow::Borrowed(ctx);
                         // B4 [merge_into]: the loop builds `opts` via
                         // `AgentLoopConfig::to_stream_options`, which DROPS the
                         // harness's pinned `headers`/`metadata` (AgentLoopConfig
@@ -2975,7 +2975,9 @@ impl AgentHarness {
                             // request carries — and only this one, since `ctx` is
                             // rebuilt per call from the loop's context.
                             if let Some(patch) = hooks.transform_context(&model, &ctx) {
-                                patch.apply(&mut ctx);
+                                if patch != rpi_ai::ContextPatch::default() {
+                                    patch.apply(ctx.to_mut());
+                                }
                             }
                             if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
                                 patch.apply(&mut opts);
@@ -5858,5 +5860,90 @@ mod session_switch_tests {
                     )
             )
         }));
+    }
+}
+
+#[cfg(test)]
+mod borrowed_context_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Probe(Arc<Mutex<(usize, Option<String>)>>);
+    #[async_trait::async_trait]
+    impl rpi_ai::Provider for Probe {
+        fn id(&self) -> &str {
+            "probe"
+        }
+        fn models(&self) -> &[Model] {
+            &[]
+        }
+        async fn stream_simple(
+            &self,
+            model: &Model,
+            context: &rpi_ai::Context,
+            _: &rpi_ai::SimpleStreamOptions,
+        ) -> rpi_ai::AssistantMessageEventStream {
+            *self.0.lock().unwrap() = (
+                context.messages.as_ptr() as usize,
+                context.system_prompt.clone(),
+            );
+            let (mut producer, stream) =
+                rpi_ai::event_stream::create_assistant_message_event_stream();
+            producer
+                .push(rpi_ai::AssistantMessageEvent::Done {
+                    reason: rpi_ai::DoneReason::Stop,
+                    message: AssistantMessage::empty(model.api.clone(), "probe", "m", 0),
+                })
+                .await;
+            stream
+        }
+    }
+    struct Hook(u8);
+    impl rpi_ai::ProviderHooks for Hook {
+        fn transform_context(
+            &self,
+            _: &Model,
+            _: &rpi_ai::Context,
+        ) -> Option<rpi_ai::ContextPatch> {
+            match self.0 {
+                0 => None,
+                1 => Some(Default::default()),
+                _ => Some(rpi_ai::ContextPatch {
+                    system_prompt: Some("patched".into()),
+                }),
+            }
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observational_hooks_borrow_history_and_mutating_hooks_are_isolated() {
+        for hook in [None, Some(0), Some(1), Some(2)] {
+            let observed = Arc::new(Mutex::new((0, None)));
+            let provider = Arc::new(Probe(Arc::clone(&observed)));
+            let stream_fn = AgentHarness::build_stream_fn(
+                vec![provider],
+                hook.map(|kind| Arc::new(Hook(kind)) as Arc<dyn rpi_ai::ProviderHooks>),
+                Default::default(),
+            )
+            .unwrap();
+            let mut context =
+                rpi_ai::Context::new(vec![
+                    rpi_ai::UserMessage::new("history".repeat(4096), 0).into()
+                ]);
+            context.system_prompt = Some("original".into());
+            let model = Model::new("m", "M", rpi_ai::Api::Faux, "probe", "http://localhost");
+            stream_fn(&model, &context, &Default::default())
+                .result()
+                .await
+                .unwrap();
+            let (pointer, prompt) = observed.lock().unwrap().clone();
+            if hook == Some(2) {
+                assert_ne!(pointer, context.messages.as_ptr() as usize);
+                assert_eq!(prompt.as_deref(), Some("patched"));
+            } else {
+                assert_eq!(pointer, context.messages.as_ptr() as usize);
+                assert_eq!(prompt.as_deref(), Some("original"));
+            }
+            assert_eq!(context.system_prompt.as_deref(), Some("original"));
+        }
     }
 }
