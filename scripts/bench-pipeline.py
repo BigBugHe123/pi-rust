@@ -31,6 +31,19 @@ def main():
         ):
             data = subprocess.check_output(["git", "show", f"{baseline}:{source}"], cwd=repo)
             (fixture / name).write_bytes(data)
+        # `state.rs` declares `mod snapshot;`. Because it is staged as a
+        # sibling file (`baseline_state.rs`), Rust resolves that child module
+        # under `baseline_state/snapshot.rs`, not beside the fixture root.
+        # Copy the baseline child module as well so older revisions remain
+        # runnable by this offline benchmark.
+        baseline_snapshot = fixture / "baseline_state" / "snapshot.rs"
+        baseline_snapshot.parent.mkdir()
+        baseline_snapshot.write_bytes(
+            subprocess.check_output(
+                ["git", "show", f"{baseline}:crates/rpi-harness/src/session/state/snapshot.rs"],
+                cwd=repo,
+            )
+        )
         sources = {
             "rpc_events.rs": "crates/rpi-cli/src/rpc/events.rs",
             "protocol.rs": "crates/rpi-cli/src/remote/protocol.rs",

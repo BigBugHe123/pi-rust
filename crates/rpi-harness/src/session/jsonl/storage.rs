@@ -61,7 +61,7 @@ use crate::session::jsonl::codec::{
 use crate::session::jsonl::errors::{file_result, invalid_file, JsonlDecodeErrorKind};
 use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
 use crate::session::memory::{stamp_record, Clock};
-use crate::session::state::SessionState;
+use crate::session::state::{ApplyOutcome, SessionState};
 use crate::session::types::{
     provisioned_into_entry, BranchBounds, Entry, EntryQuery, ForkOptions, IdGenerator, LanePointer,
     LaneRecord, LogItem, LogOptions, OperationStartedRecord, ProvisionedEntry, RecordQuery,
@@ -471,15 +471,14 @@ impl SessionStorage for JsonlSessionStorage {
             seq,
             timestamp,
             lane: Some(lane.to_string()),
-            entry: full.clone(),
+            entry: full,
         };
         drop(state);
         self.append_mutation_line(&mutation).await?;
         let mut state = self.state.lock().await;
-        state.apply_mutation(mutation)?;
-        match state.get_entry(full.id()) {
-            Some(stamped) => Ok(stamped.clone()),
-            None => Err(SessionError::storage("append_entry did not persist")),
+        match state.apply_mutation(mutation)? {
+            ApplyOutcome::Entry(stamped) => Ok(stamped),
+            _ => Err(SessionError::storage("append_entry did not persist")),
         }
     }
 
@@ -502,14 +501,14 @@ impl SessionStorage for JsonlSessionStorage {
         let seq = state.next_sequence();
         let timestamp = self.clock.now_ms();
         let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-        let mutation = SessionMutation::Record {
-            record: stamped.clone(),
-        };
+        let mutation = SessionMutation::Record { record: stamped };
         drop(state);
         self.append_mutation_line(&mutation).await?;
         let mut state = self.state.lock().await;
-        state.apply_mutation(mutation)?;
-        Ok(stamped)
+        match state.apply_mutation(mutation)? {
+            ApplyOutcome::Record(stamped) => Ok(stamped),
+            _ => Err(SessionError::storage("append_record did not persist")),
+        }
     }
 
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
@@ -681,6 +680,101 @@ mod tests {
     use crate::session::types::{
         OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase,
     };
+
+    #[tokio::test]
+    async fn append_returns_the_owned_payload_but_keeps_storage_defensive() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let jsonl = JsonlSessionStorage::create(
+            fs,
+            "/owned.jsonl",
+            header(),
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        let memory = crate::session::memory::InMemorySessionStorage::new(
+            SessionMetadata {
+                id: "memory".into(),
+                created_at: 0,
+                parent_session_id: None,
+            },
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        );
+        let storages: Vec<Arc<dyn SessionStorage>> = vec![Arc::new(jsonl), Arc::new(memory)];
+        for storage in storages {
+            let text = "owned append".repeat(4096);
+            let original_pointer = text.as_ptr() as usize;
+            let expected = text.clone();
+            let mut returned = storage
+                .append_entry(
+                    ProvisionedEntry {
+                        id: "entry".into(),
+                        kind: ProvisionedKind::Message {
+                            message: rpi_ai::UserMessage::new(text, 0).into(),
+                            terminate: None,
+                        },
+                    },
+                    "main",
+                )
+                .await
+                .unwrap();
+            let Entry::Message(message) = &mut returned else {
+                panic!("expected message")
+            };
+            let rpi_agent::AgentMessage::User(user) = &mut message.message else {
+                panic!("expected user")
+            };
+            let rpi_ai::UserContent::Text(text) = &mut user.content else {
+                panic!("expected text")
+            };
+            assert_eq!(text.as_ptr() as usize, original_pointer);
+            text.clear();
+            let Entry::Message(stored) = storage.get_entry("entry").await.unwrap().unwrap() else {
+                panic!("expected stored message")
+            };
+            let rpi_agent::AgentMessage::User(user) = stored.message else {
+                panic!("expected stored user")
+            };
+            assert_eq!(user.content, rpi_ai::UserContent::Text(expected));
+
+            let payload = "owned frame".repeat(4096);
+            let original_pointer = payload.as_ptr() as usize;
+            let expected = payload.clone();
+            let mut returned = storage
+                .append_record(LaneRecord::AssistantFrame(
+                    crate::session::types::AssistantFrameRecord {
+                        base: RecordBase {
+                            id: "frame".into(),
+                            seq: 0,
+                            lane: "main".into(),
+                            timestamp: 0,
+                        },
+                        run_id: "run".into(),
+                        stream_index: 0,
+                        op: crate::session::types::AssistantFrameOp::Append,
+                        frame: Some(serde_json::Value::String(payload)),
+                    },
+                ))
+                .await
+                .unwrap();
+            let LaneRecord::AssistantFrame(frame) = &mut returned else {
+                panic!("expected frame")
+            };
+            let Some(serde_json::Value::String(payload)) = &mut frame.frame else {
+                panic!("expected frame payload")
+            };
+            assert_eq!(payload.as_ptr() as usize, original_pointer);
+            payload.clear();
+            let records = storage.find_records(&RecordQuery::default()).await.unwrap();
+            let LaneRecord::AssistantFrame(frame) = &records[0] else {
+                panic!("expected stored frame")
+            };
+            assert_eq!(frame.frame, Some(serde_json::Value::String(expected)));
+        }
+    }
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
         rpi_agent::message::AgentMessage::User(rpi_ai::types::UserMessage::new(text, 1))

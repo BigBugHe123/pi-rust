@@ -3702,12 +3702,13 @@ impl AgentHarness {
             });
         }
 
-        // Build the branch path (now includes the just-persisted prompts).
-        let path = self.branch_path_oldest_first().await?;
-        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
-
         // Pre-run compaction evaluation.
         if snap.compaction.enabled && snap.model.context_window > 0 {
+            // Do not load and clone history for an evaluation that is disabled.
+            // Keep this separate from the post-compaction read: compaction can
+            // change the branch, and caller transforms may be stateful.
+            let path = self.branch_path_oldest_first().await?;
+            let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
             let ctx = build_session_context(&path, &build_opts);
             let ctx_tokens = estimate_context_tokens(&ctx.messages).tokens;
             let window = snap.model.context_window as i64;
@@ -4026,11 +4027,18 @@ impl AgentHarness {
             self.clone(),
         ));
         let result = loop {
+            // An attempt owns its history. A retry reloads the durable branch
+            // below, so retaining a deep copy of these messages is unnecessary.
+            let attempt_context = AgentContext {
+                system_prompt: agent_context.system_prompt.clone(),
+                messages: std::mem::take(&mut agent_context.messages),
+                tools: agent_context.tools.clone(),
+            };
             // Entering from an assistant runs that message's tools as its very
             // first action, which is exactly why it is never retried (see below).
             let attempt_result = if from_assistant {
                 run_agent_loop_from_assistant(
-                    agent_context.clone(),
+                    attempt_context,
                     config.clone(),
                     Arc::clone(&emitter),
                     Arc::clone(&stream_fn),
@@ -4039,7 +4047,7 @@ impl AgentHarness {
             } else {
                 run_agent_loop(
                     Vec::new(),
-                    agent_context.clone(),
+                    attempt_context,
                     config.clone(),
                     Arc::clone(&emitter),
                     Arc::clone(&stream_fn),

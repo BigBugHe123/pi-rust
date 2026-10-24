@@ -83,9 +83,16 @@ class Client(Base):
         request = self.send('prompt', message=text, content=text)
         ack = False
         final = settled = None
+        turn_started = None
+        turn_ms = []
         deadline = start + 90
         while not (ack and settled is not None):
             now, event = self.next(deadline)
+            if event.get('type') == 'turn_start':
+                turn_started = now
+            elif event.get('type') == 'turn_end' and turn_started is not None:
+                turn_ms.append((now - turn_started) * 1000)
+                turn_started = None
             if event.get('type') == 'agent_end':
                 final = now
             if event.get('type') == 'agent_settled':
@@ -109,6 +116,8 @@ class Client(Base):
                 'agent_end_ms': (final - start) * 1000,
                 'settle_gap_ms': (settled - final) * 1000,
                 'cpu_ms': after['cpu_ms'] - before['cpu_ms'],
+                'turn_ms': turn_ms,
+                'turn_count': len(turn_ms),
                 'rpc_bytes': dict(sizes), 'rpc_events': dict(counts)}
 
 
@@ -167,7 +176,11 @@ def sample(name, extensions, persistence, scenario, rep):
             assert s['STATE']['requests'] == 1 and not s['STATE']['errors'], s['STATE']
         row['prompts'] = {key: sum(value[key] for value in prompts)
                           for key in ['wall_ms', 'agent_end_ms', 'settle_gap_ms', 'cpu_ms']}
-        row['prompts'].update(individual=prompts, memory=c.memory(), session_files=files(c, previous))
+        row['prompts'].update(
+            individual=prompts,
+            turn_ms=[duration for value in prompts for duration in value['turn_ms']],
+            turn_count=sum(value['turn_count'] for value in prompts),
+            memory=c.memory(), session_files=files(c, previous))
         row['stderr'] = ''.join(c.stderr)
         assert 'failed to load' not in row['stderr'].lower(), row['stderr']
         return row
@@ -200,7 +213,7 @@ report = {'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
           'extension_sha256': {str(path): sha(path) for path in (s['ROOT'] / 'extensions/target/release').glob('libbench_echo_*.so')},
           'runs': a.runs, 'warmup': a.warmup, 'turns': a.turns, 'prompt_count': a.prompts,
           'worker_threads_override': a.worker_threads,
-          'notes': 'All programs wait for completed settlement. agent_end_ms separately records the same final agent event boundary. /proc CPU resolution 10 ms. Chain exactly matches archived workloads; fresh runs only short prompts in a new session. Same fixed fixture binaries; no live model or credentials.',
+          'notes': 'All programs wait for completed settlement. agent_end_ms separately records the same final agent event boundary; turn_ms records each turn_start→turn_end interval (one LLM/tool turn), while wall_ms covers the whole logical prompt. /proc CPU resolution 10 ms. Chain exactly matches archived workloads; fresh runs only short prompts in a new session. Same fixed fixture binaries; no live model or credentials.',
           'workdir': str(s['WORK']), 'samples': [], 'errors': []}
 
 
