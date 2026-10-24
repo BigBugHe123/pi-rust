@@ -103,7 +103,7 @@ jobs:
       - name: Check the standalone ABI core
         run: cargo check -p rpi-plugin-sdk --no-default-features --locked
 
-      - name: Test provider bridge reconstruction
+      - name: Test provider bridge reconstruction and capacity
         run: cargo test -p rpi-extensions --features provider-performance --locked 'provider::'
 
       - name: Test prebuilt release manifests
@@ -113,6 +113,21 @@ jobs:
         run: |
           python3 scripts/test_release_automation.py
           python3 scripts/test_release_channels.py
+
+  windows-plugin-lifecycle:
+    name: Windows plugin ABI and DLL lifecycle
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Negotiate old and new ABI tables
+        run: cargo test -p rpi-plugin-sdk --features provider --locked
+      - name: Check DLL shutdown and tool ownership
+        run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
   release:
     name: Release automation

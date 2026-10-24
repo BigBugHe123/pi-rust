@@ -21,7 +21,7 @@ impl Provider for Script {
         let (mut prod, stream) = create_assistant_message_event_stream();
         tokio::spawn(async move {
             for event in events {
-                if !prod.push(event) {
+                if !prod.push(event).await {
                     break;
                 }
             }
