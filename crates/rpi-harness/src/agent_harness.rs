@@ -3045,6 +3045,9 @@ impl AgentHarness {
     /// Load this lane's branch path, oldest-first. Returns an empty vec when
     /// the lane is empty (no leaf).
     async fn branch_path_oldest_first(&self) -> HarnessResult<Vec<Entry>> {
+        let diagnostics =
+            std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0");
+        let started = diagnostics.then(std::time::Instant::now);
         let leaf = self
             .session
             .view(&self.lane)
@@ -3062,11 +3065,20 @@ impl AgentHarness {
             start: Some(leaf_id),
             ..Default::default()
         };
-        self.session
+        let result = self
+            .session
             .view(&self.lane)
             .find_entries_on_branch(&query, &bounds)
             .await
-            .map_err(session_to_harness_err)
+            .map_err(session_to_harness_err);
+        if let Some(started) = started {
+            eprintln!(
+                "RPI_CONTEXT_DIAGNOSTICS path_load_ns={} path_entries={}",
+                started.elapsed().as_nanos().min(u64::MAX as u128),
+                result.as_ref().map(Vec::len).unwrap_or_default(),
+            );
+        }
+        result
     }
 
     /// Snapshot the inner config fields needed to build an `AgentLoopConfig`.

@@ -20,6 +20,8 @@ use crate::types::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::BTreeSet;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 // Re-expose the cache-control wire types from `cache_control.rs` under the
 // local alias the TS-flavored names below expect.
@@ -214,6 +216,34 @@ pub struct ToolPlacement {
     /// Normalized names of the deferred tools (so `convert_tool_result` can
     /// decide which references to emit).
     pub deferred_names: BTreeSet<String>,
+}
+
+static BUILD_PARAMS_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+fn build_params_diagnostics_enabled() -> bool {
+    *BUILD_PARAMS_DIAGNOSTICS.get_or_init(|| {
+        std::env::var_os("RPI_PROVIDER_DIAGNOSTICS")
+            .or_else(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS"))
+            .is_some_and(|value| value != "0")
+    })
+}
+
+fn elapsed_ns(started: Option<Instant>) -> u64 {
+    started
+        .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+        .unwrap_or_default()
+}
+
+/// Optional phase timings for one request build. All fields remain zero unless
+/// provider diagnostics are enabled, so the normal request path does not pay
+/// for per-phase clocks.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BuildParamsDiagnostics {
+    pub normalize_ns: u64,
+    pub deferred_tools_ns: u64,
+    pub convert_messages_ns: u64,
+    pub convert_tools_ns: u64,
+    pub total_ns: u64,
 }
 
 // ----------------------------------------------------------------------------
@@ -592,20 +622,10 @@ pub fn split_deferred_tools(
             immediate.push(tool);
         }
     }
-    let deferred_names_clone = deferred_names.clone();
     ToolPlacement {
         immediate,
         deferred,
         deferred_names,
-    }
-    .with_names(deferred_names_clone)
-}
-
-impl ToolPlacement {
-    fn with_names(self, _names: BTreeSet<String>) -> Self {
-        // deferred_names already populated above; this is a no-op hook keeping
-        // the construction site readable.
-        self
     }
 }
 
@@ -1237,6 +1257,31 @@ pub fn estimate_context_tokens(messages: &[Message], system_prompt: Option<&str>
     (chars + 3) / 4
 }
 
+fn clamp_max_tokens_to_context_with_tokens(model: &Model, tokens: u64, max_tokens: u64) -> u64 {
+    const CONTEXT_SAFETY_TOKENS: u64 = 4096;
+    const MIN_MAX_TOKENS: u64 = 1;
+    let available = model
+        .context_window
+        .saturating_sub(tokens)
+        .saturating_sub(CONTEXT_SAFETY_TOKENS);
+    std::cmp::min(max_tokens, std::cmp::max(MIN_MAX_TOKENS, available))
+}
+
+/// Clamp `max_tokens` using a previously computed context-token estimate.
+/// Keeping this separate lets one request reuse the estimate when thinking
+/// configuration requires a second clamp.
+fn clamp_max_tokens_to_context_with_estimate(
+    model: &Model,
+    tokens: Option<u64>,
+    max_tokens: u64,
+) -> u64 {
+    const MIN_MAX_TOKENS: u64 = 1;
+    if model.context_window == 0 {
+        return std::cmp::max(MIN_MAX_TOKENS, max_tokens);
+    }
+    clamp_max_tokens_to_context_with_tokens(model, tokens.unwrap_or_default(), max_tokens)
+}
+
 /// Clamp `max_tokens` so the request never asks for more than the context
 /// window allows (minus a safety margin). Mirrors `clampMaxTokensToContext`.
 pub fn clamp_max_tokens_to_context(
@@ -1245,17 +1290,11 @@ pub fn clamp_max_tokens_to_context(
     system_prompt: Option<&str>,
     max_tokens: u64,
 ) -> u64 {
-    const CONTEXT_SAFETY_TOKENS: u64 = 4096;
-    const MIN_MAX_TOKENS: u64 = 1;
     if model.context_window == 0 {
-        return std::cmp::max(MIN_MAX_TOKENS, max_tokens);
+        return std::cmp::max(1, max_tokens);
     }
     let tokens = estimate_context_tokens(messages, system_prompt);
-    let available = model
-        .context_window
-        .saturating_sub(tokens)
-        .saturating_sub(CONTEXT_SAFETY_TOKENS);
-    std::cmp::min(max_tokens, std::cmp::max(MIN_MAX_TOKENS, available))
+    clamp_max_tokens_to_context_with_tokens(model, tokens, max_tokens)
 }
 
 // ----------------------------------------------------------------------------
@@ -1297,6 +1336,7 @@ pub struct BuiltParams {
     pub cache_control: CacheControlOption,
     /// The `anthropic-beta` header value (comma-joined), when any betas apply.
     pub beta_header: Option<String>,
+    pub diagnostics: BuildParamsDiagnostics,
 }
 
 /// Build the full Anthropic request body + beta headers from a pi context.
@@ -1313,28 +1353,33 @@ pub fn build_params(
     is_oauth: bool,
     opts: &SimpleStreamOptions,
 ) -> BuiltParams {
+    let diagnostics_enabled = build_params_diagnostics_enabled();
+    let total_started = diagnostics_enabled.then(Instant::now);
     let compat = get_anthropic_compat(model);
     let cache_control_opt = get_cache_control(model, opts.cache_retention);
     let cache_ref = cache_control_opt.cache_control.as_ref();
 
+    let phase_started = diagnostics_enabled.then(Instant::now);
     let transformed = request_messages(&ctx.messages, model);
+    let normalize_ns = elapsed_ns(phase_started);
+
+    let phase_started = diagnostics_enabled.then(Instant::now);
     let placement = split_deferred_tools(
         &transformed,
         &ctx.tools,
         compat.tool_references(),
         &|name: &str| name.to_string(),
     );
+    let deferred_tools_ns = elapsed_ns(phase_started);
     let mut immediate = placement.immediate;
     let mut deferred = placement.deferred;
+    let mut deferred_names = placement.deferred_names;
     if immediate.is_empty() && !deferred.is_empty() {
-        immediate = deferred.clone();
-        deferred.clear();
+        immediate = std::mem::take(&mut deferred);
+        deferred_names.clear();
     }
-    let deferred_names = deferred
-        .iter()
-        .map(|t| t.name.clone())
-        .collect::<BTreeSet<_>>();
 
+    let phase_started = diagnostics_enabled.then(Instant::now);
     let messages = convert_messages(
         &transformed,
         cache_ref,
@@ -1342,16 +1387,15 @@ pub fn build_params(
         &deferred_names,
         &|name: &str| name.to_string(),
     );
+    let convert_messages_ns = elapsed_ns(phase_started);
 
     // max_tokens: opts.max_tokens wins; else model.max_tokens. Thinking may
     // inflate this (handled below for budget-based models).
     let base_max_tokens = opts.max_tokens.unwrap_or(model.max_tokens);
-    let mut max_tokens = clamp_max_tokens_to_context(
-        model,
-        &ctx.messages,
-        ctx.system_prompt.as_deref(),
-        base_max_tokens,
-    );
+    let context_tokens = (model.context_window != 0)
+        .then(|| estimate_context_tokens(&ctx.messages, ctx.system_prompt.as_deref()));
+    let mut max_tokens =
+        clamp_max_tokens_to_context_with_estimate(model, context_tokens, base_max_tokens);
 
     // Thinking config.
     let thinking_enabled = opts.reasoning.is_some() && opts.reasoning != Some(ThinkingLevel::Off);
@@ -1382,12 +1426,8 @@ pub fn build_params(
                     opts.thinking_budgets.as_ref(),
                 );
                 // Re-clamp the adjusted max to the context window.
-                max_tokens = clamp_max_tokens_to_context(
-                    model,
-                    &ctx.messages,
-                    ctx.system_prompt.as_deref(),
-                    adjusted_max,
-                );
+                max_tokens =
+                    clamp_max_tokens_to_context_with_estimate(model, context_tokens, adjusted_max);
                 let budget = std::cmp::min(budget, max_tokens.saturating_sub(MIN_ANSWER_TOKENS));
                 thinking = Some(AnthropicThinking::Enabled {
                     budget_tokens: budget,
@@ -1435,6 +1475,7 @@ pub fn build_params(
     };
 
     // Tools.
+    let phase_started = diagnostics_enabled.then(Instant::now);
     let tools: Option<Vec<AnthropicTool>> = if !immediate.is_empty() || !deferred.is_empty() {
         let mut all = convert_tools(
             &immediate,
@@ -1458,6 +1499,7 @@ pub fn build_params(
     } else {
         None
     };
+    let convert_tools_ns = elapsed_ns(phase_started);
 
     // Metadata user_id (abuse-tracking).
     let metadata = opts
@@ -1490,6 +1532,13 @@ pub fn build_params(
         request,
         cache_control: cache_control_opt,
         beta_header,
+        diagnostics: BuildParamsDiagnostics {
+            normalize_ns,
+            deferred_tools_ns,
+            convert_messages_ns,
+            convert_tools_ns,
+            total_ns: elapsed_ns(total_started),
+        },
     }
 }
 
@@ -1904,6 +1953,37 @@ mod tests {
             }
             _ => panic!("expected toolResult"),
         }
+    }
+
+    #[test]
+    fn all_deferred_tools_fall_back_to_immediate_without_references() {
+        let model = model_with_compat(AnthropicMessagesCompat::default());
+        let ctx = crate::types::Context {
+            system_prompt: None,
+            messages: vec![Message::ToolResult(Box::new(ToolResultMessage {
+                role: crate::types::ToolResultRole,
+                tool_call_id: "call".into(),
+                tool_name: "loader".into(),
+                content: vec![Content::text("loaded")],
+                details: None,
+                usage: None,
+                added_tool_names: vec!["loader".into()],
+                is_error: false,
+                timestamp: 0,
+            }))],
+            tools: vec![sample_tool("loader")],
+        };
+        let built = build_params(&model, &ctx, false, &SimpleStreamOptions::default());
+        assert_eq!(built.request.tools.as_ref().unwrap()[0].name, "loader");
+        assert_eq!(built.request.tools.as_ref().unwrap()[0].defer_loading, None);
+        assert!(matches!(
+            &built.request.messages[0].content,
+            AnthropicMessageContent::Blocks(blocks)
+                if matches!(&blocks[0], AnthropicContentBlock::ToolResult {
+                    content: Some(ToolResultContent::Text(text)),
+                    ..
+                } if text == "loaded")
+        ));
     }
 
     fn sample_tool(name: &str) -> Tool {

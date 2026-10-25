@@ -22,6 +22,10 @@ impl PreparedJsonRequest {
         })))
     }
 
+    pub(super) fn body_len(&self) -> Option<usize> {
+        self.0.request.body()?.as_bytes().map(|body| body.len())
+    }
+
     pub(super) async fn send(&self) -> Result<reqwest::Response, crate::AiError> {
         let request = self
             .0

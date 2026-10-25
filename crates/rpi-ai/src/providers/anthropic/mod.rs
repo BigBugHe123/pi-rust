@@ -47,14 +47,22 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 static PROVIDER_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
 
 fn provider_diagnostics_enabled() -> bool {
-    *PROVIDER_DIAGNOSTICS
-        .get_or_init(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0"))
+    *PROVIDER_DIAGNOSTICS.get_or_init(|| {
+        std::env::var_os("RPI_PROVIDER_DIAGNOSTICS")
+            .or_else(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS"))
+            .is_some_and(|value| value != "0")
+    })
 }
 
 struct ProviderRequestDiagnostics {
     enabled: bool,
     started: Option<Instant>,
     params_build_ns: u64,
+    normalize_ns: u64,
+    deferred_tools_ns: u64,
+    convert_messages_ns: u64,
+    convert_tools_ns: u64,
+    build_total_ns: u64,
     request_encode_ns: u64,
     request_body_bytes: usize,
     messages_bytes: usize,
@@ -72,6 +80,11 @@ impl ProviderRequestDiagnostics {
             enabled,
             started: enabled.then(Instant::now),
             params_build_ns: 0,
+            normalize_ns: 0,
+            deferred_tools_ns: 0,
+            convert_messages_ns: 0,
+            convert_tools_ns: 0,
+            build_total_ns: 0,
             request_encode_ns: 0,
             request_body_bytes: 0,
             messages_bytes: 0,
@@ -96,8 +109,13 @@ impl Drop for ProviderRequestDiagnostics {
             return;
         }
         eprintln!(
-            "RPI_PROVIDER_DIAGNOSTICS provider=anthropic params_build_ns={} request_encode_ns={} request_body_bytes={} messages_bytes={} tools_bytes={} system_bytes={} message_count={} http_wait_ns={} sse_first_event_ns={} total_ns={}",
+            "RPI_PROVIDER_DIAGNOSTICS provider=anthropic params_build_ns={} normalize_ns={} deferred_tools_ns={} convert_messages_ns={} convert_tools_ns={} build_total_ns={} request_encode_ns={} request_body_bytes={} messages_bytes={} tools_bytes={} system_bytes={} message_count={} http_wait_ns={} sse_first_event_ns={} total_ns={}",
             self.params_build_ns,
+            self.normalize_ns,
+            self.deferred_tools_ns,
+            self.convert_messages_ns,
+            self.convert_tools_ns,
+            self.build_total_ns,
             self.request_encode_ns,
             self.request_body_bytes,
             self.messages_bytes,
@@ -314,11 +332,15 @@ async fn run_anthropic_stream(
             return;
         }
     };
+    if diagnostics.enabled {
+        diagnostics.normalize_ns = built.diagnostics.normalize_ns;
+        diagnostics.deferred_tools_ns = built.diagnostics.deferred_tools_ns;
+        diagnostics.convert_messages_ns = built.diagnostics.convert_messages_ns;
+        diagnostics.convert_tools_ns = built.diagnostics.convert_tools_ns;
+        diagnostics.build_total_ns = built.diagnostics.total_ns;
+    }
     let non_stream = std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() == Some("1");
     if diagnostics.enabled {
-        diagnostics.request_body_bytes = serde_json::to_vec(&built.request)
-            .map(|value| value.len())
-            .unwrap_or_default();
         diagnostics.messages_bytes = serde_json::to_vec(&built.request.messages)
             .map(|value| value.len())
             .unwrap_or_default();
@@ -368,7 +390,12 @@ async fn run_anthropic_stream(
     }
     drop(built);
     let request = match prepared {
-        Ok(request) => request,
+        Ok(request) => {
+            if diagnostics.enabled {
+                diagnostics.request_body_bytes = request.body_len().unwrap_or_default();
+            }
+            request
+        }
         Err(error) => {
             emit_terminal_error(
                 prod,
