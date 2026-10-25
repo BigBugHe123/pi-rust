@@ -772,7 +772,7 @@ pub fn convert_messages(
     deferred_tool_names: &BTreeSet<String>,
     normalize_name: &dyn Fn(&str) -> String,
 ) -> Vec<AnthropicMessage> {
-    let mut params: Vec<AnthropicMessage> = Vec::new();
+    let mut params: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
     let mut loaded_tool_names: BTreeSet<String> = BTreeSet::new();
     let n = messages.len();
     let mut i = 0;

@@ -194,15 +194,18 @@ impl AgentLoopConfig {
 /// The default `convert_to_llm`: keep only `user`/`assistant`/`toolResult`
 /// messages, drop `custom`. Mirrors TS `defaultConvertToLlm`.
 pub fn default_convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
-    messages
-        .into_iter()
-        .filter_map(|m| match m {
-            AgentMessage::User(u) => Some(Message::User(u)),
-            AgentMessage::Assistant(a) => Some(Message::Assistant(a)),
-            AgentMessage::ToolResult(t) => Some(Message::ToolResult(t)),
-            AgentMessage::Custom(_) => None,
-        })
-        .collect()
+    let mut converted = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            AgentMessage::User(user) => converted.push(Message::User(user)),
+            AgentMessage::Assistant(assistant) => converted.push(Message::Assistant(assistant)),
+            AgentMessage::ToolResult(tool_result) => {
+                converted.push(Message::ToolResult(tool_result))
+            }
+            AgentMessage::Custom(_) => {}
+        }
+    }
+    converted
 }
 
 /// Wrap a `default_convert_to_llm` into the `ConvertToLlm` Arc shape expected
