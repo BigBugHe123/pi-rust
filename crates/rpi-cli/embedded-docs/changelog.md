@@ -11,6 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.5...v0.9.0) - 2026-10-25
+
+### Added
+
+- *(runtime)* extract reusable runtime and optimize execution
+- add optional binary serialization benchmark
+- add zero-copy archived payloads
+
+### Fixed
+
+- *(release)* sync workspace lock and embedded docs
+- *(cli)* keep temporary model switches out of settings.json
+
+### Other
+
+- Merge origin/main into feature-0.9.0
+- Merge branch 'main' into fix/model-switch-not-persisted
+- Merge remote-tracking branch 'origin/main' into feature-0.9.0
+- reduce repeated context and message copies
+- remove zero-copy from plugin sdk
+- compare zero-copy with json and cbor
+
 ## [0.8.5](https://github.com/bigfish1913/pi-rust/compare/v0.8.4...v0.8.5) - 2026-10-24
 
 ### Fixed
