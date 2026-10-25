@@ -352,6 +352,14 @@ rpi dev                                 # build + watch + live reload
 The host loads project `.rpi/extensions`, then global
 `~/.rpi/agent/extensions`, then any `--extensions-dir`.
 
+For a new Rust plugin, start with [`docs/extensions/authoring.md`](docs/extensions/authoring.md)
+and `examples/plugin-stub`. Use `rpi-plugin-sdk` for the `cdylib` ABI. If the plugin
+project also needs reusable session, workspace, native RPC or durable-runtime logic
+for a Web/ACP adapter, add [`rpi-extcore`](https://crates.io/crates/rpi-extcore)
+(`rpi-extcore = "0.1"`). It is a normal Rust library, not the `cdylib` entry point,
+and it does not replace `rpi-plugin-sdk`; a simple tool plugin should not add it
+unnecessarily.
+
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).

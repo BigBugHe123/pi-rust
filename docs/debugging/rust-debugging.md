@@ -25,7 +25,7 @@ license = "MIT"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rpi-plugin-sdk = "0.1"
+rpi-plugin-sdk = "0.8"
 serde_json = "1"
 ```
 

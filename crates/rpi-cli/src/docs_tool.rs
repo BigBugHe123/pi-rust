@@ -30,7 +30,7 @@ struct DocPage {
 static DOCS: &[DocPage] = &[
     DocPage {
         topic: "authoring",
-        description: "Rust cdylib 扩展开发最佳实践：统一 C ABI 入口、工具生命周期、事件处理器、资源发现、rpi dev 开发与发布检查清单",
+        description: "Rust cdylib 扩展开发最佳实践：统一 C ABI 入口、工具生命周期、事件处理器、资源发现、rpi dev 开发、rpi-extcore 复用边界与发布检查清单",
         content: include_str!("../embedded-docs/extension-authoring.md"),
         aliases: &["package-authoring", "extension-authoring", "create-package", "create-extension"],
     },
@@ -303,11 +303,22 @@ mod tests {
         let output = execute(serde_json::json!({"topic": "authoring", "query": "rpi dev"})).await;
         assert!(output.contains("rpi dev"));
 
-        // The cdylib build contract is a separate section from the `rpi dev`
-        // workflow text, so query for it directly rather than relying on both
-        // terms co-occurring in one excerpt window.
+        // The cdylib build contract is a separate section from the `rpi`
+        // dev workflow text, so query for it directly rather than relying
+        // on both terms co-occurring in one excerpt window.
         let cdylib = execute(serde_json::json!({"topic": "authoring", "query": "cdylib"})).await;
         assert!(cdylib.contains("cdylib"));
+    }
+
+    #[tokio::test]
+    async fn returns_extcore_reuse_guidance() {
+        let output = execute(serde_json::json!({
+            "topic": "authoring",
+            "query": "rpi-extcore"
+        }))
+        .await;
+        assert!(output.contains("rpi-extcore"));
+        assert!(output.contains("rpi-plugin-sdk"));
     }
 
     #[tokio::test]

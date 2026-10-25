@@ -317,6 +317,12 @@ RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 ## 6. Rust 插件
 
 Rust 原生插件是 `cdylib`，只依赖 `rpi-plugin-sdk`，由 `rpi-extensions` 动态加载：
+完整的“从零写插件”流程见 [`docs/extensions/authoring.md`](../extensions/authoring.md)，
+包括 Cargo 结构、`export_plugin!`、工具生命周期、能力检测、测试和 `rpi dev`。
+如果插件项目还需要 Web/ACP 适配器共享的 session、workspace、RPC 或 durable 状态，
+可以额外复用 [`rpi-extcore`](https://crates.io/crates/rpi-extcore)（`rpi-extcore = "0.1"`）。
+它是普通 Rust 库，不是 `cdylib` 入口，也不替代 `rpi-plugin-sdk`；只做普通 CLI 工具时
+不要为了 ABI 注册引入它。
 
 ```bash
 cargo build -p plugin-stub
