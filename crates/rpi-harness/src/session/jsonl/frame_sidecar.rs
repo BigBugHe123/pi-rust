@@ -24,6 +24,7 @@ use serde_json::Value;
 use crate::session::types::LaneRecord;
 
 const MAGIC: &[u8; 8] = b"RPIAFRM\0";
+const PAYLOAD_MAGIC: &[u8; 8] = b"RPIFPAY\0";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 34;
 #[cfg(feature = "frame-sidecar-zlib")]
@@ -154,7 +155,77 @@ pub fn decode_block_at(bytes: &[u8], offset: u64) -> Result<Vec<LaneRecord>, Fra
     }
     Ok(block.records)
 }
-/// Decode one referenced record from a sidecar block.
+/// Decode payload-only records from a block. Version-1 full-record blocks are
+/// accepted too, allowing sessions created by the prototype to keep loading.
+pub fn decode_payload_block_at(
+    bytes: &[u8],
+    offset: u64,
+) -> Result<Vec<Option<Value>>, FrameSidecarError> {
+    let offset = usize::try_from(offset).map_err(|_| FrameSidecarError::InvalidLength)?;
+    if offset >= bytes.len() {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    #[cfg(feature = "frame-sidecar-zlib")]
+    if bytes[offset..].starts_with(COMPRESSED_MAGIC) {
+        let decoded = decode_compressed_block(&bytes[offset..])?;
+        return decode_payload_block_at(&decoded, 0);
+    }
+    if bytes[offset..].starts_with(MAGIC) {
+        return decode_block_at(bytes, offset as u64).map(|records| {
+            records
+                .into_iter()
+                .filter_map(|record| match record {
+                    LaneRecord::AssistantFrame(frame) => Some(frame.frame),
+                    _ => None,
+                })
+                .collect()
+        });
+    }
+    if !bytes[offset..].starts_with(PAYLOAD_MAGIC) {
+        return Err(FrameSidecarError::InvalidMagic);
+    }
+    if bytes.len() - offset < HEADER_LEN {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let version = u16::from_le_bytes([bytes[offset + 8], bytes[offset + 9]]);
+    if version != VERSION {
+        return Err(FrameSidecarError::UnsupportedVersion(version));
+    }
+    let payload_len = u32::from_le_bytes([
+        bytes[offset + 10],
+        bytes[offset + 11],
+        bytes[offset + 12],
+        bytes[offset + 13],
+    ]) as usize;
+    let record_count = u32::from_le_bytes([
+        bytes[offset + 14],
+        bytes[offset + 15],
+        bytes[offset + 16],
+        bytes[offset + 17],
+    ]) as usize;
+    if record_count == 0 || payload_len > MAX_BLOCK_BYTES {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let block_end = offset
+        .checked_add(HEADER_LEN)
+        .and_then(|end| end.checked_add(payload_len))
+        .ok_or(FrameSidecarError::InvalidLength)?;
+    if block_end > bytes.len() {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let payload = &bytes[offset + HEADER_LEN..block_end];
+    let values: Result<Vec<_>, _> = payload
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice)
+        .collect();
+    let values = values.map_err(|error| FrameSidecarError::InvalidRecord(error.to_string()))?;
+    if values.len() != record_count {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    Ok(values)
+}
+
 pub fn decode_record_at(
     bytes: &[u8],
     offset: u64,
@@ -167,6 +238,53 @@ pub fn decode_record_at(
         .ok_or(FrameSidecarError::InvalidLength)
 }
 
+/// Encode a block containing only the optional frame payloads. The main JSONL
+/// record retains all identity and ordering metadata, so this avoids storing
+/// the same LaneRecord envelope twice.
+pub fn encode_payload_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError> {
+    if records.is_empty() {
+        return Err(FrameSidecarError::EmptyBlock);
+    }
+    let mut payload = Vec::new();
+    for record in records {
+        let LaneRecord::AssistantFrame(frame) = record else {
+            return Err(FrameSidecarError::NonFrameRecord);
+        };
+        if frame.op != crate::session::types::AssistantFrameOp::Append {
+            return Err(FrameSidecarError::NonFrameRecord);
+        }
+        serde_json::to_writer(&mut payload, &frame.frame)
+            .map_err(|error| FrameSidecarError::InvalidRecord(error.to_string()))?;
+        payload.push(b'\n');
+    }
+    encode_payload_bytes(records, payload)
+}
+
+fn encode_payload_bytes(
+    records: &[LaneRecord],
+    payload: Vec<u8>,
+) -> Result<Vec<u8>, FrameSidecarError> {
+    if payload.len() > MAX_BLOCK_BYTES || payload.len() > u32::MAX as usize {
+        return Err(FrameSidecarError::BlockTooLarge(
+            payload.len().min(u32::MAX as usize) as u32,
+        ));
+    }
+    let mut encoded = Vec::with_capacity(HEADER_LEN + payload.len());
+    encoded.extend_from_slice(PAYLOAD_MAGIC);
+    encoded.extend_from_slice(&VERSION.to_le_bytes());
+    encoded.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&(records.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(
+        &records
+            .first()
+            .expect("non-empty block")
+            .seq()
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&records.last().expect("non-empty block").seq().to_le_bytes());
+    encoded.extend_from_slice(&payload);
+    Ok(encoded)
+}
 /// Encode one non-empty block of assistant-frame records.
 pub fn encode_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError> {
     if records.is_empty() {
@@ -216,7 +334,7 @@ pub fn encode_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError
 #[cfg(feature = "frame-sidecar-zlib")]
 pub fn encode_compressed_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError> {
     let raw = encode_block(records)?;
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
     encoder
         .write_all(&raw)
         .map_err(|error| FrameSidecarError::Compression(error.to_string()))?;
@@ -271,7 +389,39 @@ fn decode_compressed_block(bytes: &[u8]) -> Result<Vec<u8>, FrameSidecarError> {
     Ok(decoded)
 }
 
-/// Decode all complete blocks from a sidecar byte stream.
+/// Encode a payload-only block with the same zlib envelope as full-record
+/// compatibility blocks.
+#[cfg(feature = "frame-sidecar-zlib")]
+pub fn encode_compressed_payload_block(
+    records: &[LaneRecord],
+) -> Result<Vec<u8>, FrameSidecarError> {
+    let raw = encode_payload_block(records)?;
+    encode_compressed_bytes(raw)
+}
+
+#[cfg(feature = "frame-sidecar-zlib")]
+fn encode_compressed_bytes(raw: Vec<u8>) -> Result<Vec<u8>, FrameSidecarError> {
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::fast());
+    encoder
+        .write_all(&raw)
+        .map_err(|error| FrameSidecarError::Compression(error.to_string()))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|error| FrameSidecarError::Compression(error.to_string()))?;
+    if compressed.len() > u32::MAX as usize || raw.len() > u32::MAX as usize {
+        return Err(FrameSidecarError::BlockTooLarge(
+            compressed.len().min(u32::MAX as usize) as u32,
+        ));
+    }
+    let mut encoded = Vec::with_capacity(COMPRESSED_HEADER_LEN + compressed.len());
+    encoded.extend_from_slice(COMPRESSED_MAGIC);
+    encoded.extend_from_slice(&COMPRESSED_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
 ///
 /// A short final header or payload is a recoverable torn tail. A complete
 /// header with malformed JSON is corruption and returns an error instead.
@@ -423,6 +573,26 @@ mod tests {
         let decoded = decode_blocks(&encoded).unwrap();
         assert_eq!(decoded.records, records);
         assert!(!decoded.truncated_tail);
+    }
+
+    #[test]
+    fn payload_only_blocks_round_trip_without_record_envelopes() {
+        let records = vec![
+            frame(1, AssistantFrameOp::Append),
+            frame(2, AssistantFrameOp::Append),
+        ];
+        let encoded = encode_payload_block(&records).unwrap();
+        let decoded = decode_payload_block_at(&encoded, 0).unwrap();
+        assert_eq!(
+            decoded,
+            records
+                .iter()
+                .map(|record| match record {
+                    LaneRecord::AssistantFrame(frame) => frame.frame.clone(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

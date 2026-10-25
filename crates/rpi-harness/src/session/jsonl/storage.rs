@@ -62,9 +62,9 @@ use crate::session::jsonl::codec::{
 };
 use crate::session::jsonl::errors::{file_result, invalid_file, JsonlDecodeErrorKind};
 #[cfg(feature = "frame-sidecar-zlib")]
-use crate::session::jsonl::frame_sidecar::encode_compressed_block;
+use crate::session::jsonl::frame_sidecar::encode_compressed_payload_block;
 use crate::session::jsonl::frame_sidecar::{
-    decode_block_at, encode_block, parse_reference_marker, reference_marker,
+    decode_payload_block_at, encode_payload_block, parse_reference_marker, reference_marker,
 };
 use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
 use crate::session::memory::{stamp_record, Clock};
@@ -159,7 +159,7 @@ impl JsonlSessionStorage {
     fn hydrate_sidecar_mutation(
         mutation: SessionMutation,
         sidecar: Option<&[u8]>,
-        blocks: &mut HashMap<u64, Vec<LaneRecord>>,
+        blocks: &mut HashMap<u64, Vec<Option<serde_json::Value>>>,
     ) -> SessionResult<SessionMutation> {
         let SessionMutation::Record { mut record } = mutation else {
             return Ok(mutation);
@@ -179,7 +179,7 @@ impl JsonlSessionStorage {
         let bytes = sidecar
             .ok_or_else(|| SessionError::storage("assistant frame references a missing sidecar"))?;
         if !blocks.contains_key(&offset) {
-            let decoded = decode_block_at(bytes, offset)
+            let decoded = decode_payload_block_at(bytes, offset)
                 .map_err(|error| SessionError::storage(error.to_string()))?;
             blocks.insert(offset, decoded);
         }
@@ -188,23 +188,7 @@ impl JsonlSessionStorage {
             .and_then(|records| records.get(index as usize))
             .cloned()
             .ok_or_else(|| SessionError::storage("assistant frame sidecar index is invalid"))?;
-        let LaneRecord::AssistantFrame(hydrated_frame) = hydrated else {
-            return Err(SessionError::storage(
-                "assistant frame sidecar reference resolved to a non-frame record",
-            ));
-        };
-        if hydrated_frame.base.id != frame.base.id
-            || hydrated_frame.base.seq != frame.base.seq
-            || hydrated_frame.base.lane != frame.base.lane
-            || hydrated_frame.run_id != frame.run_id
-            || hydrated_frame.stream_index != frame.stream_index
-            || hydrated_frame.op != frame.op
-        {
-            return Err(SessionError::storage(
-                "assistant frame sidecar reference metadata does not match the session record",
-            ));
-        }
-        frame.frame = hydrated_frame.frame;
+        frame.frame = hydrated;
         Ok(SessionMutation::Record { record })
     }
 
@@ -578,14 +562,14 @@ impl JsonlSessionStorage {
         };
         #[cfg(feature = "frame-sidecar-zlib")]
         let block = if Self::compressed_sidecar_enabled() {
-            encode_compressed_block(records)
+            encode_compressed_payload_block(records)
         } else {
-            encode_block(records)
+            encode_payload_block(records)
         }
         .map_err(|error| SessionError::storage(error.to_string()))?;
         #[cfg(not(feature = "frame-sidecar-zlib"))]
-        let block =
-            encode_block(records).map_err(|error| SessionError::storage(error.to_string()))?;
+        let block = encode_payload_block(records)
+            .map_err(|error| SessionError::storage(error.to_string()))?;
         file_result(
             self.fs
                 .append_file(path, FileContent::Bytes(block), None)
