@@ -12,7 +12,8 @@
 //! that lane. Lane resolution goes through `get_leaf_id_for_lane`, which throws
 //! `invalid_lane` when the lane does not exist — matching TS.
 
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -26,6 +27,17 @@ use crate::session::types::{
     LogOptions, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordQuery,
     SessionMetadata, SessionStats, SessionStorage, SessionTree,
 };
+
+static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+fn agent_diagnostics_enabled() -> bool {
+    *AGENT_DIAGNOSTICS
+        .get_or_init(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0"))
+}
+
+fn elapsed_ns(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+}
 
 // ---------------------------------------------------------------------------
 // IdGenerator default — uuidv7. Mirrors TS `{ next: () => uuidv7() }`.
@@ -382,6 +394,66 @@ impl Session {
         self.commit_record(record).await
     }
 
+    /// Append a durable record followed immediately by an entry.
+    pub(crate) async fn append_record_and_entry(
+        &self,
+        record: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<(LaneRecord, Entry)> {
+        for payload in [serde_json::to_value(&record), serde_json::to_value(&entry)] {
+            let value = payload.map_err(|e| {
+                SessionError::invalid_payload(format!("Durable payload is not serializable: {e}"))
+            })?;
+            assert_json_serializable(&value)?;
+        }
+        self.storage_arc()
+            .append_record_and_entry(record, entry, lane)
+            .await
+    }
+
+    /// Append a record, an entry, and a following record in that exact order.
+    pub(crate) async fn append_record_entry_and_record(
+        &self,
+        before: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+        after: LaneRecord,
+    ) -> SessionResult<(LaneRecord, Entry, LaneRecord)> {
+        for payload in [
+            serde_json::to_value(&before),
+            serde_json::to_value(&entry),
+            serde_json::to_value(&after),
+        ] {
+            let value = payload.map_err(|e| {
+                SessionError::invalid_payload(format!("Durable payload is not serializable: {e}"))
+            })?;
+            assert_json_serializable(&value)?;
+        }
+        self.storage_arc()
+            .append_record_entry_and_record(before, entry, lane, after)
+            .await
+    }
+
+    /// Append a batch of records through the active storage backend.
+    pub(crate) async fn append_records(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        let diagnostics = agent_diagnostics_enabled();
+        let count = records.len();
+        let started = diagnostics.then(Instant::now);
+        let result = self.storage_arc().append_records(records).await;
+        if let Some(started) = started {
+            eprintln!(
+                "RPI_SESSION_DIAGNOSTICS kind=batch records={} append_ns={}",
+                count,
+                elapsed_ns(started),
+            );
+        }
+        result
+    }
+
     // -- Record queries ------------------------------------------------------
 
     /// `findRecords(query?)`. Mirrors TS `Session.findRecords`.
@@ -561,7 +633,18 @@ impl Session {
             SessionError::invalid_payload(format!("Durable payload is not serializable: {e}"))
         })?;
         assert_json_serializable(&value)?;
-        self.storage_arc().append_entry(entry, lane).await
+        let diagnostics = agent_diagnostics_enabled();
+        let entry_type = entry.type_tag();
+        let started = diagnostics.then(Instant::now);
+        let result = self.storage_arc().append_entry(entry, lane).await;
+        if let Some(started) = started {
+            eprintln!(
+                "RPI_SESSION_DIAGNOSTICS kind=entry entry_type={} append_ns={}",
+                entry_type,
+                elapsed_ns(started),
+            );
+        }
+        result
     }
 
     /// `commitRecord(record)` — `assertJsonSerializable` then
@@ -571,7 +654,18 @@ impl Session {
             SessionError::invalid_payload(format!("Durable payload is not serializable: {e}"))
         })?;
         assert_json_serializable(&value)?;
-        self.storage_arc().append_record(record).await
+        let diagnostics = agent_diagnostics_enabled();
+        let record_type = record.record_type();
+        let started = diagnostics.then(Instant::now);
+        let result = self.storage_arc().append_record(record).await;
+        if let Some(started) = started {
+            eprintln!(
+                "RPI_SESSION_DIAGNOSTICS kind=record record_type={} append_ns={}",
+                record_type,
+                elapsed_ns(started),
+            );
+        }
+        result
     }
 }
 

@@ -37,6 +37,14 @@ pub enum Command {
         #[serde(rename = "beforeSeq")]
         before_seq: Option<u64>,
     },
+    /// Return every entry on the currently selected native branch.
+    GetSessionBranch,
+    /// Append a protocol-neutral custom entry to the current branch.
+    AppendEntry {
+        #[serde(rename = "customType")]
+        custom_type: String,
+        data: Option<Value>,
+    },
     GetStats,
     GetQueue,
     QueueMessage {
@@ -95,6 +103,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
     "get_messages",
     "get_history",
+    "get_session_branch",
+    "append_entry",
     "get_stats",
     "get_queue",
     "queue_message",

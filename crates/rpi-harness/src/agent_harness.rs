@@ -67,12 +67,12 @@ use crate::session::context::{
 };
 use crate::session::session::Session;
 use crate::session::types::{
-    BranchBounds, CompactionReason, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord,
-    OperationError, OperationFinishedRecord, OperationIntent, OperationOutcome,
-    OperationStartedRecord, ProvisionedEntry, ProvisionedKind, QueueCancelledRecord,
-    QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery, RetryPendingRecord, SessionStats,
-    SessionTree, StepAttemptRecord, StepKind, ToolReplay, ToolStartedRecord, UsageCause,
-    UsageRecord, WriteDeferredRecord,
+    AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryOrder,
+    EntryQuery, JsonValue, LaneRecord, OperationError, OperationFinishedRecord, OperationIntent,
+    OperationOutcome, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+    QueueCancelledRecord, QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery,
+    RetryPendingRecord, SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay,
+    ToolStartedRecord, UsageCause, UsageRecord, WriteDeferredRecord,
 };
 use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
@@ -3178,6 +3178,48 @@ impl AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    /// Commit the frame-stream binding, assistant entry, and step attempt in
+    /// one durable append. The logical order remains binding → entry → step.
+    pub(crate) async fn append_bound_provisioned_with_step_attempt(
+        &self,
+        entry: ProvisionedEntry,
+        run_id: &str,
+        attempt: u32,
+        stream_index: usize,
+    ) -> HarnessResult<Entry> {
+        let bind = LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: RecordBase {
+                id: self.session.id_generator().next(),
+                seq: 0,
+                lane: self.lane.clone(),
+                timestamp: 0,
+            },
+            run_id: run_id.to_string(),
+            stream_index,
+            op: AssistantFrameOp::CommitStream,
+            frame: Some(serde_json::json!({"entryId": entry.id})),
+        });
+        let step = LaneRecord::StepAttempt(StepAttemptRecord {
+            base: RecordBase {
+                id: self.session.id_generator().next(),
+                seq: 0,
+                lane: self.lane.clone(),
+                timestamp: 0,
+            },
+            run_id: run_id.to_string(),
+            step: StepKind::Assistant,
+            attempt,
+            result_entry_id: entry.id.clone(),
+            compaction_reason: None,
+        });
+        let (_, committed, _) = self
+            .session
+            .append_record_entry_and_record(bind, entry, &self.lane, step)
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(committed)
+    }
+
     /// Record that another attempt is scheduled for `run_id`.
     ///
     /// Written before the backoff wait, so a crash during the wait is
@@ -3200,19 +3242,6 @@ impl AgentHarness {
             .await
             .map_err(session_to_harness_err)?;
         Ok(())
-    }
-
-    /// Write a `step_attempt` record on this harness's lane.
-    pub(crate) async fn write_step_attempt_record(
-        &self,
-        run_id: &str,
-        step: StepKind,
-        attempt: u32,
-        result_entry_id: &str,
-        compaction_reason: Option<CompactionReason>,
-    ) -> HarnessResult<()> {
-        self.write_step_attempt(run_id, step, attempt, result_entry_id, compaction_reason)
-            .await
     }
 
     /// Persist a `Compaction` entry and return the stamped `Entry`.
@@ -3321,6 +3350,24 @@ impl AgentHarness {
         Ok(())
     }
 
+    fn operation_started_record(
+        &self,
+        run_id: &str,
+        source_leaf_id: Option<String>,
+        intent: OperationIntent,
+    ) -> LaneRecord {
+        LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: run_id.to_string(),
+                seq: 0,
+                lane: self.lane.clone(),
+                timestamp: 0,
+            },
+            source_leaf_id,
+            intent,
+        })
+    }
+
     /// Write an `operation_started` record. Returns the stamped record (its
     /// `base.id` is the run_id the caller generated; `seq`/`lane`/`timestamp`
     /// are overwritten by storage).
@@ -3330,25 +3377,36 @@ impl AgentHarness {
         source_leaf_id: Option<String>,
         intent: OperationIntent,
     ) -> HarnessResult<OperationStartedRecord> {
-        let record = LaneRecord::OperationStarted(OperationStartedRecord {
-            base: RecordBase {
-                id: run_id.to_string(),
-                seq: 0,
-                lane: self.lane.clone(),
-                timestamp: 0,
-            },
-            source_leaf_id,
-            intent,
-        });
         let stamped = self
             .session
-            .append_record(record)
+            .append_record(self.operation_started_record(run_id, source_leaf_id, intent))
             .await
             .map_err(session_to_harness_err)?;
         match stamped {
             LaneRecord::OperationStarted(s) => Ok(s),
             _ => unreachable!("append_record(OperationStarted) stamps into OperationStarted"),
         }
+    }
+
+    /// Commit `operation_started` followed by the first prompt entry in one
+    /// durable append when the backend supports it. The record remains first.
+    async fn append_operation_started_and_entry(
+        &self,
+        run_id: &str,
+        source_leaf_id: Option<String>,
+        intent: OperationIntent,
+        entry: ProvisionedEntry,
+    ) -> HarnessResult<Entry> {
+        let (_, committed) = self
+            .session
+            .append_record_and_entry(
+                self.operation_started_record(run_id, source_leaf_id, intent),
+                entry,
+                &self.lane,
+            )
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(committed)
     }
 
     /// Write an `operation_finished` record.
@@ -3646,11 +3704,35 @@ impl AgentHarness {
             system_prompt_override: None,
             resume_data,
         };
-        self.write_operation_started(&run_id, source_leaf.clone(), intent)
+        let prompt_start = if let Some(first) = prompts.first() {
+            let first_entry_id = queued_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.next_entry_id());
+            self.append_operation_started_and_entry(
+                &run_id,
+                source_leaf.clone(),
+                intent,
+                ProvisionedEntry {
+                    id: first_entry_id,
+                    kind: ProvisionedKind::Message {
+                        message: first.clone(),
+                        terminate: None,
+                    },
+                },
+            )
             .await?;
+            1
+        } else {
+            self.write_operation_started(&run_id, source_leaf.clone(), intent)
+                .await?;
+            0
+        };
 
-        // Persist prompts (the user's input) BEFORE the run so they're durable.
-        for (index, msg) in prompts.iter().enumerate() {
+        // Persist the remaining prompts (the user's input) BEFORE the run so
+        // they're durable. The first prompt, when present, was committed with
+        // operation_started above.
+        for (index, msg) in prompts.iter().enumerate().skip(prompt_start) {
             if let Some(entry_id) = queued_ids.get(index) {
                 self.append_provisioned(ProvisionedEntry {
                     id: entry_id.clone(),
@@ -4005,6 +4087,7 @@ impl AgentHarness {
             self.lane.clone(),
             run_id.clone(),
         ));
+        settle_state.set_frame_recorder(Arc::clone(&frame_recorder));
         let emitter: Arc<dyn AgentEmitter> = frame_recorder.clone();
 
         // Drive the loop. We pass an EMPTY prompts vec to `run_agent_loop`

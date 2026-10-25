@@ -113,6 +113,24 @@ last committed frame rather than replaying the turn. Custom Anthropic or
 OpenAI-compatible gateways are declared in `~/.rpi/agent/models.json` and
 selected with `--model <provider>/<model>`.
 
+### Runtime diagnostics
+
+To investigate slow model preparation, context construction, tool execution, or
+persistent assistant-frame writes, temporarily enable stderr diagnostics:
+
+```bash
+RPI_AGENT_DIAGNOSTICS=1 RPI_FRAME_DIAGNOSTICS=1 \
+  rpi -p "reproduce the issue" 2>rpi-diagnostics.log
+```
+
+`RPI_AGENT_DIAGNOSTICS` reports context, request, tool, and session append
+latencies. `RPI_FRAME_DIAGNOSTICS` reports durable frame batching, flush barriers,
+and writer failures. Diagnostics are disabled when the variables are unset or
+set to `0`; they do not change the JSONL format. See
+[`docs/debugging/rust-debugging.md`](docs/debugging/rust-debugging.md) for the
+field reference. The built-in read-only `docs` tool can retrieve it with
+`{"topic":"debugging","query":"RPI_FRAME_DIAGNOSTICS"}`.
+
 ### Request timeouts and model compatibility
 
 `--timeout 600` limits a whole LLM request, including its streamed response.

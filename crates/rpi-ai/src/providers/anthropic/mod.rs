@@ -29,6 +29,8 @@ use crate::model::{Model, StreamingProtocolCompat};
 use crate::provider::{CacheRetention, Provider, SimpleStreamOptions};
 use crate::types::{AssistantMessageEvent, Content, Context, DoneReason, StopReason, Usage};
 use async_trait::async_trait;
+use std::sync::OnceLock;
+use std::time::Instant;
 
 use crate::providers::anthropic::build_params::{build_params, BuiltParams};
 use crate::providers::anthropic::cost::calculate_cost;
@@ -41,6 +43,70 @@ use crate::providers::anthropic::sse::SseEventStream;
 /// (`2023-06-01`); the TS SDK attaches this implicitly, the Rust port sets it
 /// explicitly since it speaks raw `reqwest`.
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+static PROVIDER_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+fn provider_diagnostics_enabled() -> bool {
+    *PROVIDER_DIAGNOSTICS
+        .get_or_init(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0"))
+}
+
+struct ProviderRequestDiagnostics {
+    enabled: bool,
+    started: Option<Instant>,
+    request_encode_ns: u64,
+    request_body_bytes: usize,
+    messages_bytes: usize,
+    tools_bytes: usize,
+    system_bytes: usize,
+    message_count: usize,
+    http_wait_ns: u64,
+    sse_first_event_ns: u64,
+}
+
+impl ProviderRequestDiagnostics {
+    fn new() -> Self {
+        let enabled = provider_diagnostics_enabled();
+        Self {
+            enabled,
+            started: enabled.then(Instant::now),
+            request_encode_ns: 0,
+            request_body_bytes: 0,
+            messages_bytes: 0,
+            tools_bytes: 0,
+            system_bytes: 0,
+            message_count: 0,
+            http_wait_ns: 0,
+            sse_first_event_ns: 0,
+        }
+    }
+
+    fn elapsed(started: Option<Instant>) -> u64 {
+        started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default()
+    }
+}
+
+impl Drop for ProviderRequestDiagnostics {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        eprintln!(
+            "RPI_PROVIDER_DIAGNOSTICS provider=anthropic request_encode_ns={} request_body_bytes={} messages_bytes={} tools_bytes={} system_bytes={} message_count={} http_wait_ns={} sse_first_event_ns={} total_ns={}",
+            self.request_encode_ns,
+            self.request_body_bytes,
+            self.messages_bytes,
+            self.tools_bytes,
+            self.system_bytes,
+            self.message_count,
+            self.http_wait_ns,
+            self.sse_first_event_ns,
+            Self::elapsed(self.started),
+        );
+    }
+}
 
 /// The Anthropic Messages-API provider. Mirrors the `Anthropic`-SDK-backed
 /// surface in `api/anthropic-messages.ts` (`stream` + `streamSimple`) +
@@ -222,6 +288,7 @@ async fn run_anthropic_stream(
     params: Result<PreparedParams, String>,
     opts: &SimpleStreamOptions,
 ) {
+    let mut diagnostics = ProviderRequestDiagnostics::new();
     let mut state = MapperState::new(
         model.api.clone(),
         model.provider.clone(),
@@ -239,6 +306,21 @@ async fn run_anthropic_stream(
         }
     };
     let non_stream = std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() == Some("1");
+    if diagnostics.enabled {
+        diagnostics.request_body_bytes = serde_json::to_vec(&built.request)
+            .map(|value| value.len())
+            .unwrap_or_default();
+        diagnostics.messages_bytes = serde_json::to_vec(&built.request.messages)
+            .map(|value| value.len())
+            .unwrap_or_default();
+        diagnostics.tools_bytes = serde_json::to_vec(&built.request.tools)
+            .map(|value| value.len())
+            .unwrap_or_default();
+        diagnostics.system_bytes = serde_json::to_vec(&built.request.system)
+            .map(|value| value.len())
+            .unwrap_or_default();
+        diagnostics.message_count = built.request.messages.len();
+    }
 
     // ---- assemble headers (createClient, API-key arm) ----
     let headers = assemble_headers(
@@ -257,6 +339,7 @@ async fn run_anthropic_stream(
     }
     // Normal streaming requests serialize the typed request directly. Only the
     // compatibility mode needs a mutable JSON tree before the single encoding.
+    let encode_started = diagnostics.enabled.then(Instant::now);
     let prepared = if non_stream {
         serde_json::to_value(&built.request)
             .map_err(|error| error.to_string())
@@ -271,6 +354,9 @@ async fn run_anthropic_stream(
         super::request::PreparedJsonRequest::new(builder, &built.request)
             .map_err(|error| error.to_string())
     };
+    if diagnostics.enabled {
+        diagnostics.request_encode_ns = ProviderRequestDiagnostics::elapsed(encode_started);
+    }
     drop(built);
     let request = match prepared {
         Ok(request) => request,
@@ -293,6 +379,7 @@ async fn run_anthropic_stream(
     // 2xx and an `AiError::Http { status }` on non-2xx (so the retry predicate
     // can classify 408/409/429/>=500). Cancellation is honored via a `select!`
     // around the send — the in-flight reqwest future is dropped on abort.
+    let http_started = diagnostics.enabled.then(Instant::now);
     let response_result = retry_provider_request(
         move || {
             let request = request.clone();
@@ -332,6 +419,9 @@ async fn run_anthropic_stream(
         &opts.signal,
     )
     .await;
+    if diagnostics.enabled {
+        diagnostics.http_wait_ns = ProviderRequestDiagnostics::elapsed(http_started);
+    }
 
     let response = match response_result {
         Ok(r) => r,
@@ -459,10 +549,12 @@ async fn run_anthropic_stream(
     // applies the model-aware `cost_fn` on the final usage before the terminal
     // event (mirrors the inline `calculateCost(model, output.usage)` calls).
     let mut sse = SseEventStream::new(response, opts.signal.clone())
-        .with_idle_timeout(opts.stream_idle_timeout());
+        .with_idle_timeout(opts.stream_idle_timeout())
+        .with_diagnostics(diagnostics.enabled);
     let cost_model = model.cost.clone();
     let cost_fn = move |usage: &Usage| calculate_cost(&cost_model, usage);
     run_mapper(&mut sse, prod, &mut state, cost_fn).await;
+    diagnostics.sse_first_event_ns = sse.diagnostics_first_event_ns().unwrap_or_default();
 }
 
 fn strip_cache_control(value: &mut serde_json::Value) {

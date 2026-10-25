@@ -16,6 +16,7 @@ use crate::error::AiError;
 use crate::providers::anthropic::json_parse::parse_json_with_repair;
 use bytes::Bytes;
 use futures::StreamExt;
+use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// The `ANTHROPIC_MESSAGE_EVENTS` set — event types the mapper consumes. Any
@@ -200,6 +201,8 @@ pub struct SseEventStream {
     idle_timeout: Option<std::time::Duration>,
     last_bytes_at: tokio::time::Instant,
     done: bool,
+    diagnostics_started: Option<Instant>,
+    diagnostics_first_event_ns: Option<u64>,
 }
 
 impl SseEventStream {
@@ -214,6 +217,8 @@ impl SseEventStream {
             idle_timeout: Some(crate::provider::DEFAULT_STREAM_IDLE_TIMEOUT),
             last_bytes_at: tokio::time::Instant::now(),
             done: false,
+            diagnostics_started: None,
+            diagnostics_first_event_ns: None,
         }
     }
 
@@ -222,6 +227,37 @@ impl SseEventStream {
     pub fn with_idle_timeout(mut self, timeout: Option<std::time::Duration>) -> Self {
         self.idle_timeout = timeout.filter(|value| !value.is_zero());
         self
+    }
+
+    /// Enable optional timing of the first decoded SSE event. Disabled by
+    /// default so the normal provider path does not add timing work.
+    pub fn with_diagnostics(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.diagnostics_started = Some(Instant::now());
+        }
+        self
+    }
+
+    /// Return the elapsed time until the first decoded SSE event.
+    pub fn diagnostics_first_event_ns(&self) -> Option<u64> {
+        self.diagnostics_first_event_ns
+    }
+
+    fn record_diagnostic_event(&mut self, event: ServerSentEvent) -> ServerSentEvent {
+        if self.diagnostics_first_event_ns.is_none() {
+            if let Some(started) = self.diagnostics_started.take() {
+                self.diagnostics_first_event_ns =
+                    Some(started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+            }
+        }
+        event
+    }
+
+    fn record_diagnostic_option(
+        &mut self,
+        event: Option<ServerSentEvent>,
+    ) -> Option<ServerSentEvent> {
+        event.map(|event| self.record_diagnostic_event(event))
     }
 
     /// Pull the next SSE event, or `Ok(None)` when the body is exhausted (after
@@ -260,7 +296,7 @@ impl SseEventStream {
             }
             self.buffer = leftover;
             if let Some(event) = produced {
-                return Ok(Some(event));
+                return Ok(Some(self.record_diagnostic_event(event)));
             }
 
             if self.done {
@@ -276,11 +312,12 @@ impl SseEventStream {
                     let pending = std::mem::take(&mut buffer);
                     if let Some(event) = self.state.decode_line(&pending) {
                         self.buffer = buffer;
-                        return Ok(Some(event));
+                        return Ok(Some(self.record_diagnostic_event(event)));
                     }
                     self.buffer = buffer;
                 }
-                return Ok(self.state.flush());
+                let flushed = self.state.flush();
+                return Ok(self.record_diagnostic_option(flushed));
             }
 
             // Cancellation must race the body read itself. Checking the token
@@ -495,6 +532,8 @@ mod tests {
             idle_timeout: Some(std::time::Duration::from_secs(5)),
             last_bytes_at: tokio::time::Instant::now(),
             done: false,
+            diagnostics_started: None,
+            diagnostics_first_event_ns: None,
         };
         (sender, stream)
     }

@@ -50,7 +50,7 @@ Provider 是 LLM 协议边界。上层处理统一消息和事件，具体 HTTP/
 
 ## 会话与长任务
 
-会话是带 branch 和 lane 的 entry 树，JSONL 后端记录消息、操作及步骤。Harness 根据 branch 构造模型上下文，并管理提交、取消与崩溃恢复。压缩新增摘要 entry，保留原始历史；当前既支持 run 前检查，也支持工具结果后的运行中检查。
+会话是带 branch 和 lane 的 entry 树，JSONL 后端记录消息、操作及步骤。Harness 根据 branch 构造模型上下文，并管理提交、取消与崩溃恢复。流式 assistant frame 作为不进入上下文的进度 record 写入持久化 session；durable writer 会将 frame 按最多 32 条或约 50 ms 聚合，并在绑定 assistant entry、清理 stream/run 前强制 flush。这样保留崩溃恢复的已提交前缀，同时减少每帧一次文件追加的调度开销。压缩新增摘要 entry，保留原始历史；当前既支持 run 前检查，也支持工具结果后的运行中检查。需要定位请求、上下文或 frame writer 耗时时，可使用 `RPI_AGENT_DIAGNOSTICS=1` 和 `RPI_FRAME_DIAGNOSTICS=1`，详见 [Rust 调试指南](../debugging/rust-debugging.md)。
 
 恢复和重放行为受记录状态与工具 replay 策略约束，不能将所有工具视为可安全重复执行。详细排查证据见 [恢复与重复思考复盘](../debugging/llm-repetition-forensics.md)。
 

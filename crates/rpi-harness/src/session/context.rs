@@ -22,6 +22,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rpi_agent::message::AgentMessage;
 use rpi_ai::types::StopReason;
@@ -215,8 +216,11 @@ pub fn build_session_context(
     path_entries: &[Entry],
     options: &SessionContextBuildOptions,
 ) -> SessionContext {
+    let diagnostics = std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0");
+    let started = diagnostics.then(Instant::now);
     let mut ctx = derive_session_context_state(path_entries);
     let context_entries = context_entries(path_entries, options);
+    let context_entry_count = context_entries.len();
     let mut messages = Vec::new();
     for (index, entry) in context_entries.iter().enumerate() {
         messages.extend(session_entry_to_context_messages(
@@ -227,6 +231,15 @@ pub fn build_session_context(
         ));
     }
     ctx.messages = messages;
+    if let Some(started) = started {
+        eprintln!(
+            "RPI_CONTEXT_DIAGNOSTICS path_entries={} context_entries={} messages={} build_ns={}",
+            path_entries.len(),
+            context_entry_count,
+            ctx.messages.len(),
+            started.elapsed().as_nanos().min(u64::MAX as u128),
+        );
+    }
     ctx
 }
 

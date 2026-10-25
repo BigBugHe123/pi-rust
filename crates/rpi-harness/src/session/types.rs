@@ -1318,6 +1318,43 @@ pub trait SessionStorage: Send + Sync {
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry>;
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord>;
 
+    async fn append_record_and_entry(
+        &self,
+        record: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<(LaneRecord, Entry)> {
+        let record = self.append_record(record).await?;
+        let entry = self.append_entry(entry, lane).await?;
+        Ok((record, entry))
+    }
+
+    /// Append a record, an entry, and a following record in that exact logical
+    /// order. Durable backends may encode all three mutations together.
+    async fn append_record_entry_and_record(
+        &self,
+        before: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+        after: LaneRecord,
+    ) -> SessionResult<(LaneRecord, Entry, LaneRecord)> {
+        let before = self.append_record(before).await?;
+        let entry = self.append_entry(entry, lane).await?;
+        let after = self.append_record(after).await?;
+        Ok((before, entry, after))
+    }
+
+    /// Append several records as one logical batch. Backends that do not have
+    /// a native batch writer retain the existing semantics by falling back to
+    /// ordered single-record appends.
+    async fn append_records(&self, records: Vec<LaneRecord>) -> SessionResult<Vec<LaneRecord>> {
+        let mut stamped = Vec::with_capacity(records.len());
+        for record in records {
+            stamped.push(self.append_record(record).await?);
+        }
+        Ok(stamped)
+    }
+
     // Reads
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>>;
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>>;

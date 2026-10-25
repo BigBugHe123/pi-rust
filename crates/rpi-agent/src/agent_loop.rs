@@ -36,11 +36,19 @@ use rpi_ai::types::{
 };
 use rpi_ai::validate_tool_arguments;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// The messages a single `run_agent_loop` invocation added (prompt + assistant
 /// + tool results + injected steering/follow-ups). Returned to the caller.
 pub type NewMessages = Vec<AgentMessage>;
+
+static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+fn agent_diagnostics_enabled() -> bool {
+    *AGENT_DIAGNOSTICS
+        .get_or_init(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0"))
+}
 
 /// Why a run ended. `Completed` is the normal exit; `Aborted`/`Failed` are set
 /// when the terminal assistant message carried `Aborted`/`Error`.
@@ -430,6 +438,88 @@ async fn run_loop(
 // streamAssistantResponse
 // ----------------------------------------------------------------------------
 
+struct AssistantRequestDiagnostics {
+    enabled: bool,
+    started: Instant,
+    input_messages: usize,
+    llm_messages: usize,
+    tools: usize,
+    transform_ns: u64,
+    convert_ns: u64,
+    stream_open_ns: u64,
+    stream_started: Option<Instant>,
+    first_poll_ns: u64,
+    provider_events: u64,
+    first_event_ns: u64,
+    emit_calls: u64,
+    emit_ns: u64,
+    fold_ns: u64,
+}
+
+impl AssistantRequestDiagnostics {
+    fn new(input_messages: usize, tools: usize) -> Self {
+        Self {
+            enabled: agent_diagnostics_enabled(),
+            started: Instant::now(),
+            input_messages,
+            llm_messages: 0,
+            tools,
+            transform_ns: 0,
+            convert_ns: 0,
+            stream_open_ns: 0,
+            stream_started: None,
+            first_poll_ns: 0,
+            provider_events: 0,
+            first_event_ns: 0,
+            emit_calls: 0,
+            emit_ns: 0,
+            fold_ns: 0,
+        }
+    }
+
+    fn elapsed_ns(started: Instant) -> u64 {
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    async fn emit_agent_event(&mut self, emit: &Arc<dyn AgentEmitter>, event: AgentEvent) {
+        let started = self.enabled.then(Instant::now);
+        emit_event(emit, event).await;
+        if let Some(started) = started {
+            self.emit_calls += 1;
+            self.emit_ns += Self::elapsed_ns(started);
+        }
+    }
+}
+
+impl Drop for AssistantRequestDiagnostics {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let stream_ns = self
+            .stream_started
+            .map(Self::elapsed_ns)
+            .unwrap_or_default();
+        eprintln!(
+            "RPI_AGENT_DIAGNOSTICS phase=assistant input_messages={} llm_messages={} tools={} transform_ns={} convert_ns={} stream_open_ns={} first_event_ns={} first_poll_ns={} provider_events={} emit_calls={} emit_ns={} fold_ns={} stream_ns={} total_ns={}",
+            self.input_messages,
+            self.llm_messages,
+            self.tools,
+            self.transform_ns,
+            self.convert_ns,
+            self.stream_open_ns,
+            self.first_event_ns,
+            self.first_poll_ns,
+            self.provider_events,
+            self.emit_calls,
+            self.emit_ns,
+            self.fold_ns,
+            stream_ns,
+            Self::elapsed_ns(self.started),
+        );
+    }
+}
+
 /// Stream one assistant response, folding protocol events into the partial
 /// message and emitting agent `Message*` events. Mirrors TS
 /// `streamAssistantResponse`.
@@ -439,15 +529,26 @@ async fn stream_assistant_response(
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
 ) -> Result<AssistantMessage, AgentError> {
+    let mut diagnostics =
+        AssistantRequestDiagnostics::new(context.messages.len(), context.tools.len());
+    let transform_started = diagnostics.enabled.then(Instant::now);
     // Apply optional transform_context (AgentMessage[] → AgentMessage[]).
     let messages = if let Some(transform) = &config.transform_context {
         transform(context.messages.clone(), config.signal.clone()).await
     } else {
         context.messages.clone()
     };
+    if let Some(started) = transform_started {
+        diagnostics.transform_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+    }
 
     // convert_to_llm (AgentMessage[] → Message[]).
+    let convert_started = diagnostics.enabled.then(Instant::now);
     let llm_messages = (config.convert_to_llm)(messages).await;
+    if let Some(started) = convert_started {
+        diagnostics.convert_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        diagnostics.llm_messages = llm_messages.len();
+    }
 
     let llm_context = rpi_ai::types::Context {
         system_prompt: if context.system_prompt.is_empty() {
@@ -469,17 +570,43 @@ async fn stream_assistant_response(
     };
 
     let opts = config.to_stream_options(resolved_api_key);
+    let stream_open_started = diagnostics.enabled.then(Instant::now);
     let mut response = stream_fn(&config.model, &llm_context, &opts);
+    if let Some(started) = stream_open_started {
+        diagnostics.stream_open_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        diagnostics.stream_started = Some(Instant::now());
+    }
 
     let mut added_partial = false;
+    let mut first_poll = true;
 
-    while let Some(event) = response.next().await {
+    loop {
+        let poll_started = diagnostics.enabled.then(Instant::now);
+        let next = response.next().await;
+        let poll_ns = poll_started.map(AssistantRequestDiagnostics::elapsed_ns);
+        let Some(event) = next else {
+            break;
+        };
+        let event_started = diagnostics.enabled.then(Instant::now);
+        if diagnostics.enabled {
+            diagnostics.provider_events += 1;
+            if first_poll {
+                diagnostics.first_poll_ns = poll_ns.unwrap_or_default();
+                if let Some(stream_started) = diagnostics.stream_started {
+                    diagnostics.first_event_ns =
+                        AssistantRequestDiagnostics::elapsed_ns(stream_started);
+                }
+                first_poll = false;
+            }
+        }
         match &event {
             AssistantMessageEvent::Start { partial } => {
                 let am = AgentMessage::Assistant(Box::new((**partial).clone()));
                 context.messages.push(am.clone());
                 added_partial = true;
-                emit_event(emit, AgentEvent::MessageStart { message: am }).await;
+                diagnostics
+                    .emit_agent_event(emit, AgentEvent::MessageStart { message: am })
+                    .await;
             }
             AssistantMessageEvent::TextStart { partial, .. }
             | AssistantMessageEvent::TextDelta { partial, .. }
@@ -497,17 +624,18 @@ async fn stream_assistant_response(
                     // terminal arm replaces it with the finalized message. Keeping
                     // the old `*last = am.clone()` copied the whole growing message
                     // once per delta for no observable effect.
-                    emit_event(
-                        emit,
-                        AgentEvent::MessageUpdate {
-                            // `Arc` bump, not a deep clone: this fires once per
-                            // streaming delta, and the provider already built the
-                            // snapshot it hands us.
-                            message: Arc::clone(partial),
-                            assistant_message_event: event,
-                        },
-                    )
-                    .await;
+                    diagnostics
+                        .emit_agent_event(
+                            emit,
+                            AgentEvent::MessageUpdate {
+                                // `Arc` bump, not a deep clone: this fires once per
+                                // streaming delta, and the provider already built the
+                                // snapshot it hands us.
+                                message: Arc::clone(partial),
+                                assistant_message_event: event,
+                            },
+                        )
+                        .await;
                 }
             }
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
@@ -523,17 +651,26 @@ async fn stream_assistant_response(
                     }
                 } else {
                     context.messages.push(am.clone());
-                    emit_event(
-                        emit,
-                        AgentEvent::MessageStart {
-                            message: am.clone(),
-                        },
-                    )
-                    .await;
+                    diagnostics
+                        .emit_agent_event(
+                            emit,
+                            AgentEvent::MessageStart {
+                                message: am.clone(),
+                            },
+                        )
+                        .await;
                 }
-                emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+                diagnostics
+                    .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+                    .await;
+                if let Some(started) = event_started {
+                    diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
+                }
                 return Ok(final_message);
             }
+        }
+        if let Some(started) = event_started {
+            diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
         }
     }
 
@@ -549,15 +686,18 @@ async fn stream_assistant_response(
         }
     } else {
         context.messages.push(am.clone());
-        emit_event(
-            emit,
-            AgentEvent::MessageStart {
-                message: am.clone(),
-            },
-        )
-        .await;
+        diagnostics
+            .emit_agent_event(
+                emit,
+                AgentEvent::MessageStart {
+                    message: am.clone(),
+                },
+            )
+            .await;
     }
-    emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+    diagnostics
+        .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+        .await;
     Ok(final_message)
 }
 
@@ -1124,6 +1264,7 @@ async fn execute_prepared_tool_call(
     let accepting_updates = Arc::new(AtomicBool::new(true));
     let tool_call_id = tool_call.id.clone();
     let tool_name = tool_call.name.clone();
+    let diagnostic_tool_name = tool_name.clone();
     let args_clone = args.clone();
     let emit_clone = Arc::clone(emit);
 
@@ -1150,7 +1291,8 @@ async fn execute_prepared_tool_call(
     };
 
     let child_token = config.signal.child_token();
-    match tool
+    let execute_started = agent_diagnostics_enabled().then(Instant::now);
+    let outcome = match tool
         .execute(&tool_call.id, args.clone(), child_token, on_update)
         .await
     {
@@ -1168,7 +1310,17 @@ async fn execute_prepared_tool_call(
                 is_error: true,
             }
         }
+    };
+    if let Some(started) = execute_started {
+        eprintln!(
+            "RPI_TOOL_DIAGNOSTICS tool={} call_id={} is_error={} execute_ns={}",
+            diagnostic_tool_name,
+            tool_call.id,
+            outcome.is_error,
+            started.elapsed().as_nanos().min(u64::MAX as u128),
+        );
     }
+    outcome
 }
 
 /// Result of `execute` before `after_tool_call` overrides. Mirrors TS

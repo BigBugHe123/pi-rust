@@ -32,12 +32,15 @@
 //! `docs/debugging/llm-repetition-forensics.md` §十一.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
 use rpi_agent::{AgentEmitter, AgentEvent, AgentMessage};
 use rpi_ai::frames::{reduce_frames, AssistantMessageFrame, AssistantMessageFrameEncoder};
 use rpi_ai::types::{AssistantMessage, AssistantMessageEvent, StopReason, Usage};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::result::{HarnessError, HarnessResult};
 use crate::session::session::Session;
@@ -45,6 +48,262 @@ use crate::session::types::{
     AssistantFrameOp, AssistantFrameRecord, Entry, EntryOrder, EntryQuery, LaneRecord, RecordBase,
     RecordQuery,
 };
+
+const FRAME_CHUNK_RECORDS: usize = 32;
+const FRAME_CHANNEL_CAPACITY: usize = 128;
+const FRAME_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FrameFlushReason {
+    #[cfg(test)]
+    Manual,
+    PrepareCommit,
+    ClearStreamBefore,
+    ClearStreamAfter,
+    ClearRunBefore,
+    ClearRunAfter,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct FrameDiagnosticsSnapshot {
+    pub frame_append_requests: u64,
+    pub batch_count: u64,
+    pub batch_records: u64,
+    pub append_records_calls: u64,
+    pub flush_requests: u64,
+    pub queue_wait_ns: u64,
+    pub flush_wait_ns: u64,
+    pub batch_append_ns: u64,
+    pub writer_failures: u64,
+    pub prepare_commit_flushes: u64,
+    pub clear_stream_before_flushes: u64,
+    pub clear_stream_after_flushes: u64,
+    pub clear_run_before_flushes: u64,
+    pub clear_run_after_flushes: u64,
+}
+
+#[derive(Debug, Default)]
+struct FrameDiagnostics {
+    enabled: bool,
+    frame_append_requests: AtomicU64,
+    batch_count: AtomicU64,
+    batch_records: AtomicU64,
+    append_records_calls: AtomicU64,
+    flush_requests: AtomicU64,
+    queue_wait_ns: AtomicU64,
+    flush_wait_ns: AtomicU64,
+    batch_append_ns: AtomicU64,
+    writer_failures: AtomicU64,
+    prepare_commit_flushes: AtomicU64,
+    clear_stream_before_flushes: AtomicU64,
+    clear_stream_after_flushes: AtomicU64,
+    clear_run_before_flushes: AtomicU64,
+    clear_run_after_flushes: AtomicU64,
+}
+
+impl FrameDiagnostics {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            enabled: std::env::var_os("RPI_FRAME_DIAGNOSTICS").is_some_and(|value| value != "0"),
+            ..Default::default()
+        })
+    }
+
+    fn add_duration(counter: &AtomicU64, duration: Duration) {
+        counter.fetch_add(
+            duration.as_nanos().min(u64::MAX as u128) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn barrier(&self, reason: FrameFlushReason) {
+        if !self.enabled {
+            return;
+        }
+        let counter = match reason {
+            #[cfg(test)]
+            FrameFlushReason::Manual => return,
+            FrameFlushReason::PrepareCommit => &self.prepare_commit_flushes,
+            FrameFlushReason::ClearStreamBefore => &self.clear_stream_before_flushes,
+            FrameFlushReason::ClearStreamAfter => &self.clear_stream_after_flushes,
+            FrameFlushReason::ClearRunBefore => &self.clear_run_before_flushes,
+            FrameFlushReason::ClearRunAfter => &self.clear_run_after_flushes,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> FrameDiagnosticsSnapshot {
+        FrameDiagnosticsSnapshot {
+            frame_append_requests: self.frame_append_requests.load(Ordering::Relaxed),
+            batch_count: self.batch_count.load(Ordering::Relaxed),
+            batch_records: self.batch_records.load(Ordering::Relaxed),
+            append_records_calls: self.append_records_calls.load(Ordering::Relaxed),
+            flush_requests: self.flush_requests.load(Ordering::Relaxed),
+            queue_wait_ns: self.queue_wait_ns.load(Ordering::Relaxed),
+            flush_wait_ns: self.flush_wait_ns.load(Ordering::Relaxed),
+            batch_append_ns: self.batch_append_ns.load(Ordering::Relaxed),
+            writer_failures: self.writer_failures.load(Ordering::Relaxed),
+            prepare_commit_flushes: self.prepare_commit_flushes.load(Ordering::Relaxed),
+            clear_stream_before_flushes: self.clear_stream_before_flushes.load(Ordering::Relaxed),
+            clear_stream_after_flushes: self.clear_stream_after_flushes.load(Ordering::Relaxed),
+            clear_run_before_flushes: self.clear_run_before_flushes.load(Ordering::Relaxed),
+            clear_run_after_flushes: self.clear_run_after_flushes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FrameWriteCommand {
+    Append(LaneRecord),
+    Flush(oneshot::Sender<Result<(), String>>),
+}
+
+#[derive(Clone)]
+struct FrameWriter {
+    tx: mpsc::Sender<FrameWriteCommand>,
+    diagnostics: Arc<FrameDiagnostics>,
+}
+
+impl FrameWriter {
+    fn new(session: Session) -> Self {
+        let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let diagnostics = FrameDiagnostics::new();
+        tokio::spawn(run_frame_writer(session, rx, Arc::clone(&diagnostics)));
+        Self { tx, diagnostics }
+    }
+
+    async fn append(&self, record: LaneRecord) -> HarnessResult<()> {
+        let started = self.diagnostics.enabled.then(Instant::now);
+        if self.diagnostics.enabled {
+            self.diagnostics
+                .frame_append_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let result = self.tx.send(FrameWriteCommand::Append(record)).await;
+        if let Some(started) = started {
+            FrameDiagnostics::add_duration(&self.diagnostics.queue_wait_ns, started.elapsed());
+        }
+        result.map_err(|_| HarnessError::io("frame writer stopped"))
+    }
+
+    async fn flush(&self) -> HarnessResult<()> {
+        let started = self.diagnostics.enabled.then(Instant::now);
+        if self.diagnostics.enabled {
+            self.diagnostics
+                .flush_requests
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        let (reply, result) = oneshot::channel();
+        let send_result = self.tx.send(FrameWriteCommand::Flush(reply)).await;
+        let result = match send_result {
+            Ok(()) => result
+                .await
+                .map_err(|_| HarnessError::io("frame writer stopped"))?
+                .map_err(HarnessError::io),
+            Err(_) => Err(HarnessError::io("frame writer stopped")),
+        };
+        if let Some(started) = started {
+            FrameDiagnostics::add_duration(&self.diagnostics.flush_wait_ns, started.elapsed());
+        }
+        result
+    }
+}
+
+async fn run_frame_writer(
+    session: Session,
+    mut rx: mpsc::Receiver<FrameWriteCommand>,
+    diagnostics: Arc<FrameDiagnostics>,
+) {
+    let mut batch = Vec::with_capacity(FRAME_CHUNK_RECORDS);
+    let mut failure: Option<String> = None;
+
+    loop {
+        let command = if batch.is_empty() {
+            rx.recv().await
+        } else {
+            match tokio::time::timeout(FRAME_CHECKPOINT_INTERVAL, rx.recv()).await {
+                Ok(command) => command,
+                Err(_) => {
+                    if failure.is_none() {
+                        if let Err(error) =
+                            flush_frame_batch(&session, &mut batch, &diagnostics).await
+                        {
+                            diagnostics.writer_failures.fetch_add(1, Ordering::Relaxed);
+                            failure = Some(error.to_string());
+                        }
+                    }
+                    continue;
+                }
+            }
+        };
+
+        let Some(command) = command else {
+            break;
+        };
+        match command {
+            FrameWriteCommand::Append(record) => {
+                if failure.is_none() {
+                    batch.push(record);
+                    if batch.len() >= FRAME_CHUNK_RECORDS {
+                        if let Err(error) =
+                            flush_frame_batch(&session, &mut batch, &diagnostics).await
+                        {
+                            diagnostics.writer_failures.fetch_add(1, Ordering::Relaxed);
+                            failure = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+            FrameWriteCommand::Flush(reply) => {
+                if failure.is_none() {
+                    if let Err(error) = flush_frame_batch(&session, &mut batch, &diagnostics).await
+                    {
+                        diagnostics.writer_failures.fetch_add(1, Ordering::Relaxed);
+                        failure = Some(error.to_string());
+                    }
+                }
+                let result = failure.clone().map_or(Ok(()), Err);
+                let _ = reply.send(result);
+            }
+        }
+    }
+
+    if failure.is_none() {
+        let _ = flush_frame_batch(&session, &mut batch, &diagnostics).await;
+    }
+}
+
+async fn flush_frame_batch(
+    session: &Session,
+    batch: &mut Vec<LaneRecord>,
+    diagnostics: &FrameDiagnostics,
+) -> HarnessResult<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let records = std::mem::take(batch);
+    if diagnostics.enabled {
+        diagnostics.batch_count.fetch_add(1, Ordering::Relaxed);
+        diagnostics
+            .batch_records
+            .fetch_add(records.len() as u64, Ordering::Relaxed);
+        diagnostics
+            .append_records_calls
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    let started = diagnostics.enabled.then(Instant::now);
+    let result = session
+        .append_records(records)
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            HarnessError::io(format!("could not append assistant frame chunk: {error}"))
+        });
+    if let Some(started) = started {
+        FrameDiagnostics::add_duration(&diagnostics.batch_append_ns, started.elapsed());
+    }
+    result
+}
 
 /// The `record_type` tag for [`AssistantFrameRecord`].
 pub const ASSISTANT_FRAME_RECORD_TYPE: &str = "assistant_frame";
@@ -374,6 +633,8 @@ struct RecorderShared {
     run_id: String,
     state: Mutex<RecorderState>,
     volatile: Option<SharedVolatileProgress>,
+    writer: Option<FrameWriter>,
+    diagnostics: Option<Arc<FrameDiagnostics>>,
 }
 
 struct RecorderState {
@@ -383,7 +644,7 @@ struct RecorderState {
 }
 
 impl RecorderShared {
-    /// Append one `AssistantFrame` record.
+    /// Queue one `AssistantFrame` record for the chunk writer.
     async fn append_frame_record(
         &self,
         stream_index: usize,
@@ -402,11 +663,54 @@ impl RecorderShared {
             op,
             frame,
         });
-        self.session
-            .append_record(record)
+        self.writer
+            .as_ref()
+            .ok_or_else(|| HarnessError::io("durable frame writer is unavailable"))?
+            .append(record)
             .await
-            .map_err(|error| HarnessError::io(error.to_string()))?;
-        Ok(())
+    }
+
+    async fn flush_frames(&self, reason: FrameFlushReason) -> HarnessResult<()> {
+        if let Some(diagnostics) = &self.diagnostics {
+            diagnostics.barrier(reason);
+        }
+        if let Some(writer) = &self.writer {
+            writer.flush().await
+        } else {
+            Ok(())
+        }
+    }
+
+    fn diagnostics_snapshot(&self) -> Option<FrameDiagnosticsSnapshot> {
+        self.diagnostics
+            .as_ref()
+            .filter(|diagnostics| diagnostics.enabled)
+            .map(|diagnostics| diagnostics.snapshot())
+    }
+
+    fn log_diagnostics(&self) {
+        let Some(snapshot) = self.diagnostics_snapshot() else {
+            return;
+        };
+        eprintln!(
+            "RPI_FRAME_DIAGNOSTICS lane={} run_id={} frame_append_requests={} batch_count={} batch_records={} append_records_calls={} flush_requests={} queue_wait_ns={} flush_wait_ns={} batch_append_ns={} writer_failures={} prepare_commit_flushes={} clear_stream_before_flushes={} clear_stream_after_flushes={} clear_run_before_flushes={} clear_run_after_flushes={}",
+            self.lane,
+            self.run_id,
+            snapshot.frame_append_requests,
+            snapshot.batch_count,
+            snapshot.batch_records,
+            snapshot.append_records_calls,
+            snapshot.flush_requests,
+            snapshot.queue_wait_ns,
+            snapshot.flush_wait_ns,
+            snapshot.batch_append_ns,
+            snapshot.writer_failures,
+            snapshot.prepare_commit_flushes,
+            snapshot.clear_stream_before_flushes,
+            snapshot.clear_stream_after_flushes,
+            snapshot.clear_run_before_flushes,
+            snapshot.clear_run_after_flushes,
+        );
     }
 
     /// Advance the recorder for one event and return the frame to append, if
@@ -456,6 +760,12 @@ impl FrameRecordingEmitter {
         run_id: impl Into<String>,
     ) -> Self {
         let volatile = session.volatile_progress();
+        let writer = volatile
+            .is_none()
+            .then(|| FrameWriter::new(session.clone()));
+        let diagnostics = writer
+            .as_ref()
+            .map(|writer| Arc::clone(&writer.diagnostics));
         Self {
             inner,
             shared: Arc::new(RecorderShared {
@@ -463,6 +773,8 @@ impl FrameRecordingEmitter {
                 lane: lane.into(),
                 run_id: run_id.into(),
                 volatile,
+                writer,
+                diagnostics,
                 state: Mutex::new(RecorderState {
                     next_index: 0,
                     current: None,
@@ -476,6 +788,21 @@ impl FrameRecordingEmitter {
         &self.shared.run_id
     }
 
+    /// Flush all queued durable frame chunks before a commit boundary.
+    #[cfg(test)]
+    pub(crate) async fn flush(&self) -> HarnessResult<()> {
+        self.shared.flush_frames(FrameFlushReason::Manual).await
+    }
+
+    pub(crate) async fn flush_with_reason(&self, reason: FrameFlushReason) -> HarnessResult<()> {
+        self.shared.flush_frames(reason).await
+    }
+
+    /// Snapshot optional frame writer diagnostics.
+    pub fn diagnostics(&self) -> Option<FrameDiagnosticsSnapshot> {
+        self.shared.diagnostics_snapshot()
+    }
+
     /// Retire this run's frames — called once its messages are persisted.
     pub async fn clear(&self) -> HarnessResult<()> {
         if let Some(progress) = &self.shared.volatile {
@@ -483,8 +810,19 @@ impl FrameRecordingEmitter {
             return Ok(());
         }
         self.shared
+            .flush_frames(FrameFlushReason::ClearRunBefore)
+            .await?;
+        self.shared
             .append_frame_record(0, AssistantFrameOp::ClearRun, None)
-            .await
+            .await?;
+        let result = self
+            .shared
+            .flush_frames(FrameFlushReason::ClearRunAfter)
+            .await;
+        if result.is_ok() {
+            self.shared.log_diagnostics();
+        }
+        result
     }
 
     /// Retire one stream, whose message has just been committed as an entry.
@@ -499,7 +837,13 @@ impl FrameRecordingEmitter {
             return Ok(());
         }
         self.shared
+            .flush_frames(FrameFlushReason::ClearStreamBefore)
+            .await?;
+        self.shared
             .append_frame_record(stream_index, AssistantFrameOp::ClearStream, None)
+            .await?;
+        self.shared
+            .flush_frames(FrameFlushReason::ClearStreamAfter)
             .await
     }
 
@@ -653,6 +997,7 @@ mod volatile_tests {
                 for event in &events[..prefix] {
                     recorder.emit(event.clone()).await;
                 }
+                recorder.flush().await.unwrap();
             }
             assert_eq!(
                 salvage_run_frames(&volatile, "run").await.unwrap(),
@@ -682,6 +1027,7 @@ mod volatile_tests {
             for event in events() {
                 recorder.emit(event).await;
             }
+            recorder.flush().await.unwrap();
             assert_eq!(replay_run_frames(&session, "run").await.unwrap().len(), 1);
             bind_stream_entry(&session, "main", "run", 0, "settled")
                 .await
@@ -746,6 +1092,7 @@ mod volatile_tests {
             for event in events() {
                 old.emit(event).await;
             }
+            old.flush().await.unwrap();
             let target = session(target_volatile);
             let recorder = FrameRecordingEmitter::new(
                 Arc::new(CollectorEmitter::default()),
@@ -756,6 +1103,7 @@ mod volatile_tests {
             for event in events() {
                 recorder.emit(event).await;
             }
+            recorder.flush().await.unwrap();
             bind_stream_entry(&target, "main", "target-run", 0, "target-entry")
                 .await
                 .unwrap();

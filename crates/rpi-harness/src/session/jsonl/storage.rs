@@ -47,6 +47,7 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -338,10 +339,17 @@ impl JsonlSessionStorage {
         op.await
     }
 
-    /// Append a mutation line to the file (no in-memory apply). Mirrors TS
-    /// `appendMutation`.
-    async fn append_mutation_line(&self, mutation: &SessionMutation) -> SessionResult<()> {
-        let line = encode_mutation(mutation);
+    /// Append one or more mutation lines while preserving the existing
+    /// visibility boundary. A reusable writer receives one buffer, so a frame
+    /// chunk pays for one append/flush instead of one per record.
+    async fn append_encoded_lines(&self, encoded: &[String]) -> SessionResult<()> {
+        if encoded.is_empty() {
+            return Ok(());
+        }
+        let mut lines = String::new();
+        for line in encoded {
+            lines.push_str(line);
+        }
         let mut append = self.append.lock().await;
         if append.is_none() {
             *append = file_result(
@@ -352,7 +360,7 @@ impl JsonlSessionStorage {
         if let Some(writer) = append.as_mut() {
             // The tail lock still orders every append, and the writer flushes
             // before acknowledgement. A failed handle is discarded for retry.
-            let result = writer.append(line.as_bytes()).await;
+            let result = writer.append(lines.as_bytes()).await;
             if result.is_err() {
                 *append = None;
             }
@@ -364,10 +372,165 @@ impl JsonlSessionStorage {
         drop(append);
         file_result(
             self.fs
-                .append_file(&self.metadata.path, FileContent::Text(line), None)
+                .append_file(&self.metadata.path, FileContent::Text(lines), None)
                 .await,
             &format!("Failed to append session {}", self.metadata.path),
         )
+    }
+
+    /// Append a frame-only batch without cloning the complete session state.
+    /// Frame records do not change lanes or open-operation state, so their
+    /// sequence and id validation can use a small local batch index.
+    async fn append_frame_record_batch(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        let _tail = self.tail.lock().await;
+        let state = self.state.lock().await;
+        let mut next_seq = state.next_sequence();
+        let mut ids = HashSet::with_capacity(records.len());
+        let mut mutations = Vec::with_capacity(records.len());
+        let mut encoded_lines = Vec::with_capacity(records.len());
+
+        for record in records {
+            let lane = record.lane().to_string();
+            state.require_lane(&lane)?;
+            if !ids.insert(record.id().to_string()) {
+                return Err(SessionError::storage(format!(
+                    "Record id already used in batch: {}",
+                    record.id()
+                )));
+            }
+            state.validate_unused_id(record.id())?;
+            let timestamp = self.clock.now_ms();
+            let stamped = stamp_record(record, next_seq, lane, timestamp);
+            next_seq += 1;
+            let mutation = SessionMutation::Record { record: stamped };
+            encoded_lines.push(encode_mutation(&mutation));
+            mutations.push(mutation);
+        }
+        drop(state);
+
+        self.append_encoded_lines(&encoded_lines).await?;
+        let mut state = self.state.lock().await;
+        let mut stamped_records = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            match state.apply_mutation(mutation)? {
+                ApplyOutcome::Record(stamped) => stamped_records.push(stamped),
+                _ => {
+                    return Err(SessionError::storage(
+                        "append_frame_record_batch did not persist a record",
+                    ));
+                }
+            }
+        }
+        Ok(stamped_records)
+    }
+
+    /// Append one non-frame record without cloning the complete session state.
+    ///
+    /// Record validation is completed while the session tail is held. The
+    /// state is only advanced after the durable append succeeds, so a failed
+    /// write leaves the in-memory state unchanged while avoiding the O(history)
+    /// candidate-state clone on the normal single-record path.
+    async fn append_single_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+        let _tail = self.tail.lock().await;
+        let lane = record.lane().to_string();
+        let state = self.state.lock().await;
+        state.require_lane(&lane)?;
+        state.validate_unused_id(record.id())?;
+        if matches!(record, LaneRecord::OperationStarted(_)) {
+            if let Some(current) = state.find_open_operations(&lane, Some(1))?.first() {
+                return Err(SessionError::storage(format!(
+                    "Lane {} already has an open operation {}",
+                    lane, current.base.id
+                )));
+            }
+        }
+        let seq = state.next_sequence();
+        let timestamp = self.clock.now_ms();
+        let stamped = stamp_record(record, seq, lane, timestamp);
+        let mutation = SessionMutation::Record { record: stamped };
+        let encoded = encode_mutation(&mutation);
+        drop(state);
+
+        self.append_encoded_lines(std::slice::from_ref(&encoded))
+            .await?;
+        let mut state = self.state.lock().await;
+        match state.apply_mutation(mutation)? {
+            ApplyOutcome::Record(stamped) => Ok(stamped),
+            _ => Err(SessionError::storage("append_record did not persist")),
+        }
+    }
+
+    /// Append a batch of lane records atomically from the reducer's point of
+    /// view. The candidate state is advanced before the file write, but the
+    /// live state is replaced only after the whole encoded batch is visible.
+    async fn append_record_batch(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        if records
+            .iter()
+            .all(|record| matches!(record, LaneRecord::AssistantFrame(_)))
+        {
+            return self.append_frame_record_batch(records).await;
+        }
+        if records.len() == 1 {
+            return Ok(vec![
+                self.append_single_record(records.into_iter().next().expect("non-empty records"))
+                    .await?,
+            ]);
+        }
+        let _tail = self.tail.lock().await;
+        let state = self.state.lock().await;
+        let mut candidate = state.clone();
+        let mut encoded_lines = Vec::with_capacity(records.len());
+        let mut stamped_records = Vec::with_capacity(records.len());
+
+        for record in records {
+            let lane = record.lane().to_string();
+            candidate.require_lane(&lane)?;
+            candidate.validate_unused_id(record.id())?;
+            if matches!(record, LaneRecord::OperationStarted(_)) {
+                if let Some(current) = candidate.find_open_operations(&lane, Some(1))?.first() {
+                    return Err(SessionError::storage(format!(
+                        "Lane {} already has an open operation {}",
+                        lane, current.base.id
+                    )));
+                }
+            }
+            let seq = candidate.next_sequence();
+            let timestamp = self.clock.now_ms();
+            let stamped = stamp_record(record, seq, lane, timestamp);
+            let mutation = SessionMutation::Record { record: stamped };
+            let encoded = encode_mutation(&mutation);
+            match candidate.apply_mutation(mutation)? {
+                ApplyOutcome::Record(stamped) => stamped_records.push(stamped),
+                _ => {
+                    return Err(SessionError::storage(
+                        "append_record_batch did not persist a record",
+                    ));
+                }
+            }
+            encoded_lines.push(encoded);
+        }
+        drop(state);
+
+        self.append_encoded_lines(&encoded_lines).await?;
+        let mut state = self.state.lock().await;
+        *state = candidate;
+        Ok(stamped_records)
+    }
+
+    /// Append one mutation line to the file (no in-memory apply).
+    async fn append_mutation_line(&self, mutation: &SessionMutation) -> SessionResult<()> {
+        let encoded = encode_mutation(mutation);
+        self.append_encoded_lines(std::slice::from_ref(&encoded))
+            .await
     }
 }
 
@@ -482,33 +645,141 @@ impl SessionStorage for JsonlSessionStorage {
         }
     }
 
-    async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
-        let lane = record.lane().to_string();
-        let is_operation_started = matches!(record, LaneRecord::OperationStarted(_));
-        let _g = self.tail.lock().await;
+    async fn append_record_and_entry(
+        &self,
+        record: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<(LaneRecord, Entry)> {
+        let _tail = self.tail.lock().await;
         let state = self.state.lock().await;
-        state.require_lane(&lane)?;
+        let record_lane = record.lane().to_string();
+        state.require_lane(&record_lane)?;
         state.validate_unused_id(record.id())?;
-        if is_operation_started {
-            let open = state.find_open_operations(&lane, Some(1))?;
-            if let Some(current) = open.first() {
+        if matches!(record, LaneRecord::OperationStarted(_)) {
+            if let Some(current) = state.find_open_operations(&record_lane, Some(1))?.first() {
                 return Err(SessionError::storage(format!(
                     "Lane {} already has an open operation {}",
-                    lane, current.base.id
+                    record_lane, current.base.id
                 )));
             }
         }
-        let seq = state.next_sequence();
-        let timestamp = self.clock.now_ms();
-        let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-        let mutation = SessionMutation::Record { record: stamped };
-        drop(state);
-        self.append_mutation_line(&mutation).await?;
-        let mut state = self.state.lock().await;
-        match state.apply_mutation(mutation)? {
-            ApplyOutcome::Record(stamped) => Ok(stamped),
-            _ => Err(SessionError::storage("append_record did not persist")),
+        let parent_id = state.require_lane(lane)?;
+        state.validate_unused_id(&entry.id)?;
+        if entry.id == record.id() {
+            return Err(SessionError::already_exists(format!(
+                "Session id already exists: {}",
+                entry.id
+            )));
         }
+        let record_seq = state.next_sequence();
+        let stamped_record = stamp_record(record, record_seq, record_lane, self.clock.now_ms());
+        let record_mutation = SessionMutation::Record {
+            record: stamped_record,
+        };
+        let entry_timestamp = self.clock.now_ms();
+        let entry_mutation = SessionMutation::Entry {
+            seq: record_seq + 1,
+            timestamp: entry_timestamp,
+            lane: Some(lane.to_string()),
+            entry: provisioned_into_entry(entry, record_seq + 1, parent_id, entry_timestamp),
+        };
+        let encoded = vec![
+            encode_mutation(&record_mutation),
+            encode_mutation(&entry_mutation),
+        ];
+        drop(state);
+        self.append_encoded_lines(&encoded).await?;
+        let mut state = self.state.lock().await;
+        let committed_record = match state.apply_mutation(record_mutation)? {
+            ApplyOutcome::Record(stamped) => stamped,
+            _ => return Err(SessionError::storage("append_record did not persist")),
+        };
+        let committed_entry = match state.apply_mutation(entry_mutation)? {
+            ApplyOutcome::Entry(stamped) => stamped,
+            _ => return Err(SessionError::storage("append_entry did not persist")),
+        };
+        Ok((committed_record, committed_entry))
+    }
+
+    async fn append_record_entry_and_record(
+        &self,
+        before: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+        after: LaneRecord,
+    ) -> SessionResult<(LaneRecord, Entry, LaneRecord)> {
+        let _tail = self.tail.lock().await;
+        let state = self.state.lock().await;
+        let before_lane = before.lane().to_string();
+        let after_lane = after.lane().to_string();
+        state.require_lane(&before_lane)?;
+        state.require_lane(lane)?;
+        state.require_lane(&after_lane)?;
+        state.validate_unused_id(before.id())?;
+        state.validate_unused_id(&entry.id)?;
+        state.validate_unused_id(after.id())?;
+        if before.id() == entry.id || before.id() == after.id() || entry.id == after.id() {
+            return Err(SessionError::already_exists(
+                "Session mutation ids must be distinct",
+            ));
+        }
+        if matches!(before, LaneRecord::OperationStarted(_)) {
+            if let Some(current) = state.find_open_operations(&before_lane, Some(1))?.first() {
+                return Err(SessionError::storage(format!(
+                    "Lane {} already has an open operation {}",
+                    before_lane, current.base.id
+                )));
+            }
+        }
+        let parent_id = state.require_lane(lane)?;
+        let first_seq = state.next_sequence();
+        let before_mutation = SessionMutation::Record {
+            record: stamp_record(before, first_seq, before_lane, self.clock.now_ms()),
+        };
+        let entry_timestamp = self.clock.now_ms();
+        let entry_mutation = SessionMutation::Entry {
+            seq: first_seq + 1,
+            timestamp: entry_timestamp,
+            lane: Some(lane.to_string()),
+            entry: provisioned_into_entry(entry, first_seq + 1, parent_id, entry_timestamp),
+        };
+        let after_mutation = SessionMutation::Record {
+            record: stamp_record(after, first_seq + 2, after_lane, self.clock.now_ms()),
+        };
+        let encoded = vec![
+            encode_mutation(&before_mutation),
+            encode_mutation(&entry_mutation),
+            encode_mutation(&after_mutation),
+        ];
+        drop(state);
+
+        self.append_encoded_lines(&encoded).await?;
+        let mut state = self.state.lock().await;
+        let committed_before = match state.apply_mutation(before_mutation)? {
+            ApplyOutcome::Record(stamped) => stamped,
+            _ => return Err(SessionError::storage("before record did not persist")),
+        };
+        let committed_entry = match state.apply_mutation(entry_mutation)? {
+            ApplyOutcome::Entry(stamped) => stamped,
+            _ => return Err(SessionError::storage("entry did not persist")),
+        };
+        let committed_after = match state.apply_mutation(after_mutation)? {
+            ApplyOutcome::Record(stamped) => stamped,
+            _ => return Err(SessionError::storage("after record did not persist")),
+        };
+        Ok((committed_before, committed_entry, committed_after))
+    }
+
+    async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+        self.append_record_batch(vec![record])
+            .await?
+            .pop()
+            .ok_or_else(|| SessionError::storage("append_record returned no record"))
+    }
+
+    async fn append_records(&self, records: Vec<LaneRecord>) -> SessionResult<Vec<LaneRecord>> {
+        self.append_record_batch(records).await
     }
 
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
@@ -774,6 +1045,48 @@ mod tests {
             };
             assert_eq!(frame.frame, Some(serde_json::Value::String(expected)));
         }
+    }
+
+    #[tokio::test]
+    async fn append_records_batches_frame_records_with_contiguous_sequences() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            "/batch.jsonl",
+            header(),
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        let frame = |id: &str| {
+            LaneRecord::AssistantFrame(crate::session::types::AssistantFrameRecord {
+                base: RecordBase {
+                    id: id.into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "run".into(),
+                stream_index: 0,
+                op: crate::session::types::AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"id": id})),
+            })
+        };
+        let returned = storage
+            .append_records(vec![frame("frame-1"), frame("frame-2")])
+            .await
+            .unwrap();
+        assert_eq!(
+            returned.iter().map(LaneRecord::seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let stored = storage.find_records(&RecordQuery::default()).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        let mut ids = stored.iter().map(|record| record.id()).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["frame-1", "frame-2"]);
     }
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {

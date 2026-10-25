@@ -270,6 +270,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn returns_runtime_diagnostics_guide() {
+        let output = execute(serde_json::json!({
+            "topic": "debugging",
+            "query": "RPI_FRAME_DIAGNOSTICS"
+        }))
+        .await;
+        assert!(output.contains("RPI_FRAME_DIAGNOSTICS"));
+        assert!(output.contains("frame writer"));
+    }
+
+    #[tokio::test]
+    async fn returns_runtime_diagnostics_from_overview() {
+        let output = execute(serde_json::json!({
+            "topic": "overview",
+            "query": "RPI_AGENT_DIAGNOSTICS"
+        }))
+        .await;
+        assert!(output.contains("RPI_AGENT_DIAGNOSTICS"));
+        assert!(output.contains("latencies"));
+    }
+
+    #[tokio::test]
     async fn returns_complete_user_guide() {
         let output = execute(serde_json::json!({"topic": "guide", "query": "cdylib"})).await;
         assert!(output.contains("cdylib"));
