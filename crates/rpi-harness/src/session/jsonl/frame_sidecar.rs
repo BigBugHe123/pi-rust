@@ -1,7 +1,8 @@
 //! Optional assistant-frame sidecar block codec.
 //!
-//! The default storage mode remains inline JSONL. `JsonlSessionStorage` can opt
-//! into this format explicitly or through `RPI_FRAME_SIDECAR=1`.
+//! This module is a standalone, versioned codec for a future sidecar backend.
+//! The core JSONL storage path intentionally does not depend on it, so the
+//! default durable path remains simple, readable, and fast.
 //!
 //! A sidecar consists of independent blocks. Each block has a fixed header and
 //! a newline-delimited JSON payload containing only `assistant_frame` records.

@@ -47,25 +47,19 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem};
-use rpi_tools::error::FileErrorCode;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::jsonl::codec::{
     encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
 };
 use crate::session::jsonl::errors::{file_result, invalid_file, JsonlDecodeErrorKind};
-#[cfg(feature = "frame-sidecar-zlib")]
-use crate::session::jsonl::frame_sidecar::encode_compressed_payload_block;
-use crate::session::jsonl::frame_sidecar::{
-    decode_payload_block_at, encode_payload_block, parse_reference_marker, reference_marker,
-};
 use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
 use crate::session::memory::{stamp_record, Clock};
 use crate::session::state::{ApplyOutcome, SessionState};
@@ -95,47 +89,9 @@ pub struct JsonlSessionStorage {
     /// full duration.
     tail: Mutex<()>,
     append: Mutex<Option<Box<dyn rpi_tools::env::AppendFile>>>,
-    /// Optional sidecar path for assistant-frame Append payloads. The mode is
-    /// opt-in via `RPI_FRAME_SIDECAR=1`; all other records stay in the main
-    /// JSONL file.
-    frame_sidecar_path: Option<String>,
 }
 
 impl JsonlSessionStorage {
-    fn sidecar_enabled() -> bool {
-        std::env::var_os("RPI_FRAME_SIDECAR").is_some_and(|value| value != "0")
-    }
-
-    fn sidecar_path(path: &str) -> String {
-        format!("{path}.frames")
-    }
-
-    #[cfg(feature = "frame-sidecar-zlib")]
-    fn compressed_sidecar_enabled() -> bool {
-        cfg!(feature = "frame-sidecar-zlib")
-            && std::env::var_os("RPI_FRAME_SIDECAR_ZLIB").is_some_and(|value| value != "0")
-    }
-
-    fn new_with_sidecar(
-        fs: Arc<dyn FileSystem>,
-        metadata: JsonlSessionMetadata,
-        clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
-        sidecar_enabled: bool,
-    ) -> Self {
-        let frame_sidecar_path = sidecar_enabled.then(|| Self::sidecar_path(&metadata.path));
-        Self {
-            fs,
-            metadata,
-            state: tokio::sync::Mutex::new(SessionState::new()),
-            clock,
-            ids,
-            tail: Mutex::new(()),
-            append: Mutex::new(None),
-            frame_sidecar_path,
-        }
-    }
-
     /// Build a storage over an already-initialized file (header written).
     /// Mirrors TS `new JsonlSessionStorage(fs, metadata)`.
     pub fn new(
@@ -144,83 +100,25 @@ impl JsonlSessionStorage {
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
     ) -> Self {
-        Self::new_with_sidecar(fs, metadata, clock, ids, Self::sidecar_enabled())
+        Self {
+            fs,
+            metadata,
+            state: tokio::sync::Mutex::new(SessionState::new()),
+            clock,
+            ids,
+            tail: Mutex::new(()),
+            append: Mutex::new(None),
+        }
     }
 
-    fn mutation_has_sidecar_reference(mutation: &SessionMutation) -> bool {
-        matches!(
-            mutation,
-            SessionMutation::Record {
-                record: LaneRecord::AssistantFrame(frame)
-            } if frame.op == crate::session::types::AssistantFrameOp::Append
-                && frame.frame.as_ref().is_some_and(|payload| parse_reference_marker(payload).is_some())
-        )
-    }
-    fn hydrate_sidecar_mutation(
-        mutation: SessionMutation,
-        sidecar: Option<&[u8]>,
-        blocks: &mut HashMap<u64, Vec<Option<serde_json::Value>>>,
-    ) -> SessionResult<SessionMutation> {
-        let SessionMutation::Record { mut record } = mutation else {
-            return Ok(mutation);
-        };
-        let LaneRecord::AssistantFrame(frame) = &mut record else {
-            return Ok(SessionMutation::Record { record });
-        };
-        if frame.op != crate::session::types::AssistantFrameOp::Append {
-            return Ok(SessionMutation::Record { record });
-        }
-        let Some(payload) = frame.frame.as_ref() else {
-            return Ok(SessionMutation::Record { record });
-        };
-        let Some((offset, index)) = parse_reference_marker(payload) else {
-            return Ok(SessionMutation::Record { record });
-        };
-        let bytes = sidecar
-            .ok_or_else(|| SessionError::storage("assistant frame references a missing sidecar"))?;
-        if !blocks.contains_key(&offset) {
-            let decoded = decode_payload_block_at(bytes, offset)
-                .map_err(|error| SessionError::storage(error.to_string()))?;
-            blocks.insert(offset, decoded);
-        }
-        let hydrated = blocks
-            .get(&offset)
-            .and_then(|records| records.get(index as usize))
-            .cloned()
-            .ok_or_else(|| SessionError::storage("assistant frame sidecar index is invalid"))?;
-        frame.frame = hydrated;
-        Ok(SessionMutation::Record { record })
-    }
-
-    /// Create using the environment-selected storage mode.
+    /// Create a new session file: write the header, then build a storage over
+    /// it. Mirrors TS `JsonlSessionStorage.create`.
     pub async fn create(
         fs: Arc<dyn FileSystem>,
         path: &str,
         header: JsonlV4Header,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
-    ) -> SessionResult<Self> {
-        Self::create_with_mode(fs, path, header, clock, ids, Self::sidecar_enabled()).await
-    }
-
-    /// Create a session with assistant-frame sidecar writes enabled.
-    pub async fn create_with_frame_sidecar(
-        fs: Arc<dyn FileSystem>,
-        path: &str,
-        header: JsonlV4Header,
-        clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
-    ) -> SessionResult<Self> {
-        Self::create_with_mode(fs, path, header, clock, ids, true).await
-    }
-
-    async fn create_with_mode(
-        fs: Arc<dyn FileSystem>,
-        path: &str,
-        header: JsonlV4Header,
-        clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
-        sidecar_enabled: bool,
     ) -> SessionResult<Self> {
         file_result(
             fs.write_file(path, FileContent::Text(encode_header(&header)), None)
@@ -232,54 +130,16 @@ impl JsonlSessionStorage {
             &format!("Failed to read session metadata {path}"),
         )?;
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
-        Ok(Self::new_with_sidecar(
-            fs,
-            metadata,
-            clock,
-            ids,
-            sidecar_enabled,
-        ))
+        Ok(Self::new(fs, metadata, clock, ids))
     }
 
-    /// Load using the environment-selected storage mode. Existing sidecar files
-    /// are detected automatically so repository reopen remains transparent.
+    /// Load + replay an existing session file, repairing a torn tail if the
+    /// last physical line is a syntax error. Mirrors TS `JsonlSessionStorage.load`.
     pub async fn load(
         fs: Arc<dyn FileSystem>,
         path: &str,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
-    ) -> SessionResult<Self> {
-        let sidecar_exists = fs.file_info(&Self::sidecar_path(path), None).await.is_ok();
-        Self::load_with_mode(
-            fs,
-            path,
-            clock,
-            ids,
-            Self::sidecar_enabled() || sidecar_exists,
-        )
-        .await
-    }
-
-    /// Load a session and resolve assistant-frame references from its sidecar.
-    /// This is explicit so callers and tests can opt in without mutating the
-    /// process environment.
-    pub async fn load_with_frame_sidecar(
-        fs: Arc<dyn FileSystem>,
-        path: &str,
-        clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
-    ) -> SessionResult<Self> {
-        Self::load_with_mode(fs, path, clock, ids, true).await
-    }
-
-    /// Load + replay an existing session file, repairing a torn tail if the
-    /// last physical line is a syntax error. Mirrors TS `JsonlSessionStorage.load`.
-    async fn load_with_mode(
-        fs: Arc<dyn FileSystem>,
-        path: &str,
-        clock: Arc<dyn Clock>,
-        ids: Arc<dyn IdGenerator>,
-        sidecar_enabled: bool,
     ) -> SessionResult<Self> {
         let content = file_result(
             fs.read_text_file(path, None).await,
@@ -299,22 +159,7 @@ impl JsonlSessionStorage {
             &format!("Failed to read session metadata {path}"),
         )?;
         let metadata = metadata_from_header(&header, path, info.mtime_ms);
-        let storage = Self::new_with_sidecar(fs.clone(), metadata, clock, ids, sidecar_enabled);
-        let sidecar_bytes = if let Some(sidecar_path) = storage.frame_sidecar_path.as_deref() {
-            match fs.read_binary_file(sidecar_path, None).await {
-                Ok(bytes) => Some(bytes),
-                Err(error) if error.code == FileErrorCode::NotFound => None,
-                Err(error) => {
-                    return Err(SessionError::storage(format!(
-                        "Failed to read assistant frame sidecar {sidecar_path}: {}",
-                        error.message
-                    )))
-                }
-            }
-        } else {
-            None
-        };
-        let mut sidecar_blocks = HashMap::new();
+        let storage = Self::new(fs.clone(), metadata, clock, ids);
 
         // Lines kept through the duplicate-seq recovery, so a healed file can
         // be republished without the dropped duplicates (see after the loop).
@@ -324,19 +169,6 @@ impl JsonlSessionStorage {
             let line_no = (idx + 1) as u32;
             match parse_mutation(line) {
                 Ok(mutation) => {
-                    if !sidecar_enabled && Self::mutation_has_sidecar_reference(&mutation) {
-                        return Err(invalid_file(
-                            path,
-                            line_no,
-                            &"assistant frame references a missing sidecar".to_string(),
-                        ));
-                    }
-                    let mutation = Self::hydrate_sidecar_mutation(
-                        mutation,
-                        sidecar_bytes.as_deref(),
-                        &mut sidecar_blocks,
-                    )
-                    .map_err(|error| invalid_file(path, line_no, &error.message))?;
                     let mut state = storage.state.lock().await;
                     // Self-heal a duplicated/late append. Two writers on one
                     // JSONL (e.g. a session resumed while still open in another
@@ -546,53 +378,6 @@ impl JsonlSessionStorage {
         )
     }
 
-    async fn append_sidecar_block(&self, records: &[LaneRecord]) -> SessionResult<u64> {
-        let Some(path) = self.frame_sidecar_path.as_deref() else {
-            return Err(SessionError::storage("assistant frame sidecar is disabled"));
-        };
-        let offset = match self.fs.file_info(path, None).await {
-            Ok(info) => info.size,
-            Err(error) if error.code == FileErrorCode::NotFound => 0,
-            Err(error) => {
-                return Err(SessionError::storage(format!(
-                    "Failed to inspect assistant frame sidecar {path}: {}",
-                    error.message
-                )))
-            }
-        };
-        #[cfg(feature = "frame-sidecar-zlib")]
-        let block = if Self::compressed_sidecar_enabled() {
-            encode_compressed_payload_block(records)
-        } else {
-            encode_payload_block(records)
-        }
-        .map_err(|error| SessionError::storage(error.to_string()))?;
-        #[cfg(not(feature = "frame-sidecar-zlib"))]
-        let block = encode_payload_block(records)
-            .map_err(|error| SessionError::storage(error.to_string()))?;
-        file_result(
-            self.fs
-                .append_file(path, FileContent::Bytes(block), None)
-                .await,
-            &format!("Failed to append assistant frame sidecar {path}"),
-        )?;
-        Ok(offset)
-    }
-
-    fn sidecar_reference_mutation(
-        mutation: &SessionMutation,
-        offset: u64,
-        index: u32,
-    ) -> SessionMutation {
-        let mut mutation = mutation.clone();
-        if let SessionMutation::Record { record } = &mut mutation {
-            if let LaneRecord::AssistantFrame(frame) = record {
-                frame.frame = Some(reference_marker(offset, index));
-            }
-        }
-        mutation
-    }
-
     /// Append a frame-only batch without cloning the complete session state.
     /// Frame records do not change lanes or open-operation state, so their
     /// sequence and id validation can use a small local batch index.
@@ -605,6 +390,7 @@ impl JsonlSessionStorage {
         let mut next_seq = state.next_sequence();
         let mut ids = HashSet::with_capacity(records.len());
         let mut mutations = Vec::with_capacity(records.len());
+        let mut encoded_lines = Vec::with_capacity(records.len());
 
         for record in records {
             let lane = record.lane().to_string();
@@ -619,42 +405,11 @@ impl JsonlSessionStorage {
             let timestamp = self.clock.now_ms();
             let stamped = stamp_record(record, next_seq, lane, timestamp);
             next_seq += 1;
-            mutations.push(SessionMutation::Record { record: stamped });
+            let mutation = SessionMutation::Record { record: stamped };
+            encoded_lines.push(encode_mutation(&mutation));
+            mutations.push(mutation);
         }
         drop(state);
-
-        let use_sidecar = self.frame_sidecar_path.is_some()
-            && mutations.iter().all(|mutation| {
-                matches!(
-                    mutation,
-                    SessionMutation::Record {
-                        record: LaneRecord::AssistantFrame(frame)
-                    } if frame.op == crate::session::types::AssistantFrameOp::Append
-                )
-            });
-        let sidecar_offset = if use_sidecar {
-            let frame_records: Vec<_> = mutations
-                .iter()
-                .map(|mutation| match mutation {
-                    SessionMutation::Record { record } => record.clone(),
-                    _ => unreachable!("frame sidecar batch contains only records"),
-                })
-                .collect();
-            Some(self.append_sidecar_block(&frame_records).await?)
-        } else {
-            None
-        };
-        let encoded_lines: Vec<_> = mutations
-            .iter()
-            .enumerate()
-            .map(|(index, mutation)| {
-                let on_disk = sidecar_offset.map_or_else(
-                    || mutation.clone(),
-                    |offset| Self::sidecar_reference_mutation(mutation, offset, index as u32),
-                );
-                encode_mutation(&on_disk)
-            })
-            .collect();
 
         self.append_encoded_lines(&encoded_lines).await?;
         let mut state = self.state.lock().await;
@@ -672,6 +427,8 @@ impl JsonlSessionStorage {
         Ok(stamped_records)
     }
 
+    /// Append one non-frame record without cloning the complete session state.
+    ///
     /// Record validation is completed while the session tail is held. The
     /// state is only advanced after the durable append succeeds, so a failed
     /// write leaves the in-memory state unchanged while avoiding the O(history)
@@ -1330,192 +1087,6 @@ mod tests {
         let mut ids = stored.iter().map(|record| record.id()).collect::<Vec<_>>();
         ids.sort_unstable();
         assert_eq!(ids, ["frame-1", "frame-2"]);
-    }
-
-    #[tokio::test]
-    async fn sidecar_frame_records_round_trip_without_swallowing_extension_entries() {
-        let fs: Arc<dyn FileSystem> =
-            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
-        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
-        let storage = JsonlSessionStorage::create_with_frame_sidecar(
-            fs.clone(),
-            "/sidecar.jsonl",
-            header(),
-            clock.clone(),
-            ids.clone(),
-        )
-        .await
-        .unwrap();
-        storage
-            .append_entry(
-                ProvisionedEntry {
-                    id: "extension-before".into(),
-                    kind: ProvisionedKind::Message {
-                        message: user_msg("before"),
-                        terminate: None,
-                    },
-                },
-                "main",
-            )
-            .await
-            .unwrap();
-        let frame = |id: &str, text: &str| {
-            LaneRecord::AssistantFrame(crate::session::types::AssistantFrameRecord {
-                base: RecordBase {
-                    id: id.into(),
-                    seq: 0,
-                    lane: "main".into(),
-                    timestamp: 0,
-                },
-                run_id: "run".into(),
-                stream_index: id.ends_with('1').then_some(1).unwrap_or(2),
-                op: crate::session::types::AssistantFrameOp::Append,
-                frame: Some(serde_json::json!({"text": text})),
-            })
-        };
-        storage
-            .append_records(vec![frame("frame-1", "one"), frame("frame-2", "two")])
-            .await
-            .unwrap();
-        storage
-            .append_entry(
-                ProvisionedEntry {
-                    id: "extension-after".into(),
-                    kind: ProvisionedKind::Message {
-                        message: user_msg("after"),
-                        terminate: None,
-                    },
-                },
-                "main",
-            )
-            .await
-            .unwrap();
-
-        let main = fs.read_text_file("/sidecar.jsonl", None).await.unwrap();
-        assert!(main.contains("$rpiFrameSidecar"));
-        let sidecar = fs
-            .read_binary_file("/sidecar.jsonl.frames", None)
-            .await
-            .unwrap();
-        assert!(!sidecar.is_empty());
-
-        let reloaded =
-            JsonlSessionStorage::load_with_frame_sidecar(fs, "/sidecar.jsonl", clock, ids)
-                .await
-                .unwrap();
-        assert!(reloaded
-            .get_entry("extension-before")
-            .await
-            .unwrap()
-            .is_some());
-        assert!(reloaded
-            .get_entry("extension-after")
-            .await
-            .unwrap()
-            .is_some());
-        let records = reloaded
-            .find_records(&RecordQuery::default())
-            .await
-            .unwrap();
-        let frames: Vec<_> = records
-            .iter()
-            .filter_map(|record| match record {
-                LaneRecord::AssistantFrame(frame) => frame.frame.clone(),
-                _ => None,
-            })
-            .collect();
-        assert!(frames.contains(&serde_json::json!({"text": "one"})));
-        assert!(frames.contains(&serde_json::json!({"text": "two"})));
-    }
-
-    #[tokio::test]
-    #[ignore = "manual persistence benchmark"]
-    async fn sidecar_storage_benchmark() {
-        use std::time::Instant;
-
-        let mode = std::env::var("RPI_BENCH_MODE").unwrap_or_else(|_| "inline".into());
-        assert!(matches!(mode.as_str(), "inline" | "raw" | "zlib"));
-        if mode == "zlib" {
-            assert!(
-                cfg!(feature = "frame-sidecar-zlib"),
-                "zlib benchmark requires --features frame-sidecar-zlib"
-            );
-        }
-        let temp = tempfile::tempdir().unwrap();
-        let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
-            temp.path().to_path_buf(),
-        ));
-        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
-        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
-        let path = "bench.jsonl";
-        let storage = if mode == "inline" {
-            JsonlSessionStorage::create(fs.clone(), path, header(), clock.clone(), ids.clone())
-                .await
-                .unwrap()
-        } else {
-            JsonlSessionStorage::create_with_frame_sidecar(
-                fs.clone(),
-                path,
-                header(),
-                clock.clone(),
-                ids.clone(),
-            )
-            .await
-            .unwrap()
-        };
-        let append_start = Instant::now();
-        for batch in 0..32 {
-            let records = (0..128)
-                .map(|index| {
-                    let sequence = batch * 128 + index;
-                    LaneRecord::AssistantFrame(crate::session::types::AssistantFrameRecord {
-                        base: RecordBase {
-                            id: format!("bench-frame-{sequence}"),
-                            seq: 0,
-                            lane: "main".into(),
-                            timestamp: 0,
-                        },
-                        run_id: "bench-run".into(),
-                        stream_index: sequence,
-                        op: crate::session::types::AssistantFrameOp::Append,
-                        frame: Some(serde_json::json!({
-                            "entryId": "bench-entry",
-                            "text": "repeated assistant frame payload for compression",
-                            "delta": "same-content"
-                        })),
-                    })
-                })
-                .collect();
-            storage.append_records(records).await.unwrap();
-        }
-        storage.drain().await;
-        let append_ms = append_start.elapsed().as_secs_f64() * 1000.0;
-        let main_bytes = fs.file_info(path, None).await.unwrap().size;
-        let sidecar_bytes = fs
-            .file_info("bench.jsonl.frames", None)
-            .await
-            .map(|info| info.size)
-            .unwrap_or(0);
-
-        let reload_start = Instant::now();
-        let reloaded = JsonlSessionStorage::load(fs, path, clock, ids)
-            .await
-            .unwrap();
-        reloaded.drain().await;
-        let reload_ms = reload_start.elapsed().as_secs_f64() * 1000.0;
-        assert_eq!(
-            reloaded
-                .find_records(&RecordQuery::default())
-                .await
-                .unwrap()
-                .len(),
-            4096
-        );
-        println!(
-            "SIDECAR_BENCH mode={mode} append_ms={append_ms:.3} reload_ms={reload_ms:.3} main_bytes={main_bytes} sidecar_bytes={sidecar_bytes} total_bytes={}",
-            main_bytes + sidecar_bytes
-        );
     }
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {

@@ -50,7 +50,6 @@ use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
 use rpi_tools::env::{FileKind, FileSystem};
-use rpi_tools::error::FileErrorCode;
 
 use crate::error::{SessionError, SessionResult};
 use crate::session::jsonl::codec::{metadata_from_header, parse_header};
@@ -280,16 +279,7 @@ impl JsonlSessionRepo {
         file_result(
             self.fs.remove(&metadata.path, false, true, None).await,
             &format!("Failed to delete session {}", metadata.path),
-        )?;
-        let sidecar_path = format!("{}.frames", metadata.path);
-        match self.fs.remove(&sidecar_path, false, true, None).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.code == FileErrorCode::NotFound => Ok(()),
-            Err(error) => Err(SessionError::storage(format!(
-                "Failed to delete assistant frame sidecar {sidecar_path}: {}",
-                error.message
-            ))),
-        }
+        )
     }
 
     /// Fork a session. Mirrors TS
