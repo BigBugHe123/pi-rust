@@ -64,8 +64,8 @@ use crate::messages::{
 use crate::prompt_templates::format_prompt_template_invocation;
 use crate::result::{HarnessError, HarnessResult, OperationKind};
 use crate::session::context::{
-    build_session_context, ContextEntryTransform, CustomEntryContextMessageProjector,
-    SessionContextBuildOptions,
+    build_session_context, build_session_context_owned, ContextEntryTransform,
+    CustomEntryContextMessageProjector, SessionContextBuildOptions,
 };
 use crate::session::session::Session;
 use crate::session::types::{
@@ -3081,6 +3081,18 @@ impl AgentHarness {
         result
     }
 
+    /// Load the default context through the storage binding. This avoids
+    /// materializing the complete branch; storage validates the same parent
+    /// chain and clones only model-visible messages.
+    async fn branch_context_default(
+        &self,
+    ) -> HarnessResult<crate::session::context::SessionContext> {
+        self.session
+            .context_on_branch_for_lane(&self.lane, &BranchBounds::default())
+            .await
+            .map_err(session_to_harness_err)
+    }
+
     /// Snapshot the inner config fields needed to build an `AgentLoopConfig`.
     fn snapshot_config(&self) -> HarnessResult<ConfigSnapshot> {
         let inner = self.inner.lock().unwrap();
@@ -3767,8 +3779,8 @@ impl AgentHarness {
         self.emit_appended_messages(prompts.iter().take(queued_ids.len()).cloned().collect())
             .await;
 
-        // Snapshot config.
         let snap = self.snapshot_config()?;
+        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
         if snap.models.is_empty() {
             let _ = self
                 .write_operation_finished(
@@ -3804,7 +3816,6 @@ impl AgentHarness {
             // Keep this separate from the post-compaction read: compaction can
             // change the branch, and caller transforms may be stateful.
             let path = self.branch_path_oldest_first().await?;
-            let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
             let ctx = build_session_context(&path, &build_opts);
             let ctx_tokens = estimate_context_tokens(&ctx.messages).tokens;
             let window = snap.model.context_window as i64;
@@ -3894,10 +3905,13 @@ impl AgentHarness {
             }
         }
 
-        // Rebuild path after potential compaction.
-        let path = self.branch_path_oldest_first().await?;
-        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
-        let ctx = build_session_context(&path, &build_opts);
+        let ctx =
+            if build_opts.entry_transforms.is_empty() && build_opts.entry_projectors.is_empty() {
+                self.branch_context_default().await?
+            } else {
+                let path = self.branch_path_oldest_first().await?;
+                build_session_context_owned(path, &build_opts)
+            };
         let system_prompt = Self::compose_prompt(
             snap.system_prompt.as_deref(),
             &snap.resources,
@@ -4244,8 +4258,14 @@ impl AgentHarness {
             post_compaction_cut.store(0, Ordering::Release);
             // Prior tools and delivered context are durable. Rebuild after the
             // wait so any writes accepted during it are included as well.
-            let path = self.branch_path_oldest_first().await?;
-            agent_context.messages = build_session_context(&path, &build_opts).messages;
+            agent_context.messages = if build_opts.entry_transforms.is_empty()
+                && build_opts.entry_projectors.is_empty()
+            {
+                self.branch_context_default().await?.messages
+            } else {
+                let path = self.branch_path_oldest_first().await?;
+                build_session_context_owned(path, &build_opts).messages
+            };
         };
 
         if let Some(error) = context_write_error.lock().unwrap().take() {

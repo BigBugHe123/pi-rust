@@ -379,6 +379,39 @@ impl SessionState {
         Ok(results)
     }
 
+    /// Project a validated branch without allocating owned copies for entries
+    /// that fall before the latest compaction boundary.
+    pub(crate) fn context_on_branch(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<crate::session::context::SessionContext> {
+        let diagnostics =
+            std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0");
+        let started = diagnostics.then(std::time::Instant::now);
+        let mut path = self.walk_to_root(Some(start), bounds)?;
+        path.reverse();
+        if bounds.stop_at_id.is_some() || bounds.stop_at_type.is_some() {
+            if let Some(end) = path.iter().position(|entry| {
+                bounds.stop_at_id.as_deref() == Some(entry.id())
+                    || bounds
+                        .stop_at_type
+                        .map(|kind| kind == entry.entry_type())
+                        .unwrap_or(false)
+            }) {
+                path.truncate(end + 1);
+            }
+        }
+        if let Some(started) = started {
+            eprintln!(
+                "RPI_CONTEXT_DIAGNOSTICS path_load_ns={} path_entries={}",
+                started.elapsed().as_nanos().min(u64::MAX as u128),
+                path.len(),
+            );
+        }
+        Ok(crate::session::context::build_session_context_from_borrowed(&path))
+    }
+
     pub fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         validate_limit(query.limit)?;
         let order = query.order.unwrap_or_default();

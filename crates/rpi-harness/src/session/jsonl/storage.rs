@@ -795,6 +795,15 @@ impl SessionStorage for JsonlSessionStorage {
         state.find_entries_on_branch(query, bounds, start)
     }
 
+    async fn context_on_branch(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<crate::session::context::SessionContext> {
+        let state = self.state.lock().await;
+        state.context_on_branch(bounds, start)
+    }
+
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         let state = self.state.lock().await;
         state.find_records(query)
@@ -942,8 +951,57 @@ mod tests {
     use super::*;
     use crate::session::memory::{CounterIdGenerator, FakeClock};
     use crate::session::types::{
-        OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase,
+        EntryOrder, OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+        RecordBase,
     };
+
+    #[tokio::test]
+    async fn context_projection_matches_jsonl_branch_query() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            "/context.jsonl",
+            header(),
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        for (id, text) in [("e1", "old"), ("e2", "visible"), ("e3", "latest")] {
+            storage
+                .append_entry(
+                    ProvisionedEntry {
+                        id: id.into(),
+                        kind: ProvisionedKind::Message {
+                            message: rpi_ai::UserMessage::new(text, 0).into(),
+                            terminate: None,
+                        },
+                    },
+                    "main",
+                )
+                .await
+                .unwrap();
+        }
+        let bounds = BranchBounds {
+            stop_at_type: Some("message".into()),
+            ..Default::default()
+        };
+        let actual = storage.context_on_branch(&bounds, "e3").await.unwrap();
+        let path = storage
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &bounds,
+                "e3",
+            )
+            .await
+            .unwrap();
+        let expected = crate::session::context::build_session_context(&path, &Default::default());
+        assert_eq!(actual.messages, expected.messages);
+    }
 
     #[tokio::test]
     async fn append_returns_the_owned_payload_but_keeps_storage_defensive() {

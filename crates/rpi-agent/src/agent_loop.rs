@@ -254,6 +254,12 @@ async fn run_loop(
 
             // Inject pending (steering/follow-up) messages before the next LLM call.
             if !pending_messages.is_empty() {
+                // Steering/follow-up hooks may return any AgentMessage, not
+                // only append-safe user messages. In particular, an injected
+                // ToolResult can be orphaned; the full converter is responsible
+                // for repairing/filtering that history. Do not feed such a
+                // suffix through the incremental converter.
+                provider_cache.invalidate();
                 for message in pending_messages.drain(..) {
                     emit_event(
                         emit,

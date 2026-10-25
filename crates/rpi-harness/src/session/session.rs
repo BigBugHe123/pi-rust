@@ -344,6 +344,39 @@ impl Session {
         Ok(entries.pop())
     }
 
+    /// Build the default hook-free provider context directly from this lane's
+    /// validated branch. Custom transforms/projectors intentionally do not use
+    /// this method; callers retain the ordinary entry-reading path for hooks.
+    pub(crate) async fn context_on_branch_for_lane(
+        &self,
+        lane: &str,
+        bounds: &BranchBounds,
+    ) -> SessionResult<crate::session::context::SessionContext> {
+        // Pin the storage Arc before either await. Resolving the leaf through
+        // `self` and then reacquiring storage could mix two session bindings.
+        let storage = self.storage_arc();
+        let start = match &bounds.start {
+            Some(id) => id.clone(),
+            None => {
+                let leaf = storage
+                    .get_lanes()
+                    .await?
+                    .into_iter()
+                    .find(|pointer| pointer.lane == lane)
+                    .ok_or_else(|| SessionError::invalid_lane(format!("Lane not found: {lane}")))?
+                    .leaf_id;
+                let Some(id) = leaf else {
+                    return Ok(crate::session::context::build_session_context(
+                        &[],
+                        &Default::default(),
+                    ));
+                };
+                id
+            }
+        };
+        storage.context_on_branch(bounds, &start).await
+    }
+
     // -- Appends (main lane) -------------------------------------------------
 
     /// `appendMessage(message)` — mint an id, commit a message entry on `main`.
@@ -827,6 +860,7 @@ mod tests {
     use crate::session::types::{EntryQuery, SessionMetadata};
     use rpi_agent::message::AgentMessage;
     use rpi_ai::types::UserMessage;
+    use std::sync::{Arc, Mutex};
 
     fn fixture_session() -> Session {
         let metadata = SessionMetadata {
@@ -854,6 +888,156 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.chars().filter(|c| *c == '-').count(), 4);
         assert_eq!(id.as_bytes()[14], b'7');
+    }
+
+    #[tokio::test]
+    async fn empty_context_matches_legacy_builder() {
+        let session = fixture_session();
+        let context = session
+            .context_on_branch_for_lane("main", &BranchBounds::default())
+            .await
+            .unwrap();
+        let expected = crate::session::context::build_session_context(
+            &[],
+            &crate::session::context::SessionContextBuildOptions::default(),
+        );
+        assert_eq!(context.messages, expected.messages);
+        assert_eq!(context.thinking_level, "off");
+        assert_eq!(context.thinking_level, expected.thinking_level);
+    }
+
+    #[derive(Clone)]
+    struct RebindingStorage {
+        inner: Arc<dyn SessionStorage>,
+        callback: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SessionStorage for RebindingStorage {
+        fn metadata(&self) -> SessionMetadata {
+            self.inner.metadata()
+        }
+        async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
+            if let Some(callback) = self.callback.lock().unwrap().take() {
+                callback();
+            }
+            self.inner.get_lanes().await
+        }
+        async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
+            self.inner.create_lane(lane, at).await
+        }
+        async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
+            self.inner.move_lane(lane, to).await
+        }
+        async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
+            self.inner.append_entry(entry, lane).await
+        }
+        async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+            self.inner.append_record(record).await
+        }
+        async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
+            self.inner.get_entry(id).await
+        }
+        async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>> {
+            self.inner.find_entries(query).await
+        }
+        async fn find_entries_on_branch(
+            &self,
+            query: &EntryQuery,
+            bounds: &BranchBounds,
+            start: &str,
+        ) -> SessionResult<Vec<Entry>> {
+            self.inner
+                .find_entries_on_branch(query, bounds, start)
+                .await
+        }
+        async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
+            self.inner.find_records(query).await
+        }
+        async fn find_open_operations(
+            &self,
+            lane: &str,
+            limit: Option<usize>,
+        ) -> SessionResult<Vec<OperationStartedRecord>> {
+            self.inner.find_open_operations(lane, limit).await
+        }
+        async fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
+            self.inner.get_log(options).await
+        }
+        async fn get_name(&self) -> SessionResult<Option<String>> {
+            self.inner.get_name().await
+        }
+        async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
+            self.inner.set_name(name).await
+        }
+        async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
+            self.inner.get_label(id).await
+        }
+        async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
+            self.inner.set_label(id, label).await
+        }
+        async fn get_stats(&self) -> SessionResult<SessionStats> {
+            self.inner.get_stats().await
+        }
+    }
+
+    #[tokio::test]
+    async fn context_rebind_during_leaf_read_keeps_one_storage_binding() {
+        let old_storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new(
+            SessionMetadata {
+                id: "old".into(),
+                created_at: 0,
+                parent_session_id: None,
+            },
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        ));
+        let new_storage: Arc<dyn SessionStorage> = Arc::new(InMemorySessionStorage::new(
+            SessionMetadata {
+                id: "new".into(),
+                created_at: 0,
+                parent_session_id: None,
+            },
+            Arc::new(SystemClock),
+            Arc::new(DefaultIdGenerator::new()),
+        ));
+        let old = Session::new(old_storage.clone(), None);
+        let new = Session::new(new_storage.clone(), None);
+        old.append_message(user("old storage")).await.unwrap();
+        new.append_message(user("new storage")).await.unwrap();
+
+        let callback: Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>> = Arc::new(Mutex::new(None));
+        let wrapper: Arc<dyn SessionStorage> = Arc::new(RebindingStorage {
+            inner: old_storage,
+            callback: callback.clone(),
+        });
+        let facade = Session::new(wrapper, None);
+        let replacement = new.storage();
+        *callback.lock().unwrap() = Some(Box::new({
+            let facade = facade.clone();
+            move || facade.set_storage(replacement)
+        }));
+
+        let context = facade
+            .context_on_branch_for_lane("main", &BranchBounds::default())
+            .await
+            .unwrap();
+        assert!(matches!(
+            &context.messages[0],
+            AgentMessage::User(message)
+                if message.content == rpi_ai::types::UserContent::Text("old storage".into())
+        ));
+        let current = facade
+            .get_leaf_id()
+            .await
+            .unwrap()
+            .expect("replacement leaf");
+        assert!(matches!(
+            facade.get_entry(&current).await.unwrap().unwrap(),
+            Entry::Message(message)
+                if matches!(message.message, AgentMessage::User(ref user)
+                    if user.content == rpi_ai::types::UserContent::Text("new storage".into()))
+        ));
     }
 
     #[tokio::test]

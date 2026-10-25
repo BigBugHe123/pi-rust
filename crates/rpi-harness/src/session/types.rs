@@ -1364,6 +1364,30 @@ pub trait SessionStorage: Send + Sync {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<Vec<Entry>>;
+
+    /// Default, hook-free context projection. Backends may override this to
+    /// walk their owned state while borrowing entries; the fallback preserves
+    /// custom-storage compatibility and defensive-copy semantics.
+    async fn context_on_branch(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<crate::session::context::SessionContext> {
+        let path = self
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                bounds,
+                start,
+            )
+            .await?;
+        Ok(crate::session::context::build_session_context_owned(
+            path,
+            &Default::default(),
+        ))
+    }
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>>;
     /// Returns unfinished `operation_started` records, newest first. Recovery
     /// uses `limit: 2`: 0 = idle, 1 = suspended, 2 = corruption.

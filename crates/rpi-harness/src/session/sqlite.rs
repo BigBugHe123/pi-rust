@@ -132,6 +132,15 @@ impl SessionStorage for SqliteSessionStorage {
             .find_entries_on_branch(query, bounds, start)
             .await
     }
+    async fn context_on_branch(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<crate::session::context::SessionContext> {
+        self.refresh()?;
+        SessionStorage::context_on_branch(&self.inner, bounds, start).await
+    }
+
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
         self.refresh()?;
         self.inner.find_records(query).await
@@ -374,7 +383,7 @@ impl SessionRepo for SqliteSessionRepo {
 mod tests {
     use super::*;
     use crate::session::memory::{CounterIdGenerator, FakeClock};
-    use crate::session::types::{EntryQuery, ForkOptions, ProvisionedKind};
+    use crate::session::types::{EntryOrder, EntryQuery, ForkOptions, ProvisionedKind};
     use rpi_agent::message::AgentMessage;
 
     fn repo() -> (SqliteSessionRepo, tempfile::TempDir) {
@@ -386,6 +395,64 @@ mod tests {
         )
         .unwrap();
         (repo, dir)
+    }
+
+    #[tokio::test]
+    async fn context_projection_refreshes_and_matches_branch_query() {
+        let (repo, _dir) = repo();
+        let first = repo
+            .create(&SessionCreateOptions {
+                id: Some("context".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        first
+            .append_entry(
+                ProvisionedEntry {
+                    id: "m1".into(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::from(rpi_ai::types::UserMessage::new("one", 1)),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        let second = repo.open(&first.metadata()).await.unwrap();
+        second
+            .append_entry(
+                ProvisionedEntry {
+                    id: "m2".into(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::from(rpi_ai::types::UserMessage::new("two", 2)),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await
+            .unwrap();
+        let actual = first
+            .context_on_branch(&BranchBounds::default(), "m2")
+            .await
+            .unwrap();
+        let path = first
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &BranchBounds::default(),
+                "m2",
+            )
+            .await
+            .unwrap();
+        let expected = crate::session::context::build_session_context(&path, &Default::default());
+        assert_eq!(actual.messages, expected.messages);
+        assert_eq!(actual.messages.len(), 2);
     }
 
     #[tokio::test]

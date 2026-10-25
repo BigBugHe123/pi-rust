@@ -1821,6 +1821,37 @@ mod resume_admission {
         source
     }
 
+    #[tokio::test]
+    async fn custom_storage_uses_default_context_fallback_and_propagates_errors() {
+        let source = fresh_session();
+        source
+            .append_message(AgentMessage::User(rpi_ai::types::UserMessage::new(
+                "fallback", 0,
+            )))
+            .await
+            .unwrap();
+        let storage = PausedStorage {
+            inner: source.storage(),
+            armed: AtomicBool::new(false),
+            ready: Default::default(),
+            proceed: Default::default(),
+        };
+        let leaf = storage.inner.get_lanes().await.unwrap()[0]
+            .leaf_id
+            .clone()
+            .unwrap();
+        let context = storage
+            .context_on_branch(&BranchBounds::default(), &leaf)
+            .await
+            .unwrap();
+        assert_eq!(context.messages.len(), 1);
+        let error = storage
+            .context_on_branch(&BranchBounds::default(), "missing")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, rpi_harness::error::SessionErrorCode::NotFound);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn session_switch_is_rejected_through_resume_preparation_and_chain_is_persisted() {
         let source = interrupted_session().await;

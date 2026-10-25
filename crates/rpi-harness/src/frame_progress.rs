@@ -32,7 +32,7 @@
 //! `docs/debugging/llm-repetition-forensics.md` §十一.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -162,14 +162,37 @@ enum FrameWriteCommand {
 struct FrameWriter {
     tx: mpsc::Sender<FrameWriteCommand>,
     diagnostics: Arc<FrameDiagnostics>,
+    /// Number of frame records accepted by the channel but not yet included in
+    /// a completed storage append. A barrier with no pending records is already
+    /// ordered after all prior appends, so sending an empty Flush is redundant.
+    pending: Arc<AtomicUsize>,
+    failure: Arc<Mutex<Option<String>>>,
 }
 
 impl FrameWriter {
     fn new(session: Session) -> Self {
         let (tx, rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
         let diagnostics = FrameDiagnostics::new();
-        tokio::spawn(run_frame_writer(session, rx, Arc::clone(&diagnostics)));
-        Self { tx, diagnostics }
+        let pending = Arc::new(AtomicUsize::new(0));
+        let failure = Arc::new(Mutex::new(None));
+        // A writer outlives the recorder and may finish after the harness
+        // switches the shared facade to another session. Pin the original
+        // storage/recovery binding, while retaining the caller's generator for
+        // record ids.
+        let pinned = session.pin(Arc::clone(session.id_generator()));
+        tokio::spawn(run_frame_writer(
+            pinned,
+            rx,
+            Arc::clone(&diagnostics),
+            Arc::clone(&pending),
+            Arc::clone(&failure),
+        ));
+        Self {
+            tx,
+            diagnostics,
+            pending,
+            failure,
+        }
     }
 
     async fn append(&self, record: LaneRecord) -> HarnessResult<()> {
@@ -179,14 +202,35 @@ impl FrameWriter {
                 .frame_append_requests
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let result = self.tx.send(FrameWriteCommand::Append(record)).await;
+        let permit = self
+            .tx
+            .reserve()
+            .await
+            .map_err(|_| HarnessError::io("frame writer stopped"))?;
+        // No await remains between reserve and send. Cancellation before the
+        // permit is acquired never changes pending; cancellation after this
+        // point cannot interrupt the synchronous increment/send pair.
+        self.pending.fetch_add(1, Ordering::AcqRel);
+        permit.send(FrameWriteCommand::Append(record));
         if let Some(started) = started {
             FrameDiagnostics::add_duration(&self.diagnostics.queue_wait_ns, started.elapsed());
         }
-        result.map_err(|_| HarnessError::io("frame writer stopped"))
+        Ok(())
     }
 
     async fn flush(&self) -> HarnessResult<()> {
+        // `append` increments before enqueueing, and the writer decrements only
+        // after its storage append completes. Therefore zero is a real ordered
+        // no-op, not merely an observation that the channel happens to be empty.
+        if self.pending.load(Ordering::Acquire) == 0 {
+            if let Some(error) = self.failure.lock().unwrap().clone() {
+                return Err(HarnessError::io(error));
+            }
+            if self.tx.is_closed() {
+                return Err(HarnessError::io("frame writer stopped"));
+            }
+            return Ok(());
+        }
         let started = self.diagnostics.enabled.then(Instant::now);
         if self.diagnostics.enabled {
             self.diagnostics
@@ -213,25 +257,39 @@ async fn run_frame_writer(
     session: Session,
     mut rx: mpsc::Receiver<FrameWriteCommand>,
     diagnostics: Arc<FrameDiagnostics>,
+    pending: Arc<AtomicUsize>,
+    failure_state: Arc<Mutex<Option<String>>>,
 ) {
     let mut batch = Vec::with_capacity(FRAME_CHUNK_RECORDS);
+    let mut deadline = None;
     let mut failure: Option<String> = None;
 
     loop {
         let command = if batch.is_empty() {
+            deadline = None;
             rx.recv().await
         } else {
-            match tokio::time::timeout(FRAME_CHECKPOINT_INTERVAL, rx.recv()).await {
+            let wait_until = deadline.expect("a non-empty frame batch has a deadline");
+            match tokio::time::timeout_at(wait_until, rx.recv()).await {
                 Ok(command) => command,
                 Err(_) => {
                     if failure.is_none() {
-                        if let Err(error) =
-                            flush_frame_batch(&session, &mut batch, &diagnostics).await
+                        if let Err(error) = flush_frame_batch(
+                            &session,
+                            &mut batch,
+                            &diagnostics,
+                            &pending,
+                            &failure_state,
+                        )
+                        .await
                         {
                             diagnostics.writer_failures.fetch_add(1, Ordering::Relaxed);
-                            failure = Some(error.to_string());
+                            let message = error.to_string();
+                            *failure_state.lock().unwrap() = Some(message.clone());
+                            failure = Some(message);
                         }
                     }
+                    deadline = None;
                     continue;
                 }
             }
@@ -243,25 +301,55 @@ async fn run_frame_writer(
         match command {
             FrameWriteCommand::Append(record) => {
                 if failure.is_none() {
+                    // The checkpoint is measured from the first pending frame,
+                    // not from the most recent receive. A busy stream must not
+                    // postpone durability indefinitely.
+                    if batch.is_empty() {
+                        deadline = Some(tokio::time::Instant::now() + FRAME_CHECKPOINT_INTERVAL);
+                    }
                     batch.push(record);
                     if batch.len() >= FRAME_CHUNK_RECORDS {
-                        if let Err(error) =
-                            flush_frame_batch(&session, &mut batch, &diagnostics).await
+                        if let Err(error) = flush_frame_batch(
+                            &session,
+                            &mut batch,
+                            &diagnostics,
+                            &pending,
+                            &failure_state,
+                        )
+                        .await
                         {
                             diagnostics.writer_failures.fetch_add(1, Ordering::Relaxed);
-                            failure = Some(error.to_string());
+                            let message = error.to_string();
+                            *failure_state.lock().unwrap() = Some(message.clone());
+                            failure = Some(message);
                         }
+                        deadline = None;
                     }
+                } else {
+                    // The writer has already reported a durable failure. Accept
+                    // no more work, but release its pending accounting so a
+                    // caller never waits on an impossible batch.
+                    pending.fetch_sub(1, Ordering::AcqRel);
                 }
             }
             FrameWriteCommand::Flush(reply) => {
                 if failure.is_none() {
-                    if let Err(error) = flush_frame_batch(&session, &mut batch, &diagnostics).await
+                    if let Err(error) = flush_frame_batch(
+                        &session,
+                        &mut batch,
+                        &diagnostics,
+                        &pending,
+                        &failure_state,
+                    )
+                    .await
                     {
                         diagnostics.writer_failures.fetch_add(1, Ordering::Relaxed);
-                        failure = Some(error.to_string());
+                        let message = error.to_string();
+                        *failure_state.lock().unwrap() = Some(message.clone());
+                        failure = Some(message);
                     }
                 }
+                deadline = None;
                 let result = failure.clone().map_or(Ok(()), Err);
                 let _ = reply.send(result);
             }
@@ -269,24 +357,42 @@ async fn run_frame_writer(
     }
 
     if failure.is_none() {
-        let _ = flush_frame_batch(&session, &mut batch, &diagnostics).await;
+        let _ =
+            flush_frame_batch(&session, &mut batch, &diagnostics, &pending, &failure_state).await;
     }
+}
+
+fn publish_failure_before_pending_release(
+    message: String,
+    failure_state: &Mutex<Option<String>>,
+    pending: &AtomicUsize,
+    count: usize,
+) {
+    let mut failure = failure_state.lock().unwrap();
+    if failure.is_none() {
+        *failure = Some(message);
+    }
+    drop(failure);
+    pending.fetch_sub(count, Ordering::AcqRel);
 }
 
 async fn flush_frame_batch(
     session: &Session,
     batch: &mut Vec<LaneRecord>,
     diagnostics: &FrameDiagnostics,
+    pending: &AtomicUsize,
+    failure_state: &Mutex<Option<String>>,
 ) -> HarnessResult<()> {
     if batch.is_empty() {
         return Ok(());
     }
     let records = std::mem::take(batch);
+    let count = records.len();
     if diagnostics.enabled {
         diagnostics.batch_count.fetch_add(1, Ordering::Relaxed);
         diagnostics
             .batch_records
-            .fetch_add(records.len() as u64, Ordering::Relaxed);
+            .fetch_add(count as u64, Ordering::Relaxed);
         diagnostics
             .append_records_calls
             .fetch_add(1, Ordering::Relaxed);
@@ -299,6 +405,13 @@ async fn flush_frame_batch(
         .map_err(|error| {
             HarnessError::io(format!("could not append assistant frame chunk: {error}"))
         });
+    if let Err(error) = &result {
+        // Publish failure before releasing the last pending count. A concurrent
+        // barrier must not observe zero and return success in this small window.
+        publish_failure_before_pending_release(error.to_string(), failure_state, pending, count);
+    } else {
+        pending.fetch_sub(count, Ordering::AcqRel);
+    }
     if let Some(started) = started {
         FrameDiagnostics::add_duration(&diagnostics.batch_append_ns, started.elapsed());
     }
@@ -1068,6 +1181,215 @@ mod volatile_tests {
                 assert!(session.volatile_progress().is_none());
             }
         }
+    }
+
+    #[test]
+    fn sticky_failure_is_published_before_pending_reaches_zero() {
+        let pending = AtomicUsize::new(1);
+        let failure = Mutex::new(None);
+        publish_failure_before_pending_release("append failed".into(), &failure, &pending, 1);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(
+            failure.lock().unwrap().as_deref(),
+            Some("append failed"),
+            "pending zero must imply the sticky failure is already visible"
+        );
+
+        let (tx, _rx) = mpsc::channel(1);
+        let writer = FrameWriter {
+            tx,
+            diagnostics: FrameDiagnostics::new(),
+            pending: Arc::new(AtomicUsize::new(0)),
+            failure: Arc::new(Mutex::new(Some("append failed".into()))),
+        };
+        let result = futures::executor::block_on(writer.flush());
+        assert!(
+            result.is_err(),
+            "sticky failure must not be hidden by fast path"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_frame_append_publishes_sticky_error_before_release() {
+        let session = session(false);
+        let pending = AtomicUsize::new(1);
+        let failure = Mutex::new(None);
+        let mut batch = vec![LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: RecordBase {
+                id: "bad-lane-frame".into(),
+                seq: 0,
+                lane: "missing-lane".into(),
+                timestamp: 0,
+            },
+            run_id: "failed-run".into(),
+            stream_index: 0,
+            op: AssistantFrameOp::Append,
+            frame: None,
+        })];
+
+        let result = flush_frame_batch(
+            &session,
+            &mut batch,
+            &FrameDiagnostics::new(),
+            &pending,
+            &failure,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(batch.is_empty());
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert!(failure.lock().unwrap().is_some());
+    }
+    #[tokio::test]
+    async fn cancelled_append_does_not_leak_pending_reservation() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let writer = FrameWriter {
+            tx,
+            diagnostics: FrameDiagnostics::new(),
+            pending: Arc::clone(&pending),
+            failure: Arc::new(Mutex::new(None)),
+        };
+        let record = |id: String| {
+            LaneRecord::AssistantFrame(AssistantFrameRecord {
+                base: RecordBase {
+                    id,
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "cancel-run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: None,
+            })
+        };
+
+        writer.append(record("first".into())).await.unwrap();
+        assert_eq!(pending.load(Ordering::Acquire), 1);
+        let blocked_writer = writer.clone();
+        let mut blocked = Box::pin(blocked_writer.append(record("cancelled".into())));
+        assert!(futures::poll!(blocked.as_mut()).is_pending());
+        drop(blocked);
+        assert_eq!(
+            pending.load(Ordering::Acquire),
+            1,
+            "a cancelled reserve must not leave a phantom pending record"
+        );
+
+        let command = rx.recv().await.expect("the first append is queued");
+        assert!(matches!(command, FrameWriteCommand::Append(_)));
+        pending.fetch_sub(1, Ordering::AcqRel);
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        writer.flush().await.unwrap();
+
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let closed = FrameWriter {
+            tx,
+            diagnostics: FrameDiagnostics::new(),
+            pending: Arc::new(AtomicUsize::new(0)),
+            failure: Arc::new(Mutex::new(None)),
+        };
+        assert!(closed.append(record("closed".into())).await.is_err());
+        assert_eq!(closed.pending.load(Ordering::Acquire), 0);
+    }
+    #[tokio::test]
+    async fn detached_writer_keeps_the_original_storage_binding_after_switch() {
+        let session = session(false);
+        let old_storage = session.storage();
+        let target = self::session(false);
+        let target_storage = target.storage();
+        let writer = FrameWriter::new(session.clone());
+        let record = LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: RecordBase {
+                id: session.id_generator().next(),
+                seq: 0,
+                lane: "main".into(),
+                timestamp: 0,
+            },
+            run_id: "old-run".into(),
+            stream_index: 0,
+            op: AssistantFrameOp::Append,
+            frame: None,
+        });
+
+        writer.append(record).await.unwrap();
+        drop(writer);
+        session.set_storage(target_storage.clone());
+        tokio::task::yield_now().await;
+
+        let query = RecordQuery {
+            record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
+            run_id: Some("old-run".into()),
+            ..Default::default()
+        };
+        let old_records = old_storage.find_records(&query).await.unwrap();
+        let target_records = target_storage.find_records(&query).await.unwrap();
+        assert_eq!(
+            old_records.len(),
+            1,
+            "queued work belongs to the old session"
+        );
+        assert_eq!(
+            target_records.len(),
+            0,
+            "a switch must not receive old work"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frame_checkpoint_deadline_is_not_reset_by_busy_input() {
+        let session = session(false);
+        let storage = session.storage();
+        let writer = FrameWriter::new(session.clone());
+        let record = |id: String| {
+            LaneRecord::AssistantFrame(AssistantFrameRecord {
+                base: RecordBase {
+                    id,
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "busy-run".into(),
+                stream_index: 0,
+                op: AssistantFrameOp::Append,
+                frame: None,
+            })
+        };
+
+        writer
+            .append(record(session.id_generator().next()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(40)).await;
+        writer
+            .append(record(session.id_generator().next()))
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        // The first frame's deadline was t=50ms. A relative timeout reset by
+        // the second frame would instead wait until t=90ms and fail this check.
+        tokio::time::advance(Duration::from_millis(20)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+
+        let records = storage
+            .find_records(&RecordQuery {
+                record_type: Some(ASSISTANT_FRAME_RECORD_TYPE),
+                run_id: Some("busy-run".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            records.len(),
+            2,
+            "the batch must flush at its first deadline"
+        );
+        drop(writer);
     }
 
     #[tokio::test]
