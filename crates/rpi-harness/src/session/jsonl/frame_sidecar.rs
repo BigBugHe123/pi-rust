@@ -1,8 +1,7 @@
 //! Optional assistant-frame sidecar block codec.
 //!
-//! This module is deliberately not wired into the default JSONL storage path
-//! yet. It defines the physical block format we can use in a later migration
-//! while keeping the logical [`LaneRecord`] stream unchanged.
+//! The default storage mode remains inline JSONL. `JsonlSessionStorage` can opt
+//! into this format explicitly or through `RPI_FRAME_SIDECAR=1`.
 //!
 //! A sidecar consists of independent blocks. Each block has a fixed header and
 //! a newline-delimited JSON payload containing only `assistant_frame` records.
@@ -75,6 +74,42 @@ impl fmt::Display for FrameSidecarError {
 
 impl std::error::Error for FrameSidecarError {}
 
+/// Encode a reference marker stored in the main JSONL record.
+pub fn reference_marker(offset: u64, index: u32) -> Value {
+    serde_json::json!({
+        "$rpiFrameSidecar": {
+            "offset": offset,
+            "index": index,
+        }
+    })
+}
+
+/// Read a reference marker from a frame payload.
+pub fn parse_reference_marker(value: &Value) -> Option<(u64, u32)> {
+    let marker = value.get("$rpiFrameSidecar")?.as_object()?;
+    Some((
+        marker.get("offset")?.as_u64()?,
+        u32::try_from(marker.get("index")?.as_u64()?).ok()?,
+    ))
+}
+
+/// Decode one referenced record from a sidecar block.
+pub fn decode_record_at(
+    bytes: &[u8],
+    offset: u64,
+    index: u32,
+) -> Result<LaneRecord, FrameSidecarError> {
+    let offset = usize::try_from(offset).map_err(|_| FrameSidecarError::InvalidLength)?;
+    if offset >= bytes.len() {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let decoded = decode_blocks(&bytes[offset..])?;
+    decoded
+        .records
+        .into_iter()
+        .nth(index as usize)
+        .ok_or(FrameSidecarError::InvalidLength)
+}
 /// Encode one non-empty block of assistant-frame records.
 pub fn encode_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError> {
     if records.is_empty() {
