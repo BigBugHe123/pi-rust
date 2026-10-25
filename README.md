@@ -11,9 +11,10 @@
 [![Best of Agent Harnesses](https://img.shields.io/badge/%F0%9F%8F%86_Best_of-Agent_Harnesses-5ac4bf)](https://github.com/RyanAlberts/best-of-Agent-Harnesses)
 
 `rpi` is a library-first coding-agent runtime written in Rust, plus a terminal
-agent built on top of it. Nine composable crates span provider adapters, a
-durable crash-resumable agent loop, a terminal UI, and a stable plugin ABI — so
-the same code works as an embedded SDK or as a ready-to-run `rpi` command.
+agent built on top of it. Ten composable crates span provider adapters, a
+durable crash-resumable agent loop, a reusable runtime, a terminal UI, and a
+stable plugin ABI — so the same code works as an embedded SDK or as a ready-to-run
+`rpi` command.
 
 rpi began as a Rust reimplementation of the [Pi TypeScript SDK](https://github.com/earendil-works/pi)
 by Mario Zechner. It now includes its own Rust-native plugin ABI and execution
@@ -204,6 +205,7 @@ and enforced in review:
 
 ```
 rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness
+                    ↘ rpi-runtime
 ```
 
 Five crates sit outside that chain:
@@ -218,7 +220,7 @@ Five crates sit outside that chain:
   the ABI. That edge is names-only — nothing is linked or called.
 - `rpi-extensions` is `rpi-plugin-sdk` plus `rpi-ai`/`rpi-agent`, since it hosts
   plugins that run tools.
-- `rpi-cli` depends on all nine of the others, which is how the `rpi` binary
+- `rpi-cli` depends on all ten of the others, which is how the `rpi` binary
 gets the TUI, the harness and the plugin loader at once.
 
 | Crate | What it is |
