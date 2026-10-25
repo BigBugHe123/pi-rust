@@ -474,6 +474,7 @@ fn test_tui_state() -> Arc<TuiState> {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -1755,6 +1756,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2822,6 +2824,7 @@ fn test_autocomplete_slash_suggestions_render() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2914,6 +2917,7 @@ fn test_select_list_swap_restores_editor() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -3009,6 +3013,7 @@ fn test_message_history_browse_restores_draft() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -3107,6 +3112,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -3191,6 +3197,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: max_visible,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -4398,4 +4405,94 @@ fn fullscreen_drag_paints_highlight_and_click_does_not() {
         "a plain click must not paint a highlight: {click_frame:?}"
     );
     assert!(click_text.is_none(), "a plain click must not select text");
+}
+
+// ==== Reviewer probes for PR #106 (carried verbatim; the Windows ones call
+// the real state/paste-run/editor methods in the key loop's NEW order). ====
+
+fn review_pr106_slash_state() -> Arc<TuiState> {
+    let state = test_tui_state();
+    state.autocomplete.set_provider(Arc::new(
+        SlashCommandAutocompleteProvider::with_default_commands(),
+    ));
+    state
+}
+
+#[test]
+fn review_pr106_explicitly_selecting_row_zero_must_accept_it() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    editor.set_text("/c");
+    editor.set_cursor(0, 2);
+    assert!(navigate_autocomplete(&state, &editor, 1));
+    assert!(navigate_autocomplete(&state, &editor, -1));
+    assert_eq!(*state.autocomplete_selection.lock().unwrap(), 0);
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::ApplyAndSubmit),
+        "Down then Up explicitly selected the first row; it is not a fresh ambiguous popup"
+    );
+}
+
+#[test]
+fn review_pr106_windows_queued_prefix_enter_must_submit_the_completed_command() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let submitted_for_callback = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        submitted_for_callback
+            .lock()
+            .unwrap()
+            .push(text.to_string());
+    }));
+    let now = std::time::Instant::now();
+    let mut run = WindowsPasteRun::default();
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, "/clea", true, now
+    ));
+    assert_eq!(run.text, "/clea");
+    assert!(editor.get_text().is_empty());
+    // Follow the production key-loop ordering at the NEW head: Windows Enter
+    // classification/flush FIRST, then the completion hook, then the editor.
+    assert!(!windows_enter_in_paste(&run, false, None, now));
+    run.flush(&editor, now);
+    match enter_completion_action(&state, &editor) {
+        Some(EnterCompletionAction::ApplyOnly) => {
+            if accept_enter_completion(&state, &editor) {
+                panic!("a slash command must not consume Enter as a path completion");
+            }
+        }
+        Some(EnterCompletionAction::ApplyAndSubmit) => {
+            accept_enter_completion(&state, &editor);
+        }
+        _ => {}
+    }
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        *submitted.lock().unwrap(),
+        vec!["/clear".to_string()],
+        "the completion hook must see the buffered prefix before the submitting Enter"
+    );
+}
+
+#[test]
+fn review_pr106_windows_pasted_interior_enter_must_not_rewrite_the_draft() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let now = std::time::Instant::now();
+    let mut run = WindowsPasteRun::default();
+    review_pr91_deliver_batch(&mut run, &editor, "/clea", false, now);
+    assert_eq!(editor.get_text(), "/clea");
+    // Production ordering at the NEW head: an interior pasted Enter is
+    // classified BEFORE the completion hook can look at the draft.
+    assert!(windows_enter_in_paste(&run, true, None, now));
+    run.feed('\n', now);
+    run.feed('X', now);
+    run.flush(&editor, now);
+    assert_eq!(
+        editor.get_text(),
+        "/clea\nX",
+        "an interior pasted Enter must be classified before completion can rewrite clipboard text"
+    );
 }

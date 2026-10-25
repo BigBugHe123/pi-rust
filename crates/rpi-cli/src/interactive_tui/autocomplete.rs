@@ -50,6 +50,44 @@ pub(super) fn set_editor_cursor_offset(editor: &Editor, text: &str, offset: usiz
     );
 }
 
+/// Retire the explicit-selection stamp when the popup is rebuilt for a
+/// different completed span (typing, backspace, another token) or torn down.
+/// Called with the key of the popup being rendered NOW (`None` when closing).
+fn stamp_selection_for(state: &Arc<TuiState>, key: Option<&str>) {
+    let mut stamp = state.autocomplete_selection_stamped_for.lock().unwrap();
+    match (key, stamp.as_ref()) {
+        // Same popup key → the user's navigation is still about this popup.
+        (Some(current), Some(previous)) if current == previous => {}
+        // New key or closing → the navigation intent does not carry over.
+        _ => *stamp = None,
+    }
+}
+
+/// Stable identity of a suggestion popup: what span it completes plus the
+/// candidate list it offers. A popup that completes the same span with the
+/// same candidates is "the same popup" however many times it re-renders.
+fn sugg_key(sugg: &AutocompleteSuggestions) -> String {
+    let items = sugg
+        .items
+        .iter()
+        .map(|item| item.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\u{1}");
+    format!("{}\u{2}{}\u{2}{}", sugg.start, sugg.end, items)
+}
+
+/// Whether the popup currently completing `sugg` is the one the user last
+/// navigated — the explicit-selection stamp matches its key.
+fn selection_is_explicit(state: &Arc<TuiState>, sugg: &AutocompleteSuggestions) -> bool {
+    let key = sugg_key(sugg);
+    state
+        .autocomplete_selection_stamped_for
+        .lock()
+        .unwrap()
+        .as_deref()
+        == Some(key.as_str())
+}
+
 /// Render (or clear) the autocomplete suggestion list into the container.
 pub(super) fn render_autocomplete(
     state: &Arc<TuiState>,
@@ -58,10 +96,12 @@ pub(super) fn render_autocomplete(
     state.autocomplete_container.clear();
     let Some(sugg) = suggestions else {
         *state.autocomplete_selection.lock().unwrap() = 0;
+        stamp_selection_for(state, None);
         return;
     };
     if sugg.items.is_empty() {
         *state.autocomplete_selection.lock().unwrap() = 0;
+        stamp_selection_for(state, None);
         return;
     }
     // Clamp the highlight to the full candidate list, then compute the visible
@@ -81,6 +121,12 @@ pub(super) fn render_autocomplete(
             .min(total - max_visible)
     };
     let window_end = (window_start + max_visible).min(total);
+    // The rebuilt popup completes this span now; a stamp for any other span
+    // belongs to a previous popup and must not survive the rebuild. The span
+    // is keyed by the suggestion's own [start, end) window so typing or
+    // backspacing within the token retires it, while a pure re-render (same
+    // span) keeps the user's navigation.
+    stamp_selection_for(state, Some(&sugg_key(&sugg)));
     // Build a compact list: the highlighted item marked with `→`, the rest `  `.
     // Cap the list so the dock doesn't swallow the transcript.
     let accent = state.theme_manager.get().colors.accent;
@@ -206,9 +252,11 @@ pub(super) fn enter_completion_action(
         return None;
     }
     let is_slash = text[start..].starts_with('/');
-    let highlighted = *state.autocomplete_selection.lock().unwrap();
-    let highlighted = highlighted.min(sugg.items.len().saturating_sub(1));
-    if sugg.items.len() == 1 || highlighted != 0 {
+    // Explicit selection: the user navigated THIS popup with ↑/↓. The stamp
+    // (set by navigation, retired when the popup changes) is what carries the
+    // intent — the row index alone cannot express "↓ then ↑ selected row 0".
+    let explicit_selection = selection_is_explicit(state, &sugg);
+    if sugg.items.len() == 1 || explicit_selection {
         Some(if is_slash {
             EnterCompletionAction::ApplyAndSubmit
         } else {
@@ -266,6 +314,9 @@ pub(super) fn navigate_autocomplete(
             *sel = (*sel + 1).min(total.saturating_sub(1));
         }
     }
+    // This popup has now been explicitly navigated: stamp it so a later Enter
+    // accepts the (possibly zeroth) highlighted row as a deliberate choice.
+    *state.autocomplete_selection_stamped_for.lock().unwrap() = Some(sugg_key(&sugg));
     render_autocomplete(state, Some(sugg));
     true
 }
