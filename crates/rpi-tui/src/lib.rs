@@ -45,6 +45,7 @@ pub mod scroll_view;
 pub mod search_bar;
 pub mod searchable_select;
 pub mod select_list;
+pub mod selection;
 pub mod settings_list;
 pub mod spacer;
 pub mod status_indicator;

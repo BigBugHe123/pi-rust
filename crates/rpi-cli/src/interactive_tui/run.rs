@@ -336,46 +336,6 @@ pub(super) fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) 
     }
 }
 
-/// Extract text from the chat container within the given screen coordinates.
-/// Returns None if the selection is invalid or empty.
-pub(super) fn extract_selected_text(
-    chat_container: &Arc<Container>,
-    start: (u16, u16),
-    end: (u16, u16),
-) -> Option<String> {
-    use rpi_tui::Component;
-
-    // Get the rendered lines from the chat container
-    let lines = chat_container.render(80); // Use a reasonable width
-    if lines.is_empty() {
-        return None;
-    }
-
-    // Normalize coordinates (ensure start is before end)
-    let (start_row, end_row) = if start.1 <= end.1 {
-        (start.1 as usize, end.1 as usize)
-    } else {
-        (end.1 as usize, start.1 as usize)
-    };
-
-    // Clamp to valid range
-    let start_row = start_row.min(lines.len().saturating_sub(1));
-    let end_row = end_row.min(lines.len().saturating_sub(1));
-
-    if start_row > end_row {
-        return None;
-    }
-
-    // Extract the selected lines
-    let selected_lines: Vec<String> = lines[start_row..=end_row].to_vec();
-
-    if selected_lines.is_empty() {
-        return None;
-    }
-
-    Some(selected_lines.join("\n"))
-}
-
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
 /// (`arboard`) on non-Android platforms; otherwise returns `false` so the
 /// caller degrades to a hint.

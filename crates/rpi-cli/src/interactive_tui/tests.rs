@@ -496,8 +496,6 @@ fn test_tui_state() -> Arc<TuiState> {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     })
 }
 
@@ -1779,8 +1777,6 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
 
     // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -2848,8 +2844,6 @@ fn test_autocomplete_slash_suggestions_render() {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
     {
         let mut combined = CombinedAutocompleteProvider::new();
@@ -2942,8 +2936,6 @@ fn test_select_list_swap_restores_editor() {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
     let editor_container = Arc::new(Container::new());
     let editor = Arc::new(Editor::simple());
@@ -3039,8 +3031,6 @@ fn test_message_history_browse_restores_draft() {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
     let editor = Arc::new(Editor::simple());
 
@@ -3139,8 +3129,6 @@ fn test_accept_top_suggestion_replaces_prefix() {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
     {
         let mut combined = CombinedAutocompleteProvider::new();
@@ -3225,8 +3213,6 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     })
 }
 
@@ -4350,4 +4336,65 @@ fn round7_pr91_concatenated_short_batches_corroborate_only_at_machine_speed() {
         ),
         "beyond machine speed the accumulated newline-less text is IME-shaped, not paste evidence"
     );
+}
+
+/// The fullscreen drag-selection extraction must use the real terminal
+/// geometry, not a hardcoded 80-column render.
+///
+/// Fail-on-old record: against `fcfc931` this probe panicked with
+/// `40-column selection leaked the 80-column layout's rows` -- the old
+/// `extract_selected_text` rendered the chat at `render(80)` and returned
+/// every row of the 80-column layout for a 40-column screen selection.
+/// The new selection pipeline (rpi-tui `selection`) slices the cached
+/// document at the live width, so the same drag returns only the wrapped
+/// rows the user saw.
+#[test]
+fn fullscreen_selection_extraction_uses_the_real_terminal_width() {
+    use crate::interactive_tui::selection_probe::{probe_extract_at_width, SelectionGeometry};
+    let geometry = SelectionGeometry {
+        width: 40,
+        rows: 12,
+    };
+    // Select the first two wrapped rows of a long message on a 40-column
+    // screen: must NOT leak rows that only exist in an 80-column layout.
+    let text = probe_extract_at_width(
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678",
+        "tail marker row",
+        geometry,
+    )
+    .expect("selection produced text");
+    assert!(
+        !text.contains("tail marker"),
+        "40-column selection leaked the 80-column layout's rows: {text:?}"
+    );
+}
+
+/// The reverse-video highlight must reach the terminal during the drag (the
+/// user sees what they are selecting), while a plain click must neither
+/// highlight nor leave any selection to copy.
+#[test]
+fn fullscreen_drag_paints_highlight_and_click_does_not() {
+    use crate::interactive_tui::selection_probe::{probe_click, probe_drag, SelectionGeometry};
+    let geometry = SelectionGeometry {
+        width: 40,
+        rows: 12,
+    };
+    let long_line =
+        "0123456789012345678901234567890123456789012345678901234567890123456789012345678";
+
+    // Drag: the Drag re-render writes the inverse-video span.
+    let (drag_frame, drag_text) = probe_drag(long_line, "tail marker row", geometry);
+    assert!(
+        drag_frame.contains("\x1b[7m"),
+        "drag must paint the reverse-video highlight: {drag_frame:?}"
+    );
+    assert!(drag_text.is_some(), "drag must produce extractable text");
+
+    // Click: no inverse-video ever written, no text selected.
+    let (click_frame, click_text) = probe_click(long_line, "tail marker row", geometry);
+    assert!(
+        !click_frame.contains("\x1b[7m"),
+        "a plain click must not paint a highlight: {click_frame:?}"
+    );
+    assert!(click_text.is_none(), "a plain click must not select text");
 }
