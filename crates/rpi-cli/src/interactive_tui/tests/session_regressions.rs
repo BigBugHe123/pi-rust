@@ -18,6 +18,13 @@ fn assert_session_locked(path: &str) {
     );
 }
 
+/// An empty authenticated catalog: these tests exercise session plumbing, not
+/// model resolution, so `restore_session_model` finds nothing to apply and
+/// leaves the lane untouched.
+fn empty_catalog() -> Arc<std::sync::RwLock<Vec<rpi_ai::Model>>> {
+    Arc::new(std::sync::RwLock::new(Vec::new()))
+}
+
 #[tokio::test]
 async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_picker() {
     let temporary = tempfile::tempdir().unwrap();
@@ -55,7 +62,8 @@ async fn tui_fork_locks_the_copy_and_keeps_the_selected_root_for_switch_and_pick
             &cwd,
             &state.chat_container,
             &state,
-            &context
+            &context,
+            &empty_catalog()
         )
         .await
     );
@@ -130,6 +138,7 @@ async fn tui_import_preserves_identity_history_and_source_across_cwds() {
         &state.chat_container,
         &state,
         &context,
+        &empty_catalog(),
     )
     .await;
     assert_eq!(harness.session().storage().metadata().id, expected);
@@ -192,6 +201,7 @@ async fn invalid_import_leaves_the_active_session_and_repository_untouched() {
         &state.chat_container,
         &state,
         &context,
+        &empty_catalog(),
     )
     .await;
     assert_eq!(harness.session().storage().metadata().id, initial);
@@ -268,7 +278,8 @@ async fn session_switch_banner_reports_real_capabilities() {
             cwd,
             &state.chat_container,
             &state,
-            &context
+            &context,
+            &empty_catalog()
         )
         .await
     );
@@ -513,6 +524,660 @@ async fn review_pr98_new_must_not_switch_under_an_unscoped_user_bash_run() {
             || cancellation.is_cancelled()
             || harness.session().storage().metadata().id == previous_id,
         "/new switched while the previous session's unscoped !command remained active"
+    );
+}
+
+// --- Session C (P4 + P5): model replay + footer usage restoration ----------
+
+/// An assistant turn with the given provider/model and usage, shaped like the
+/// entries a real session records (stop `Stop`, usage filled in).
+fn recorded_assistant_turn(
+    provider: &str,
+    model: &str,
+    usage: rpi_ai::types::Usage,
+) -> AgentMessage {
+    let mut a = rpi_ai::AssistantMessage::empty(
+        rpi_ai::Api::Faux,
+        provider,
+        model,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or_default(),
+    );
+    a.stop_reason = rpi_ai::StopReason::Stop;
+    a.usage = usage;
+    AgentMessage::Assistant(Box::new(a))
+}
+
+/// Switching back to a session must put the lane on THAT session's model: the
+/// session log (its `ModelChange`/assistant entries) is the authority, not
+/// whatever `/model` last picked in the session the user is leaving.
+#[tokio::test]
+async fn switching_back_to_a_session_restores_its_model() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let first = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let first_id = first.storage().metadata().id.clone();
+    // The first session's assistant turn names the model it ran on.
+    first
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "second-model",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let second_id = second.storage().metadata().id.clone();
+    assert_ne!(first_id, second_id);
+
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(second).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    // The user's last `/model` pick (in the session being left) was `first`.
+    lane.set_model(rpi_ai::Model::new(
+        "first-model",
+        "first",
+        rpi_ai::Api::Faux,
+        "faux",
+        "http://x",
+    ))
+    .await
+    .unwrap();
+
+    let state = state_with_root(&root);
+    let context = rpi_extensions::ToolCallContext::new(cwd.to_string_lossy());
+    // The authenticated catalog carries the session's recorded model.
+    let catalog: Arc<std::sync::RwLock<Vec<rpi_ai::Model>>> =
+        Arc::new(std::sync::RwLock::new(vec![
+            rpi_ai::Model::new(
+                "first-model",
+                "first",
+                rpi_ai::Api::Faux,
+                "faux",
+                "http://x",
+            ),
+            rpi_ai::Model::new(
+                "second-model",
+                "second",
+                rpi_ai::Api::Faux,
+                "faux",
+                "http://x",
+            ),
+        ]));
+
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &first_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &context,
+            &catalog
+        )
+        .await
+    );
+
+    let model = lane.get_model().await.unwrap();
+    assert_eq!(
+        model.id, "second-model",
+        "the lane must run the resumed session's own model"
+    );
+    let footer = strip_ansi(&state.footer.render(120).join("\n"));
+    assert!(
+        footer.contains("(faux) second-model"),
+        "the footer must show the resumed session's model: {footer}"
+    );
+}
+
+/// Switching back to a session must restore THAT session's usage totals,
+/// cache-hit rate and context badge — neither blank nor the previous
+/// session's numbers.
+#[tokio::test]
+async fn switching_back_to_a_session_restores_its_footer_usage() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let first = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let first_id = first.storage().metadata().id.clone();
+    // Two recorded turns: 12k in / 3.4k out with heavy cache reads, then a
+    // turn establishing the final context size.
+    first
+        .append_message(user_message_with_images("history prompt", vec![]))
+        .await
+        .unwrap();
+    first
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "m",
+            rpi_ai::types::Usage {
+                input: 12_000,
+                output: 3_400,
+                cache_read: 40_000,
+                cache_write: 1_200,
+                ..rpi_ai::types::Usage::zero()
+            },
+        ))
+        .await
+        .unwrap();
+    first
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "m",
+            rpi_ai::types::Usage {
+                input: 6_000,
+                output: 1_000,
+                cache_read: 20_000,
+                cache_write: 0,
+                total_tokens: 126_400,
+                ..rpi_ai::types::Usage::zero()
+            },
+        ))
+        .await
+        .unwrap();
+    let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let second_id = second.storage().metadata().id.clone();
+    assert_ne!(first_id, second_id);
+
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(second).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    // The session being left had accumulated DIFFERENT live counters.
+    let state = state_with_root(&root);
+    state.footer.set_context_window(200_000);
+    state.footer.add_usage(111_111, 22_222, 0, 0, 9.999);
+
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &first_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &empty_catalog()
+        )
+        .await
+    );
+
+    let stats = strip_ansi(&state.footer.render(120).join("\n"));
+    // The first session's restored totals (12k + 6k in, 3.4k + 1k out), not
+    // the numbers the previous session left behind…
+    assert!(stats.contains("↑18k"), "input totals restored: {stats}");
+    assert!(stats.contains("↓4.4k"), "output totals restored: {stats}");
+    assert!(
+        !stats.contains("↑111k"),
+        "stale totals must be gone: {stats}"
+    );
+    // …and its latest turn's cache-hit share (20k read / 26k billed), under
+    // the same latest-turn semantics as the live `MessageEnd` handler.
+    assert!(stats.contains("76.9%"), "cache hit rate restored: {stats}");
+    // The last recorded context size, against the live window.
+    assert!(stats.contains("63.2%"), "context badge restored: {stats}");
+}
+
+/// The replay is best-effort by contract: a session whose recorded model is no
+/// longer in the authenticated catalog must still open, leaving the current
+/// lane model untouched instead of failing the switch.
+#[tokio::test]
+async fn unknown_session_model_leaves_the_current_model_in_place() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    std::fs::create_dir_all(&root).unwrap();
+    let first = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let first_id = first.storage().metadata().id.clone();
+    // The session was last driven by a model that has since disappeared from
+    // the catalog.
+    first
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "retired-model",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    let second = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let second_id = second.storage().metadata().id.clone();
+    assert_ne!(first_id, second_id);
+
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(second).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let before = lane.get_model().await.unwrap();
+
+    let state = state_with_root(&root);
+    // Catalog carries only an unrelated model.
+    let catalog: Arc<std::sync::RwLock<Vec<rpi_ai::Model>>> =
+        Arc::new(std::sync::RwLock::new(vec![rpi_ai::Model::new(
+            "first-model",
+            "first",
+            rpi_ai::Api::Faux,
+            "faux",
+            "http://x",
+        )]));
+
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &first_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog
+        )
+        .await,
+        "switching must succeed even when the recorded model is unavailable"
+    );
+    let after = lane.get_model().await.unwrap();
+    assert_eq!(after.id, before.id, "the lane model must stay untouched");
+    assert_eq!(
+        harness.session().storage().metadata().id,
+        first_id,
+        "the switch itself must have completed"
+    );
+}
+
+fn pr104_review_model(id: &str) -> rpi_ai::Model {
+    rpi_ai::Model::new(id, id, rpi_ai::Api::Faux, "faux", "http://x")
+}
+
+#[tokio::test]
+async fn review_pr104_replay_preserves_the_live_cache_hit_rate() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    let messages = [
+        recorded_assistant_turn(
+            "faux",
+            "m",
+            rpi_ai::types::Usage {
+                input: 100,
+                output: 1,
+                cache_read: 900,
+                ..rpi_ai::types::Usage::zero()
+            },
+        ),
+        recorded_assistant_turn(
+            "faux",
+            "m",
+            rpi_ai::types::Usage {
+                input: 900,
+                output: 1,
+                cache_read: 100,
+                ..rpi_ai::types::Usage::zero()
+            },
+        ),
+    ];
+    for message in &messages {
+        source.append_message(message.clone()).await.unwrap();
+    }
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let tui = Arc::new(TuiAltScreen::new(
+        Box::new(ProcessTerminal::new()),
+        true,
+        None,
+    ));
+    // Run the actual live MessageEnd handler; the latest turn is a 10% hit.
+    for message in messages {
+        handle_agent_event(
+            AgentEvent::MessageEnd { message },
+            &tui,
+            &state,
+            &state.chat_container,
+            &lane,
+        )
+        .await;
+    }
+    let before = strip_ansi(&state.footer.render(120).join("\n"));
+    assert!(before.contains("CH10.0%"), "live hit rate: {before}");
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &empty_catalog(),
+        )
+        .await
+    );
+    let after = strip_ansi(&state.footer.render(120).join("\n"));
+    assert!(
+        after.contains("CH10.0%"),
+        "restoring the same two turns must preserve the live rate, not average all turns: {after}"
+    );
+}
+
+#[tokio::test]
+async fn review_pr104_restore_model_must_follow_the_selected_branch() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    let selected = source
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "selected",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    source
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "abandoned",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    // This is the move made by /tree before leaving/reopening the session.
+    source.move_lane("main", Some(&selected)).await.unwrap();
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.set_model(pr104_review_model("selected"))
+        .await
+        .unwrap();
+    let state = state_with_root(&root);
+    let catalog = Arc::new(std::sync::RwLock::new(vec![
+        pr104_review_model("selected"),
+        pr104_review_model("abandoned"),
+    ]));
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog,
+        )
+        .await
+    );
+    assert_eq!(
+        lane.get_tip_id().await.unwrap().as_deref(),
+        Some(selected.as_str())
+    );
+    assert_eq!(
+        lane.get_model().await.unwrap().id,
+        "selected",
+        "a later entry outside the selected branch must not select the model"
+    );
+}
+
+#[tokio::test]
+async fn review_pr104_restore_model_must_ignore_a_child_lane() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    let parent = source
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "parent-model",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    source
+        .create_lane("child-review", Some(&parent))
+        .await
+        .unwrap();
+    source
+        .view("child-review")
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "child-model",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    lane.set_model(pr104_review_model("parent-model"))
+        .await
+        .unwrap();
+    let state = state_with_root(&root);
+    let catalog = Arc::new(std::sync::RwLock::new(vec![
+        pr104_review_model("parent-model"),
+        pr104_review_model("child-model"),
+    ]));
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog,
+        )
+        .await
+    );
+    assert_eq!(
+        lane.get_model().await.unwrap().id,
+        "parent-model",
+        "a child lane's later assistant turn must not replace the parent's model"
+    );
+}
+
+#[tokio::test]
+async fn review_pr104_fork_preserves_a_model_pick_before_the_next_turn() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    source
+        .append_message(recorded_assistant_turn(
+            "faux",
+            "old-model",
+            rpi_ai::types::Usage::zero(),
+        ))
+        .await
+        .unwrap();
+    let previous_id = source.storage().metadata().id.clone();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(source).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    // The real /model path does not persist settings or a ModelChange entry.
+    apply_model_selection(&lane, &state, pr104_review_model("new-model"), false)
+        .await
+        .unwrap();
+    fork_session(
+        &harness,
+        cwd,
+        &state.chat_container,
+        &state,
+        &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+    )
+    .await;
+    assert_ne!(harness.session().storage().metadata().id, previous_id);
+    assert_eq!(
+        lane.get_model().await.unwrap().id,
+        "new-model",
+        "/fork must not undo a successful /model selection made before the next assistant turn"
+    );
+}
+
+fn review_084_context_turn(model: &str, tokens: i64) -> AgentMessage {
+    recorded_assistant_turn(
+        "faux",
+        model,
+        rpi_ai::types::Usage {
+            input: tokens,
+            output: 1,
+            total_tokens: tokens,
+            ..rpi_ai::types::Usage::zero()
+        },
+    )
+}
+
+#[tokio::test]
+async fn rereview_pr104_context_must_not_come_from_a_child_lane() {
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    let main_tip = source
+        .append_message(review_084_context_turn("parent-model", 50_000))
+        .await
+        .unwrap();
+    source
+        .create_lane("child-context", Some(&main_tip))
+        .await
+        .unwrap();
+    source
+        .view("child-context")
+        .append_message(review_084_context_turn("child-model", 190_000))
+        .await
+        .unwrap();
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let mut parent_model = pr104_review_model("parent-model");
+    parent_model.context_window = 200_000;
+    let catalog = Arc::new(std::sync::RwLock::new(vec![parent_model]));
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog,
+        )
+        .await
+    );
+    // The previous model fix works, but usage replay still queries all lanes.
+    assert_eq!(lane.get_model().await.unwrap().id, "parent-model");
+    let footer = strip_ansi(&state.footer.render(160).join("\n"));
+    assert!(
+        footer.contains("25.0%/200k"),
+        "the main context is 50k/200k, not the child's 190k/200k: {footer}"
+    );
+}
+
+#[tokio::test]
+async fn rereview_pr104_compaction_must_invalidate_pre_compaction_context() {
+    use rpi_harness::session::types::{ProvisionedEntry, ProvisionedKind};
+    let temporary = tempfile::tempdir().unwrap();
+    let cwd = temporary.path();
+    let root = cwd.join("sessions");
+    let source = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let source_id = source.storage().metadata().id.clone();
+    source
+        .append_message(review_084_context_turn("model", 100_000))
+        .await
+        .unwrap();
+    // Seed the durable state after a successful /compact, without a model call.
+    // run_compact() explicitly clears the live context badge for this state.
+    source
+        .append_entry(
+            ProvisionedEntry {
+                id: "review-context-compaction".into(),
+                kind: ProvisionedKind::Compaction {
+                    summary: "Small replacement summary".into(),
+                    retained_tail: vec![],
+                    tokens_before: 100_000,
+                    details: None,
+                    usage: None,
+                },
+            },
+            "main",
+        )
+        .await
+        .unwrap();
+    let target = crate::session::create_jsonl_session(&root, &cwd.to_string_lossy())
+        .await
+        .unwrap();
+    let harness = AgentHarness::create(Default::default()).await.unwrap();
+    harness.set_session(target).await.unwrap();
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let state = state_with_root(&root);
+    let mut model = pr104_review_model("model");
+    model.context_window = 200_000;
+    let catalog = Arc::new(std::sync::RwLock::new(vec![model]));
+    assert!(
+        switch_to_session(
+            &harness,
+            &lane,
+            &source_id,
+            cwd,
+            &state.chat_container,
+            &state,
+            &rpi_extensions::ToolCallContext::new(cwd.to_string_lossy()),
+            &catalog,
+        )
+        .await
+    );
+    let footer = strip_ansi(&state.footer.render(160).join("\n"));
+    assert!(
+        footer.split_whitespace().any(|part| part == "0.0%/200k"),
+        "after compaction there is no new context report; old 50% must not reappear: {footer}"
     );
 }
 
