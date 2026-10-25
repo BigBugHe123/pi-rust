@@ -340,7 +340,7 @@ impl JsonlSessionStorage {
         op.await
     }
 
-    async fn append_encoded_bytes(&self, lines: &[u8]) -> SessionResult<()> {
+    async fn append_encoded_bytes(&self, lines: Vec<u8>) -> SessionResult<()> {
         if lines.is_empty() {
             return Ok(());
         }
@@ -354,7 +354,7 @@ impl JsonlSessionStorage {
         if let Some(writer) = append.as_mut() {
             // The tail lock still orders every append, and the writer flushes
             // before acknowledgement. A failed handle is discarded for retry.
-            let result = writer.append(lines).await;
+            let result = writer.append(&lines).await;
             if result.is_err() {
                 *append = None;
             }
@@ -366,11 +366,7 @@ impl JsonlSessionStorage {
         drop(append);
         file_result(
             self.fs
-                .append_file(
-                    &self.metadata.path,
-                    FileContent::Bytes(lines.to_vec()),
-                    None,
-                )
+                .append_file(&self.metadata.path, FileContent::Bytes(lines), None)
                 .await,
             &format!("Failed to append session {}", self.metadata.path),
         )
@@ -411,7 +407,7 @@ impl JsonlSessionStorage {
         for mutation in &mutations {
             encode_mutation_into(mutation, &mut encoded_lines);
         }
-        self.append_encoded_bytes(&encoded_lines).await?;
+        self.append_encoded_bytes(encoded_lines).await?;
         let mut state = self.state.lock().await;
         let mut stamped_records = Vec::with_capacity(mutations.len());
         for mutation in mutations {
@@ -455,7 +451,7 @@ impl JsonlSessionStorage {
         encode_mutation_into(&mutation, &mut encoded);
         drop(state);
 
-        self.append_encoded_bytes(&encoded).await?;
+        self.append_encoded_bytes(encoded).await?;
         let mut state = self.state.lock().await;
         match state.apply_mutation(mutation)? {
             ApplyOutcome::Record(stamped) => Ok(stamped),
@@ -519,7 +515,7 @@ impl JsonlSessionStorage {
         }
         drop(state);
 
-        self.append_encoded_bytes(&encoded_lines).await?;
+        self.append_encoded_bytes(encoded_lines).await?;
         let mut state = self.state.lock().await;
         *state = candidate;
         Ok(stamped_records)
@@ -529,7 +525,7 @@ impl JsonlSessionStorage {
     async fn append_mutation_line(&self, mutation: &SessionMutation) -> SessionResult<()> {
         let mut encoded = Vec::with_capacity(256);
         encode_mutation_into(mutation, &mut encoded);
-        self.append_encoded_bytes(&encoded).await
+        self.append_encoded_bytes(encoded).await
     }
 }
 
@@ -687,7 +683,7 @@ impl SessionStorage for JsonlSessionStorage {
         encode_mutation_into(&record_mutation, &mut encoded);
         encode_mutation_into(&entry_mutation, &mut encoded);
         drop(state);
-        self.append_encoded_bytes(&encoded).await?;
+        self.append_encoded_bytes(encoded).await?;
         let mut state = self.state.lock().await;
         let committed_record = match state.apply_mutation(record_mutation)? {
             ApplyOutcome::Record(stamped) => stamped,
@@ -751,7 +747,7 @@ impl SessionStorage for JsonlSessionStorage {
         encode_mutation_into(&after_mutation, &mut encoded);
         drop(state);
 
-        self.append_encoded_bytes(&encoded).await?;
+        self.append_encoded_bytes(encoded).await?;
         let mut state = self.state.lock().await;
         let committed_before = match state.apply_mutation(before_mutation)? {
             ApplyOutcome::Record(stamped) => stamped,
