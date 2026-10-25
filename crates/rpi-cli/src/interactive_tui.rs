@@ -1302,6 +1302,8 @@ pub async fn interactive_tui(
     let editor_container = Arc::new(Container::new());
     editor_container.add_child(editor.clone());
 
+    let footer_panels: Arc<dyn Component> =
+        Arc::new(panels::FooterPanels(reload_context.ext_status.clone()));
     let dock = Arc::new(VStack::from_children(vec![
         StackChild::Entry(StackEntry::new(Arc::new(panels::RegularPanels {
             mailbox: reload_context.ext_status.clone(),
@@ -1322,9 +1324,7 @@ pub async fn interactive_tui(
         ),
         StackChild::Entry(StackEntry::new(state.search_bar.clone())),
         StackChild::Entry(StackEntry::new(footer.clone())),
-        StackChild::Entry(StackEntry::new(Arc::new(panels::FooterPanels(
-            reload_context.ext_status.clone(),
-        )))),
+        StackChild::Entry(StackEntry::new(footer_panels.clone())),
     ]));
 
     let transcript_stack = Arc::new(rpi_tui::HStack::from_entries(vec![StackEntry::new(
@@ -1350,6 +1350,8 @@ pub async fn interactive_tui(
         editor.clone(),
         matches!(args.tui_mode, crate::args::TuiMode::Regular),
         show_terminal_progress,
+        footer.clone(),
+        footer_panels,
     )));
     tui.set_layout_root(Some(side_ui.lock().unwrap().root()));
     tui.set_focus(Some(editor.clone()));

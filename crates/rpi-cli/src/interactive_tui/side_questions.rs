@@ -52,6 +52,8 @@ impl View {
         tui: &Arc<TuiAltScreen>,
         keys: Arc<rpi_tui::keybindings::Keybindings>,
         show_terminal_progress: bool,
+        footer: Arc<FooterComponent>,
+        footer_panels: Arc<dyn Component>,
     ) -> Arc<Self> {
         let header = Arc::new(Text::new("BTW", 0, 0));
         let queued = Arc::new(Text::new("", 0, 0));
@@ -86,6 +88,8 @@ impl View {
             .shrink(0)
             .max_size(1),
             StackEntry::new(editor.clone()).min_size(3).max_size(8),
+            StackEntry::new(footer.clone()),
+            StackEntry::new(footer_panels.clone()),
         ]));
         let view = Arc::new(Self {
             owner,
@@ -294,6 +298,8 @@ pub(super) struct SideQuestionUi {
     suspended: bool,
     regular: bool,
     show_terminal_progress: bool,
+    footer: Arc<FooterComponent>,
+    footer_panels: Arc<dyn Component>,
     revision: Option<u64>,
     session_id: String,
     focus_revision: u64,
@@ -305,6 +311,8 @@ impl SideQuestionUi {
         editor: Arc<Editor>,
         regular: bool,
         show_terminal_progress: bool,
+        footer: Arc<FooterComponent>,
+        footer_panels: Arc<dyn Component>,
     ) -> Self {
         let workspace = Arc::new(HStack::from_entries(vec![StackEntry::new(main.clone())
             .basis(0)
@@ -320,6 +328,8 @@ impl SideQuestionUi {
             suspended: false,
             regular,
             show_terminal_progress,
+            footer,
+            footer_panels,
             revision: None,
             session_id: String::new(),
             focus_revision: 0,
@@ -428,6 +438,8 @@ impl SideQuestionUi {
                         tui,
                         keys.clone(),
                         self.show_terminal_progress,
+                        self.footer.clone(),
+                        self.footer_panels.clone(),
                     )
                 });
                 view.update(s);

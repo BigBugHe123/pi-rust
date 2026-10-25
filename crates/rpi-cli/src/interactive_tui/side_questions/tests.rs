@@ -92,7 +92,14 @@ impl Fixture {
             StackEntry::new(main_scroll.clone()).basis(0).grow(1),
             StackEntry::new(editor.clone()).shrink(0),
         ]));
-        let ui = SideQuestionUi::new(main, editor, false, true);
+        let ui = SideQuestionUi::new(
+            main,
+            editor,
+            false,
+            true,
+            Arc::new(FooterComponent::new()),
+            Arc::new(Text::new("", 0, 0)),
+        );
         let mut fixture = Self {
             ui,
             tui,
@@ -130,6 +137,55 @@ impl Fixture {
 fn snapshot(text: &str) -> Value {
     json!({"status":"running","turns":[{"requestId":"test","question":"问题 **question**","text":text,"status":"running"}],"queued":[]})
 }
+#[tokio::test]
+async fn side_view_includes_the_shared_footer() {
+    let fixture = Fixture::new(false).await;
+    let view = fixture.ui.view().unwrap();
+    let rendered = strip_ansi(&view.root.render(60).join("\n"));
+    assert!(
+        rendered.contains("claude-sonnet-5"),
+        "side footer: {rendered}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn submitted_question_and_answer_reach_the_side_view_after_sync() {
+    let mut fixture = Fixture::new(false).await;
+    let view = fixture.ui.view().unwrap();
+    view.editor.set_text("visible side question");
+    view.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while view.submitting.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let views = fixture.host.side_question_views();
+            if views
+                .first()
+                .is_some_and(|snapshot| snapshot["status"] == "done")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert!(fixture.sync(true));
+    let rendered = fixture.frame();
+    assert!(
+        rendered.contains("visible side question"),
+        "side question: {rendered}"
+    );
+    assert!(rendered.contains("answer"), "side answer: {rendered}");
+}
+
 #[tokio::test]
 async fn native_markdown_full_answer_is_scrollable_without_jumping_on_stream_updates() {
     let fixture = Fixture::new(false).await;
@@ -338,7 +394,14 @@ async fn regular_mode_uses_a_height_bounded_full_screen_and_restores_main_draft(
     let mut f = Fixture::new(false).await;
     let main = f.ui.main.clone();
     let editor = f.ui.main_editor.clone();
-    f.ui = SideQuestionUi::new(main, editor, true, true);
+    f.ui = SideQuestionUi::new(
+        main,
+        editor,
+        true,
+        true,
+        Arc::new(FooterComponent::new()),
+        Arc::new(Text::new("", 0, 0)),
+    );
     f.sync(true);
     let view = f.ui.view().unwrap();
     view.update(&snapshot(&format!(
