@@ -1349,6 +1349,7 @@ pub async fn interactive_tui(
         Arc::new(root),
         editor.clone(),
         matches!(args.tui_mode, crate::args::TuiMode::Regular),
+        show_terminal_progress,
     )));
     tui.set_layout_root(Some(side_ui.lock().unwrap().root()));
     tui.set_focus(Some(editor.clone()));

@@ -41,6 +41,7 @@ struct View {
     host: Arc<dyn RuntimeActionHost>,
     runtime: tokio::runtime::Handle,
     tui: Weak<TuiAltScreen>,
+    show_terminal_progress: bool,
 }
 impl View {
     fn new(
@@ -50,6 +51,7 @@ impl View {
         runtime: tokio::runtime::Handle,
         tui: &Arc<TuiAltScreen>,
         keys: Arc<rpi_tui::keybindings::Keybindings>,
+        show_terminal_progress: bool,
     ) -> Arc<Self> {
         let header = Arc::new(Text::new("BTW", 0, 0));
         let queued = Arc::new(Text::new("", 0, 0));
@@ -100,6 +102,7 @@ impl View {
             host,
             runtime,
             tui: Arc::downgrade(tui),
+            show_terminal_progress,
         });
         let weak = Arc::downgrade(&view);
         view.editor.on_submit(Arc::new(move |_| {
@@ -173,7 +176,11 @@ impl View {
                 user: Arc::new(UserMessageComponent::new(safe_text(
                     turn["question"].as_str().unwrap_or(""),
                 ))),
-                assistant: Arc::new(AssistantMessageComponent::default()),
+                assistant: {
+                    let assistant = Arc::new(AssistantMessageComponent::default());
+                    assistant.set_trailing_spacing(1);
+                    assistant
+                },
                 error: Arc::new(Text::new("", 1, 0)),
                 text: String::new(),
             });
@@ -210,6 +217,18 @@ impl View {
             format!("Queued ({}): {}", questions.len(), queued.join(" · "))
         });
         let status = snapshot["status"].as_str().unwrap_or("idle");
+        let running = status == "running";
+        if self.show_terminal_progress && running {
+            if self.editor.working().is_none() {
+                self.editor.set_working(Some(WorkingState {
+                    frame: 0,
+                    started_at: std::time::Instant::now(),
+                    message: "Working…".to_string(),
+                }));
+            }
+        } else if self.editor.working().is_some() {
+            self.editor.set_working(None);
+        }
         let history = if snapshot["historyTruncated"] == true {
             " · recent history only"
         } else {
@@ -274,13 +293,19 @@ pub(super) struct SideQuestionUi {
     focused: bool,
     suspended: bool,
     regular: bool,
+    show_terminal_progress: bool,
     revision: Option<u64>,
     session_id: String,
     focus_revision: u64,
     geometry: Option<(usize, bool, Option<String>)>,
 }
 impl SideQuestionUi {
-    pub(super) fn new(main: Arc<dyn Component>, editor: Arc<Editor>, regular: bool) -> Self {
+    pub(super) fn new(
+        main: Arc<dyn Component>,
+        editor: Arc<Editor>,
+        regular: bool,
+        show_terminal_progress: bool,
+    ) -> Self {
         let workspace = Arc::new(HStack::from_entries(vec![StackEntry::new(main.clone())
             .basis(0)
             .grow(1)
@@ -294,6 +319,7 @@ impl SideQuestionUi {
             focused: false,
             suspended: false,
             regular,
+            show_terminal_progress,
             revision: None,
             session_id: String::new(),
             focus_revision: 0,
@@ -401,6 +427,7 @@ impl SideQuestionUi {
                         runtime.clone(),
                         tui,
                         keys.clone(),
+                        self.show_terminal_progress,
                     )
                 });
                 view.update(s);
@@ -482,7 +509,11 @@ impl SideQuestionUi {
             self.geometry = Some(geometry);
             changed = true;
         }
-        changed
+        let side_animating = !suspended
+            && self
+                .view()
+                .is_some_and(|view| view.editor.working().is_some());
+        changed || side_animating
     }
     pub(super) fn key(&mut self, key: KeyEvent, tui: &Arc<TuiAltScreen>) -> bool {
         if !self.focused() {
