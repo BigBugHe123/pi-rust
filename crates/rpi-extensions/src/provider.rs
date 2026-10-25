@@ -351,7 +351,7 @@ fn run_provider_request_inner(
     }
 
     // Read the plugin-owned JSON (borrow `out` for the parse) then reclaim it.
-    let response_text = out.to_string_lossy();
+    let response_text = out.as_str_lossy();
 
     // Parse the response as an AssistantMessage. A plugin that returns a partial
     // or malformed message surfaces a parse error (not a crash) — the host
@@ -446,8 +446,9 @@ fn options_json(opts: &SimpleStreamOptions) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// Run a plugin's [`ProviderStreamRequestFn`](rpi_plugin_sdk::ProviderStreamRequestFn)
-/// on `spawn_blocking` while forwarding every emitted chunk to `prod` **as it
-/// arrives**, then return the plugin's terminal message.
+/// on `spawn_blocking` while forwarding available deltas to `prod` without a
+/// batch-fill delay, then return the plugin's terminal message. Adjacent pure
+/// text/thinking deltas already in the queue may be combined before mapping.
 ///
 /// The forwarding is the whole point: the request fn is synchronous, so the
 /// callback is the only moment the host learns about a delta. It runs on the
@@ -536,6 +537,8 @@ async fn drive_streaming_plugin_provider(
     });
 
     // One async task maps and forwards chunks; pressure propagates to emit.
+    // The queue combines already-buffered pure text/thinking deltas before the
+    // mapper creates a full immutable snapshot. It never waits to fill a batch.
     let mut mapper = StreamMapper::new(
         model.api.clone(),
         record.provider_id.clone(),
@@ -784,7 +787,7 @@ extern "C" fn stream_emit_trampoline(event_json: StbString, user_data: *mut c_vo
         // SAFETY: the plugin transfers a live, plugin-owned allocation exactly
         // once; `plugin_free_string` is that plugin's deallocator.
         let owned = unsafe { OwnedString::from_raw(event_json, Some(bridge.plugin_free_string)) };
-        let text = owned.to_string_lossy();
+        let text = owned.as_str_lossy();
         let bytes = text.len();
         let parsed = serde_json::from_str::<serde_json::Value>(&text);
         drop(text);
@@ -901,7 +904,7 @@ fn run_streaming_provider_request(
                 record.provider_id
             ));
         }
-        let response_text = out.to_string_lossy();
+        let response_text = out.as_str_lossy();
         serde_json::from_str::<AssistantMessage>(&response_text).map_err(|err| {
             format!(
                 "plugin provider {} returned unparseable response: {err}",
@@ -997,7 +1000,9 @@ fn request_envelope_json(model: &Model, ctx: &Context, opts: &SimpleStreamOption
 /// The mapper owns the growing `AssistantMessage` the deltas are folded into, so
 /// every `*_delta` event can carry a `partial` snapshot without the plugin having
 /// to send one — the same shape the built-in providers produce (an
-/// `Arc<AssistantMessage>` per event, cloned once per delta).
+/// `Arc<AssistantMessage>` per event). The input queue may combine consecutive
+/// pure append deltas so the mapper clones once per published batch instead of
+/// once per tiny plugin callback. Supplied snapshots are always kept separate.
 struct StreamMapper {
     output: AssistantMessage,
     /// Whether the stream has been opened by a `Start` event. The host opens it
@@ -1129,7 +1134,7 @@ impl StreamMapper {
             }
             "text_delta" => {
                 let index = self.content_index(&chunk);
-                let delta = chunk_string(&chunk, "delta");
+                let delta = take_chunk_string(&mut chunk, "delta");
                 if !self.apply_partial(partial) {
                     let block = self.ensure_text_block(index);
                     block.text.push_str(&delta);
@@ -1165,7 +1170,7 @@ impl StreamMapper {
             }
             "thinking_delta" => {
                 let index = self.content_index(&chunk);
-                let delta = chunk_string(&chunk, "delta");
+                let delta = take_chunk_string(&mut chunk, "delta");
                 if !self.apply_partial(partial) {
                     let block = self.ensure_thinking_block(index);
                     block.thinking.push_str(&delta);
@@ -1218,7 +1223,7 @@ impl StreamMapper {
             }
             "toolcall_delta" => {
                 let index = self.content_index(&chunk);
-                let delta = chunk_string(&chunk, "delta");
+                let delta = take_chunk_string(&mut chunk, "delta");
                 let accumulated = self.tool_json.entry(index).or_default();
                 accumulated.push_str(&delta);
                 // Re-parse on every delta so the partial message renders live
@@ -1381,6 +1386,17 @@ impl StreamMapper {
 }
 
 /// Read a string field from a chunk, defaulting to empty.
+fn take_chunk_string(chunk: &mut serde_json::Value, field: &str) -> String {
+    match chunk
+        .as_object_mut()
+        .and_then(|object| object.remove(field))
+    {
+        Some(serde_json::Value::String(text)) => text,
+        _ => String::new(),
+    }
+}
+
+/// Copy a string field that must remain in the chunk, defaulting to empty.
 fn chunk_string(chunk: &serde_json::Value, field: &str) -> String {
     chunk
         .get(field)

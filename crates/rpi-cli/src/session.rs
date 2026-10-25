@@ -2883,7 +2883,7 @@ pub(crate) fn ephemeral_session() -> Session {
         Arc::new(SystemClock),
         Arc::new(DefaultIdGenerator::new()),
     ));
-    Session::new(storage, None)
+    Session::new(storage, None).with_volatile_progress()
 }
 
 /// Create a fresh JSONL session file under `dir` and wrap it in a `Session`.

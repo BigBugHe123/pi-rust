@@ -19,11 +19,12 @@ categories = ["api-bindings", "development-tools::ffi"]
 # the `json` feature (default on). A plugin that wants to avoid the dep can
 # disable default features and do its own (de)serialization.
 serde_json = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+ciborium = { workspace = true, optional = true }
 
 # Provider authoring helpers are opt-in; the ABI core stays independent of rpi-ai.
 rpi-ai = { workspace = true, optional = true, features = ["providers"] }
 tokio = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
@@ -39,6 +40,9 @@ rustdoc-args = ["--cfg", "docsrs"]
 [features]
 default = ["json"]
 json = ["dep:serde_json"]
+# Compact, length-bounded binary payloads for high-frequency extension data.
+# This is additive: JSON remains the default wire format and fallback.
+binary = ["json", "dep:serde", "dep:ciborium"]
 provider = ["json", "dep:rpi-ai", "dep:tokio", "dep:serde", "dep:reqwest"]
 process = ["dep:windows-sys", "dep:libc"]
 stdio = ["dep:windows-sys", "dep:libc"]
