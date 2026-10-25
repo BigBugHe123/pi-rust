@@ -10,6 +10,15 @@
 
 use std::fmt;
 
+#[cfg(feature = "frame-sidecar-zlib")]
+use std::io::{Read, Write};
+
+#[cfg(feature = "frame-sidecar-zlib")]
+use flate2::read::ZlibDecoder;
+#[cfg(feature = "frame-sidecar-zlib")]
+use flate2::write::ZlibEncoder;
+#[cfg(feature = "frame-sidecar-zlib")]
+use flate2::Compression;
 use serde_json::Value;
 
 use crate::session::types::LaneRecord;
@@ -17,6 +26,12 @@ use crate::session::types::LaneRecord;
 const MAGIC: &[u8; 8] = b"RPIAFRM\0";
 const VERSION: u16 = 1;
 const HEADER_LEN: usize = 34;
+#[cfg(feature = "frame-sidecar-zlib")]
+const COMPRESSED_MAGIC: &[u8; 8] = b"RPIAZLB\0";
+#[cfg(feature = "frame-sidecar-zlib")]
+const COMPRESSED_VERSION: u16 = 1;
+#[cfg(feature = "frame-sidecar-zlib")]
+const COMPRESSED_HEADER_LEN: usize = 18;
 const MAX_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 
 /// Result of decoding a sidecar byte stream.
@@ -37,6 +52,8 @@ pub enum FrameSidecarError {
     BlockTooLarge(u32),
     InvalidLength,
     InvalidRecord(String),
+    #[cfg(feature = "frame-sidecar-zlib")]
+    Compression(String),
     NonFrameRecord,
     NonMonotonicSequence,
 }
@@ -61,6 +78,10 @@ impl fmt::Display for FrameSidecarError {
             Self::InvalidLength => f.write_str("assistant frame sidecar block length is invalid"),
             Self::InvalidRecord(error) => {
                 write!(f, "assistant frame sidecar record is invalid: {error}")
+            }
+            #[cfg(feature = "frame-sidecar-zlib")]
+            Self::Compression(error) => {
+                write!(f, "assistant frame sidecar compression failed: {error}")
             }
             Self::NonFrameRecord => {
                 f.write_str("assistant frame sidecar contains a non-frame record")
@@ -93,23 +114,59 @@ pub fn parse_reference_marker(value: &Value) -> Option<(u64, u32)> {
     ))
 }
 
+/// Decode one complete sidecar block at a byte offset.
+pub fn decode_block_at(bytes: &[u8], offset: u64) -> Result<Vec<LaneRecord>, FrameSidecarError> {
+    let offset = usize::try_from(offset).map_err(|_| FrameSidecarError::InvalidLength)?;
+    if offset >= bytes.len() {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    #[cfg(feature = "frame-sidecar-zlib")]
+    if bytes[offset..].starts_with(COMPRESSED_MAGIC) {
+        let decoded = decode_compressed_block(&bytes[offset..])?;
+        let block = decode_blocks(&decoded)?;
+        return if block.truncated_tail {
+            Err(FrameSidecarError::InvalidLength)
+        } else {
+            Ok(block.records)
+        };
+    }
+
+    let remaining = bytes.len() - offset;
+    if remaining < HEADER_LEN {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let payload_len = u32::from_le_bytes([
+        bytes[offset + 10],
+        bytes[offset + 11],
+        bytes[offset + 12],
+        bytes[offset + 13],
+    ]) as usize;
+    let block_end = offset
+        .checked_add(HEADER_LEN)
+        .and_then(|end| end.checked_add(payload_len))
+        .ok_or(FrameSidecarError::InvalidLength)?;
+    if block_end > bytes.len() {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let block = decode_blocks(&bytes[offset..block_end])?;
+    if block.truncated_tail {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    Ok(block.records)
+}
 /// Decode one referenced record from a sidecar block.
 pub fn decode_record_at(
     bytes: &[u8],
     offset: u64,
     index: u32,
 ) -> Result<LaneRecord, FrameSidecarError> {
-    let offset = usize::try_from(offset).map_err(|_| FrameSidecarError::InvalidLength)?;
-    if offset >= bytes.len() {
-        return Err(FrameSidecarError::InvalidLength);
-    }
-    let decoded = decode_blocks(&bytes[offset..])?;
+    let decoded = decode_block_at(bytes, offset)?;
     decoded
-        .records
         .into_iter()
         .nth(index as usize)
         .ok_or(FrameSidecarError::InvalidLength)
 }
+
 /// Encode one non-empty block of assistant-frame records.
 pub fn encode_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError> {
     if records.is_empty() {
@@ -153,6 +210,67 @@ pub fn encode_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError
     Ok(encoded)
 }
 
+/// Encode one block with a zlib envelope. The envelope keeps the raw block
+/// format intact so old raw sidecars remain readable and references still use
+/// the same byte offset + record index scheme.
+#[cfg(feature = "frame-sidecar-zlib")]
+pub fn encode_compressed_block(records: &[LaneRecord]) -> Result<Vec<u8>, FrameSidecarError> {
+    let raw = encode_block(records)?;
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&raw)
+        .map_err(|error| FrameSidecarError::Compression(error.to_string()))?;
+    let compressed = encoder
+        .finish()
+        .map_err(|error| FrameSidecarError::Compression(error.to_string()))?;
+    if compressed.len() > u32::MAX as usize || raw.len() > u32::MAX as usize {
+        return Err(FrameSidecarError::BlockTooLarge(
+            compressed.len().min(u32::MAX as usize) as u32,
+        ));
+    }
+    let mut encoded = Vec::with_capacity(COMPRESSED_HEADER_LEN + compressed.len());
+    encoded.extend_from_slice(COMPRESSED_MAGIC);
+    encoded.extend_from_slice(&COMPRESSED_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+#[cfg(feature = "frame-sidecar-zlib")]
+fn decode_compressed_block(bytes: &[u8]) -> Result<Vec<u8>, FrameSidecarError> {
+    if bytes.len() < COMPRESSED_HEADER_LEN {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    if &bytes[..8] != COMPRESSED_MAGIC {
+        return Err(FrameSidecarError::InvalidMagic);
+    }
+    let version = u16::from_le_bytes([bytes[8], bytes[9]]);
+    if version != COMPRESSED_VERSION {
+        return Err(FrameSidecarError::UnsupportedVersion(version));
+    }
+    let compressed_len = u32::from_le_bytes([bytes[10], bytes[11], bytes[12], bytes[13]]) as usize;
+    let raw_len = u32::from_le_bytes([bytes[14], bytes[15], bytes[16], bytes[17]]) as usize;
+    if raw_len > MAX_BLOCK_BYTES || compressed_len > MAX_BLOCK_BYTES {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let end = COMPRESSED_HEADER_LEN
+        .checked_add(compressed_len)
+        .ok_or(FrameSidecarError::InvalidLength)?;
+    if end > bytes.len() {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    let mut decoded = Vec::with_capacity(raw_len);
+    let mut decoder = ZlibDecoder::new(&bytes[COMPRESSED_HEADER_LEN..end]);
+    decoder
+        .read_to_end(&mut decoded)
+        .map_err(|error| FrameSidecarError::Compression(error.to_string()))?;
+    if decoded.len() != raw_len {
+        return Err(FrameSidecarError::InvalidLength);
+    }
+    Ok(decoded)
+}
+
 /// Decode all complete blocks from a sidecar byte stream.
 ///
 /// A short final header or payload is a recoverable torn tail. A complete
@@ -162,6 +280,40 @@ pub fn decode_blocks(bytes: &[u8]) -> Result<FrameSidecarDecode, FrameSidecarErr
     let mut records = Vec::new();
     while offset < bytes.len() {
         let remaining = bytes.len() - offset;
+        #[cfg(feature = "frame-sidecar-zlib")]
+        if bytes[offset..].starts_with(COMPRESSED_MAGIC) {
+            if remaining < COMPRESSED_HEADER_LEN {
+                return Ok(FrameSidecarDecode {
+                    records,
+                    truncated_tail: true,
+                });
+            }
+            let compressed_len = u32::from_le_bytes([
+                bytes[offset + 10],
+                bytes[offset + 11],
+                bytes[offset + 12],
+                bytes[offset + 13],
+            ]) as usize;
+            let block_end = offset
+                .checked_add(COMPRESSED_HEADER_LEN)
+                .and_then(|length| length.checked_add(compressed_len))
+                .ok_or(FrameSidecarError::InvalidLength)?;
+            if block_end > bytes.len() {
+                return Ok(FrameSidecarDecode {
+                    records,
+                    truncated_tail: true,
+                });
+            }
+            let decoded = decode_compressed_block(&bytes[offset..block_end])?;
+            let block = decode_blocks(&decoded)?;
+            if block.truncated_tail {
+                return Err(FrameSidecarError::InvalidLength);
+            }
+            records.extend(block.records);
+            offset = block_end;
+            continue;
+        }
+
         if remaining < HEADER_LEN {
             return Ok(FrameSidecarDecode {
                 records,
@@ -244,10 +396,6 @@ pub fn decode_blocks(bytes: &[u8]) -> Result<FrameSidecarDecode, FrameSidecarErr
 mod tests {
     use super::*;
     use crate::session::types::{AssistantFrameOp, AssistantFrameRecord, RecordBase};
-    use flate2::read::ZlibDecoder;
-    use flate2::write::ZlibEncoder;
-    use flate2::Compression;
-    use std::io::{Read, Write};
 
     fn frame(seq: u64, op: AssistantFrameOp) -> LaneRecord {
         LaneRecord::AssistantFrame(AssistantFrameRecord {
@@ -315,6 +463,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "frame-sidecar-zlib")]
     #[test]
     fn zlib_compression_round_trips_and_reduces_repeated_frame_envelopes() {
         let records: Vec<_> = (1..=128)
@@ -324,30 +473,40 @@ mod tests {
             .iter()
             .map(|record| serde_json::to_vec(record).unwrap().len() + 1)
             .sum();
-        let block = encode_block(&records).unwrap();
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&block).unwrap();
-        let compressed = encoder.finish().unwrap();
-
-        let mut decoded_block = Vec::new();
-        ZlibDecoder::new(compressed.as_slice())
-            .read_to_end(&mut decoded_block)
-            .unwrap();
-        assert_eq!(decoded_block, block);
+        let raw_block = encode_block(&records).unwrap();
+        let compressed = encode_compressed_block(&records).unwrap();
         assert!(compressed.len() < inline_bytes);
+        assert_eq!(decode_blocks(&compressed).unwrap().records, records);
+        for (index, record) in records.iter().enumerate() {
+            assert_eq!(
+                decode_record_at(&compressed, 0, index as u32).unwrap(),
+                *record
+            );
+        }
 
         if std::env::var_os("RPI_FRAME_SIDECAR_AUDIT").is_some_and(|value| value != "0") {
             eprintln!(
                 "RPI_FRAME_SIDECAR_AUDIT records={} inline_bytes={} raw_block_bytes={} compressed_block_bytes={} compression_ratio={:.3}",
                 records.len(),
                 inline_bytes,
-                block.len(),
+                raw_block.len(),
                 compressed.len(),
                 compressed.len() as f64 / inline_bytes as f64,
             );
         }
     }
 
+    #[cfg(feature = "frame-sidecar-zlib")]
+    #[test]
+    fn compressed_blocks_preserve_completed_prefix_before_torn_tail() {
+        let first = encode_compressed_block(&[frame(1, AssistantFrameOp::Append)]).unwrap();
+        let second = encode_compressed_block(&[frame(2, AssistantFrameOp::Append)]).unwrap();
+        let mut bytes = first;
+        bytes.extend_from_slice(&second[..second.len() - 1]);
+        let decoded = decode_blocks(&bytes).unwrap();
+        assert_eq!(decoded.records, vec![frame(1, AssistantFrameOp::Append)]);
+        assert!(decoded.truncated_tail);
+    }
     #[test]
     fn rejects_bad_magic() {
         let mut encoded = encode_block(&[frame(1, AssistantFrameOp::Append)]).unwrap();

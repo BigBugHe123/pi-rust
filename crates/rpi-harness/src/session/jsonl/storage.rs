@@ -47,7 +47,7 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -61,8 +61,10 @@ use crate::session::jsonl::codec::{
     encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
 };
 use crate::session::jsonl::errors::{file_result, invalid_file, JsonlDecodeErrorKind};
+#[cfg(feature = "frame-sidecar-zlib")]
+use crate::session::jsonl::frame_sidecar::encode_compressed_block;
 use crate::session::jsonl::frame_sidecar::{
-    decode_record_at, encode_block, parse_reference_marker, reference_marker,
+    decode_block_at, encode_block, parse_reference_marker, reference_marker,
 };
 use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
 use crate::session::memory::{stamp_record, Clock};
@@ -108,6 +110,12 @@ impl JsonlSessionStorage {
         format!("{path}.frames")
     }
 
+    #[cfg(feature = "frame-sidecar-zlib")]
+    fn compressed_sidecar_enabled() -> bool {
+        cfg!(feature = "frame-sidecar-zlib")
+            && std::env::var_os("RPI_FRAME_SIDECAR_ZLIB").is_some_and(|value| value != "0")
+    }
+
     fn new_with_sidecar(
         fs: Arc<dyn FileSystem>,
         metadata: JsonlSessionMetadata,
@@ -151,6 +159,7 @@ impl JsonlSessionStorage {
     fn hydrate_sidecar_mutation(
         mutation: SessionMutation,
         sidecar: Option<&[u8]>,
+        blocks: &mut HashMap<u64, Vec<LaneRecord>>,
     ) -> SessionResult<SessionMutation> {
         let SessionMutation::Record { mut record } = mutation else {
             return Ok(mutation);
@@ -169,8 +178,16 @@ impl JsonlSessionStorage {
         };
         let bytes = sidecar
             .ok_or_else(|| SessionError::storage("assistant frame references a missing sidecar"))?;
-        let hydrated = decode_record_at(bytes, offset, index)
-            .map_err(|error| SessionError::storage(error.to_string()))?;
+        if !blocks.contains_key(&offset) {
+            let decoded = decode_block_at(bytes, offset)
+                .map_err(|error| SessionError::storage(error.to_string()))?;
+            blocks.insert(offset, decoded);
+        }
+        let hydrated = blocks
+            .get(&offset)
+            .and_then(|records| records.get(index as usize))
+            .cloned()
+            .ok_or_else(|| SessionError::storage("assistant frame sidecar index is invalid"))?;
         let LaneRecord::AssistantFrame(hydrated_frame) = hydrated else {
             return Err(SessionError::storage(
                 "assistant frame sidecar reference resolved to a non-frame record",
@@ -313,6 +330,7 @@ impl JsonlSessionStorage {
         } else {
             None
         };
+        let mut sidecar_blocks = HashMap::new();
 
         // Lines kept through the duplicate-seq recovery, so a healed file can
         // be republished without the dropped duplicates (see after the loop).
@@ -329,9 +347,12 @@ impl JsonlSessionStorage {
                             &"assistant frame references a missing sidecar".to_string(),
                         ));
                     }
-                    let mutation =
-                        Self::hydrate_sidecar_mutation(mutation, sidecar_bytes.as_deref())
-                            .map_err(|error| invalid_file(path, line_no, &error.message))?;
+                    let mutation = Self::hydrate_sidecar_mutation(
+                        mutation,
+                        sidecar_bytes.as_deref(),
+                        &mut sidecar_blocks,
+                    )
+                    .map_err(|error| invalid_file(path, line_no, &error.message))?;
                     let mut state = storage.state.lock().await;
                     // Self-heal a duplicated/late append. Two writers on one
                     // JSONL (e.g. a session resumed while still open in another
@@ -555,6 +576,14 @@ impl JsonlSessionStorage {
                 )))
             }
         };
+        #[cfg(feature = "frame-sidecar-zlib")]
+        let block = if Self::compressed_sidecar_enabled() {
+            encode_compressed_block(records)
+        } else {
+            encode_block(records)
+        }
+        .map_err(|error| SessionError::storage(error.to_string()))?;
+        #[cfg(not(feature = "frame-sidecar-zlib"))]
         let block =
             encode_block(records).map_err(|error| SessionError::storage(error.to_string()))?;
         file_result(
@@ -1414,6 +1443,95 @@ mod tests {
             .collect();
         assert!(frames.contains(&serde_json::json!({"text": "one"})));
         assert!(frames.contains(&serde_json::json!({"text": "two"})));
+    }
+
+    #[tokio::test]
+    #[ignore = "manual persistence benchmark"]
+    async fn sidecar_storage_benchmark() {
+        use std::time::Instant;
+
+        let mode = std::env::var("RPI_BENCH_MODE").unwrap_or_else(|_| "inline".into());
+        assert!(matches!(mode.as_str(), "inline" | "raw" | "zlib"));
+        if mode == "zlib" {
+            assert!(
+                cfg!(feature = "frame-sidecar-zlib"),
+                "zlib benchmark requires --features frame-sidecar-zlib"
+            );
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+            temp.path().to_path_buf(),
+        ));
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+        let path = "bench.jsonl";
+        let storage = if mode == "inline" {
+            JsonlSessionStorage::create(fs.clone(), path, header(), clock.clone(), ids.clone())
+                .await
+                .unwrap()
+        } else {
+            JsonlSessionStorage::create_with_frame_sidecar(
+                fs.clone(),
+                path,
+                header(),
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap()
+        };
+        let append_start = Instant::now();
+        for batch in 0..32 {
+            let records = (0..128)
+                .map(|index| {
+                    let sequence = batch * 128 + index;
+                    LaneRecord::AssistantFrame(crate::session::types::AssistantFrameRecord {
+                        base: RecordBase {
+                            id: format!("bench-frame-{sequence}"),
+                            seq: 0,
+                            lane: "main".into(),
+                            timestamp: 0,
+                        },
+                        run_id: "bench-run".into(),
+                        stream_index: sequence,
+                        op: crate::session::types::AssistantFrameOp::Append,
+                        frame: Some(serde_json::json!({
+                            "entryId": "bench-entry",
+                            "text": "repeated assistant frame payload for compression",
+                            "delta": "same-content"
+                        })),
+                    })
+                })
+                .collect();
+            storage.append_records(records).await.unwrap();
+        }
+        storage.drain().await;
+        let append_ms = append_start.elapsed().as_secs_f64() * 1000.0;
+        let main_bytes = fs.file_info(path, None).await.unwrap().size;
+        let sidecar_bytes = fs
+            .file_info("bench.jsonl.frames", None)
+            .await
+            .map(|info| info.size)
+            .unwrap_or(0);
+
+        let reload_start = Instant::now();
+        let reloaded = JsonlSessionStorage::load(fs, path, clock, ids)
+            .await
+            .unwrap();
+        reloaded.drain().await;
+        let reload_ms = reload_start.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            reloaded
+                .find_records(&RecordQuery::default())
+                .await
+                .unwrap()
+                .len(),
+            4096
+        );
+        println!(
+            "SIDECAR_BENCH mode={mode} append_ms={append_ms:.3} reload_ms={reload_ms:.3} main_bytes={main_bytes} sidecar_bytes={sidecar_bytes} total_bytes={}",
+            main_bytes + sidecar_bytes
+        );
     }
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
