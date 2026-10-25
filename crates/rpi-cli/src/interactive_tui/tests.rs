@@ -1,6 +1,7 @@
 use super::*;
 use rpi_tui::Component;
 
+mod enter_completion;
 mod session_regressions;
 
 #[test]

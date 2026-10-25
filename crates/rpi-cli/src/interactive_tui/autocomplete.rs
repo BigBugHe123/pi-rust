@@ -161,6 +161,76 @@ pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>)
     true
 }
 
+/// What a bare Enter does while a completion popup is open. Mirrors the TS
+/// editor's `tui.select.confirm` handling (`editor.ts:757-815`): apply the
+/// highlighted completion, then — for a `/` prefix — fall through to submit;
+/// for an `@`-path completion only apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EnterCompletionAction {
+    /// Apply the completion and let the Enter fall through to submit.
+    ApplyAndSubmit,
+    /// Apply the completion but keep the Enter (a path completion must not
+    /// send the prompt).
+    ApplyOnly,
+    /// No completion to apply — submit the text exactly as typed.
+    Submit,
+}
+
+/// Decide what a bare Enter does in the current completion context.
+///
+/// Returns `None` when no completion popup applies (plain text, a `/` token
+/// that is not at the start of the input, or no suggestions) — the key falls
+/// through to the editor unchanged, preserving the upstream behavior that an
+/// unknown `/skill:name` reaches the model untouched.
+///
+/// Interception is armed only when the choice is unambiguous: the candidate
+/// list holds exactly one item, or the user has explicitly moved the
+/// highlight. A fresh ambiguous popup (several candidates, index 0) resolves
+/// to `Submit` — Enter sends what was typed, never a silently guessed row.
+pub(super) fn enter_completion_action(
+    state: &Arc<TuiState>,
+    editor: &Arc<Editor>,
+) -> Option<EnterCompletionAction> {
+    let text = editor.get_text();
+    let cursor = editor_cursor_offset(editor, &text);
+    let sugg = state.autocomplete.get_suggestions(&text, cursor)?;
+    if sugg.items.is_empty() {
+        return None;
+    }
+    let start = sugg.start.min(text.len());
+    // Same explicit-context rule as `navigate_autocomplete`: only the `/`
+    // token at input start or an `@`-file token counts as a popup the Enter
+    // key belongs to.
+    let explicit = text[start..].starts_with('/') || text[..start].ends_with('@');
+    if !explicit {
+        return None;
+    }
+    let is_slash = text[start..].starts_with('/');
+    let highlighted = *state.autocomplete_selection.lock().unwrap();
+    let highlighted = highlighted.min(sugg.items.len().saturating_sub(1));
+    if sugg.items.len() == 1 || highlighted != 0 {
+        Some(if is_slash {
+            EnterCompletionAction::ApplyAndSubmit
+        } else {
+            EnterCompletionAction::ApplyOnly
+        })
+    } else {
+        Some(EnterCompletionAction::Submit)
+    }
+}
+
+/// Apply the completion an Enter decision selected. Returns `true` when the
+/// editor text was rewritten (the caller lets the Enter fall through to
+/// submit for `ApplyAndSubmit`, or consumes it for `ApplyOnly`).
+pub(super) fn accept_enter_completion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
+    match enter_completion_action(state, editor) {
+        Some(EnterCompletionAction::ApplyAndSubmit) | Some(EnterCompletionAction::ApplyOnly) => {
+            accept_top_suggestion(state, editor)
+        }
+        _ => false,
+    }
+}
+
 /// Move the autocomplete highlight up (`direction < 0`) or down (`direction > 0`)
 /// and re-render the list. Returns `true` when the key was consumed.
 ///

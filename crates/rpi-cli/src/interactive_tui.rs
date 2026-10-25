@@ -2568,6 +2568,37 @@ pub async fn interactive_tui(
                 }
             }
 
+            // 5a-ter. A bare Enter in a completion context (`/` or `@`)
+            //     resolves the completion before submitting, mirroring the
+            //     TS editor's `tui.select.confirm` (`editor.ts:757-815`):
+            //     apply the sole/highlighted item, then let a `/` completion
+            //     fall through to submit while an `@`-path one consumes the
+            //     Enter. Unambiguous only — a fresh ambiguous popup submits
+            //     the typed text, and unknown `/skill:name` still reaches
+            //     the model untouched.
+            //     Runs AFTER the Windows paste-run flush so the editor
+            //     already holds the buffered characters of a typed prefix.
+            if key.modifiers == KeyModifiers::NONE
+                && (key.code == KeyCode::Enter
+                    || key.code == KeyCode::Char('\n')
+                    || key.code == KeyCode::Char('\r'))
+            {
+                match enter_completion_action(&state_for_key, &editor_for_key) {
+                    Some(EnterCompletionAction::ApplyOnly) => {
+                        if accept_enter_completion(&state_for_key, &editor_for_key) {
+                            tui_for_key.request_render_reusing_scroll_content();
+                            continue;
+                        }
+                    }
+                    Some(EnterCompletionAction::ApplyAndSubmit) => {
+                        // Rewrite the editor and let the Enter fall through
+                        // to the editor's submit below.
+                        accept_enter_completion(&state_for_key, &editor_for_key);
+                    }
+                    _ => {}
+                }
+            }
+
             // 5b. ↑/↓ browse submitted-message history when the editor is
             //     EMPTY (a fresh prompt) — mirrors TS historyPrevious/Next
             //     without the surprise of replacing typed text. When the
