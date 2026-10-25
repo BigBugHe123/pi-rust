@@ -346,7 +346,8 @@ impl JsonlSessionStorage {
         if encoded.is_empty() {
             return Ok(());
         }
-        let mut lines = String::new();
+        let capacity = encoded.iter().map(String::len).sum();
+        let mut lines = String::with_capacity(capacity);
         for line in encoded {
             lines.push_str(line);
         }
