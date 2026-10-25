@@ -13,10 +13,6 @@ readme = "README.md"
 keywords = ["agent", "llm", "ai", "claude", "harness"]
 categories = ["api-bindings", "asynchronous", "artificial-intelligence"]
 
-[features]
-default = []
-frame-sidecar-zlib = ["dep:flate2"]
-
 [dependencies]
 rpi-telemetry = { workspace = true }
 rpi-ai = { workspace = true }
@@ -34,7 +30,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 rusqlite = { workspace = true }
-flate2 = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -10,7 +10,6 @@
 
 pub mod codec;
 pub mod errors;
-pub mod frame_sidecar;
 pub mod repo;
 pub mod storage;
 pub mod types;
