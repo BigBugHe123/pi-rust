@@ -209,6 +209,10 @@ pub fn decode_blocks(bytes: &[u8]) -> Result<FrameSidecarDecode, FrameSidecarErr
 mod tests {
     use super::*;
     use crate::session::types::{AssistantFrameOp, AssistantFrameRecord, RecordBase};
+    use flate2::read::ZlibDecoder;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::{Read, Write};
 
     fn frame(seq: u64, op: AssistantFrameOp) -> LaneRecord {
         LaneRecord::AssistantFrame(AssistantFrameRecord {
@@ -274,6 +278,39 @@ mod tests {
             ]),
             Err(FrameSidecarError::NonMonotonicSequence)
         );
+    }
+
+    #[test]
+    fn zlib_compression_round_trips_and_reduces_repeated_frame_envelopes() {
+        let records: Vec<_> = (1..=128)
+            .map(|seq| frame(seq, AssistantFrameOp::Append))
+            .collect();
+        let inline_bytes: usize = records
+            .iter()
+            .map(|record| serde_json::to_vec(record).unwrap().len() + 1)
+            .sum();
+        let block = encode_block(&records).unwrap();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&block).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut decoded_block = Vec::new();
+        ZlibDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded_block)
+            .unwrap();
+        assert_eq!(decoded_block, block);
+        assert!(compressed.len() < inline_bytes);
+
+        if std::env::var_os("RPI_FRAME_SIDECAR_AUDIT").is_some_and(|value| value != "0") {
+            eprintln!(
+                "RPI_FRAME_SIDECAR_AUDIT records={} inline_bytes={} raw_block_bytes={} compressed_block_bytes={} compression_ratio={:.3}",
+                records.len(),
+                inline_bytes,
+                block.len(),
+                compressed.len(),
+                compressed.len() as f64 / inline_bytes as f64,
+            );
+        }
     }
 
     #[test]

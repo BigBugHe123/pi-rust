@@ -34,6 +34,7 @@ rusqlite = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 rpi-telemetry = { workspace = true }
+flate2 = "1"
 rpi-ai = { workspace = true }
 rpi-agent = { workspace = true }
 
