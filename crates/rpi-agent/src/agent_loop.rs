@@ -31,7 +31,7 @@ use crate::types::{
 };
 
 use rpi_ai::types::{
-    AssistantMessage, AssistantMessageEvent, Content, StopReason, ToolCall, ToolCallType,
+    AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, ToolCall, ToolCallType,
     ToolResultMessage, ToolResultRole,
 };
 use rpi_ai::validate_tool_arguments;
@@ -234,6 +234,7 @@ async fn run_loop(
     pending_assistant: Option<AssistantMessage>,
 ) -> Result<LoopOutcome, AgentError> {
     let mut pending_assistant = pending_assistant;
+    let mut provider_cache = ProviderMessageCache::new();
     let mut first_turn = true;
     // Check for steering messages at start (user may have typed while waiting).
     let mut pending_messages = drain_steering(config).await;
@@ -278,8 +279,14 @@ async fn run_loop(
             let message = match pending_assistant.take() {
                 Some(message) => message,
                 None => {
-                    let message =
-                        stream_assistant_response(current_context, config, emit, stream_fn).await?;
+                    let message = stream_assistant_response(
+                        current_context,
+                        config,
+                        &mut provider_cache,
+                        emit,
+                        stream_fn,
+                    )
+                    .await?;
                     new_messages.push(AgentMessage::Assistant(Box::new(message.clone())));
                     message
                 }
@@ -346,6 +353,7 @@ async fn run_loop(
                 {
                     if let Some(ctx) = upd.context {
                         *current_context = ctx;
+                        provider_cache.invalidate();
                     }
                 }
             }
@@ -374,6 +382,7 @@ async fn run_loop(
             {
                 if let Some(ctx) = upd.context {
                     *current_context = ctx;
+                    provider_cache.invalidate();
                 }
             }
 
@@ -520,37 +529,97 @@ impl Drop for AssistantRequestDiagnostics {
     }
 }
 
+struct ProviderMessageCache {
+    initialized: bool,
+    source_len: usize,
+    messages: Vec<Message>,
+}
+
+impl ProviderMessageCache {
+    fn new() -> Self {
+        Self {
+            initialized: false,
+            source_len: 0,
+            messages: Vec::new(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.initialized = false;
+        self.source_len = 0;
+        self.messages.clear();
+    }
+
+    fn take_messages(
+        &mut self,
+        context: &AgentContext,
+        config: &AgentLoopConfig,
+    ) -> Option<Vec<Message>> {
+        if config.transform_context.is_some() {
+            return None;
+        }
+        let convert = config.convert_to_llm_incremental.as_ref()?;
+        // The first request must use the full converter: harness conversion
+        // repairs orphaned/interleaved tool history before caching it.
+        if !self.initialized {
+            return None;
+        }
+        if self.source_len > context.messages.len() {
+            self.invalidate();
+            return None;
+        }
+        let suffix = &context.messages[self.source_len..];
+        self.messages.extend(convert(suffix));
+        self.source_len = context.messages.len();
+        Some(std::mem::take(&mut self.messages))
+    }
+
+    fn restore_messages(&mut self, messages: Vec<Message>) {
+        self.initialized = true;
+        self.messages = messages;
+    }
+}
+
 /// Stream one assistant response, folding protocol events into the partial
 /// message and emitting agent `Message*` events. Mirrors TS
 /// `streamAssistantResponse`.
 async fn stream_assistant_response(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
+    provider_cache: &mut ProviderMessageCache,
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
 ) -> Result<AssistantMessage, AgentError> {
     let mut diagnostics =
         AssistantRequestDiagnostics::new(context.messages.len(), context.tools.len());
-    let transform_started = diagnostics.enabled.then(Instant::now);
-    // Apply optional transform_context (AgentMessage[] → AgentMessage[]).
-    let messages = if let Some(transform) = &config.transform_context {
-        transform(context.messages.clone(), config.signal.clone()).await
+    // The incremental path owns the converted provider messages between turns.
+    // Moving them into `Context` avoids cloning the full provider history; the
+    // synchronous stream factory cannot retain the borrowed context.
+    let cached_messages = provider_cache.take_messages(context, config);
+    let cache_enabled =
+        config.transform_context.is_none() && config.convert_to_llm_incremental.is_some();
+    let llm_messages = if let Some(messages) = cached_messages {
+        messages
     } else {
-        context.messages.clone()
+        let transform_started = diagnostics.enabled.then(Instant::now);
+        let messages = if let Some(transform) = &config.transform_context {
+            transform(context.messages.clone(), config.signal.clone()).await
+        } else {
+            context.messages.clone()
+        };
+        if let Some(started) = transform_started {
+            diagnostics.transform_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        }
+        let convert_started = diagnostics.enabled.then(Instant::now);
+        let converted = (config.convert_to_llm)(messages).await;
+        if let Some(started) = convert_started {
+            diagnostics.convert_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        }
+        converted
     };
-    if let Some(started) = transform_started {
-        diagnostics.transform_ns = AssistantRequestDiagnostics::elapsed_ns(started);
-    }
+    diagnostics.llm_messages = llm_messages.len();
 
-    // convert_to_llm (AgentMessage[] → Message[]).
-    let convert_started = diagnostics.enabled.then(Instant::now);
-    let llm_messages = (config.convert_to_llm)(messages).await;
-    if let Some(started) = convert_started {
-        diagnostics.convert_ns = AssistantRequestDiagnostics::elapsed_ns(started);
-        diagnostics.llm_messages = llm_messages.len();
-    }
-
-    let llm_context = rpi_ai::types::Context {
+    let mut llm_context = rpi_ai::types::Context {
         system_prompt: if context.system_prompt.is_empty() {
             None
         } else {
@@ -572,6 +641,10 @@ async fn stream_assistant_response(
     let opts = config.to_stream_options(resolved_api_key);
     let stream_open_started = diagnostics.enabled.then(Instant::now);
     let mut response = stream_fn(&config.model, &llm_context, &opts);
+    if cache_enabled {
+        provider_cache.source_len = context.messages.len();
+        provider_cache.restore_messages(std::mem::take(&mut llm_context.messages));
+    }
     if let Some(started) = stream_open_started {
         diagnostics.stream_open_ns = AssistantRequestDiagnostics::elapsed_ns(started);
         diagnostics.stream_started = Some(Instant::now());

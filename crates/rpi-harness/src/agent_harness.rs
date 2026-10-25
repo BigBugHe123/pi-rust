@@ -57,7 +57,9 @@ use crate::compaction::{
 use crate::error::{SessionError, SessionErrorCode};
 use crate::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent};
 use crate::messages::{
-    convert_to_llm as harness_convert_to_llm, create_compaction_summary_message,
+    convert_to_llm as harness_convert_to_llm,
+    convert_to_llm_incremental as harness_convert_to_llm_incremental,
+    create_compaction_summary_message,
 };
 use crate::prompt_templates::format_prompt_template_invocation;
 use crate::result::{HarnessError, HarnessResult, OperationKind};
@@ -3898,7 +3900,13 @@ impl AgentHarness {
         };
 
         // Build the config.
+        let custom_converter = snap.to_provider_messages.is_some();
         let convert = Self::build_convert_to_llm(snap.to_provider_messages);
+        let convert_to_llm_incremental = if custom_converter {
+            None
+        } else {
+            Some(Arc::new(harness_convert_to_llm_incremental) as rpi_agent::IncrementalConvertToLlm)
+        };
         let stream_fn = Self::build_stream_fn(
             snap.models.clone(),
             snap.provider_hooks.clone(),
@@ -3956,6 +3964,7 @@ impl AgentHarness {
         let mut config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
+            convert_to_llm_incremental,
             transform_context: snap.transform_context.clone(),
             get_api_key: None,
             should_stop_after_turn,

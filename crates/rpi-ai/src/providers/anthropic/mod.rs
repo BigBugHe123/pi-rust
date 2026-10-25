@@ -54,6 +54,7 @@ fn provider_diagnostics_enabled() -> bool {
 struct ProviderRequestDiagnostics {
     enabled: bool,
     started: Option<Instant>,
+    params_build_ns: u64,
     request_encode_ns: u64,
     request_body_bytes: usize,
     messages_bytes: usize,
@@ -70,6 +71,7 @@ impl ProviderRequestDiagnostics {
         Self {
             enabled,
             started: enabled.then(Instant::now),
+            params_build_ns: 0,
             request_encode_ns: 0,
             request_body_bytes: 0,
             messages_bytes: 0,
@@ -94,7 +96,8 @@ impl Drop for ProviderRequestDiagnostics {
             return;
         }
         eprintln!(
-            "RPI_PROVIDER_DIAGNOSTICS provider=anthropic request_encode_ns={} request_body_bytes={} messages_bytes={} tools_bytes={} system_bytes={} message_count={} http_wait_ns={} sse_first_event_ns={} total_ns={}",
+            "RPI_PROVIDER_DIAGNOSTICS provider=anthropic params_build_ns={} request_encode_ns={} request_body_bytes={} messages_bytes={} tools_bytes={} system_bytes={} message_count={} http_wait_ns={} sse_first_event_ns={} total_ns={}",
+            self.params_build_ns,
             self.request_encode_ns,
             self.request_body_bytes,
             self.messages_bytes,
@@ -210,13 +213,17 @@ impl Provider for AnthropicProvider {
             create_assistant_message_event_stream_with_cancellation(&opts.signal);
 
         let http = self.http.clone();
+        let params_started = provider_diagnostics_enabled().then(Instant::now);
         let params = prepare_params(model, ctx, opts, &self.api_key, self.allow_env_api_key);
+        let params_build_ns = params_started
+            .map(|started| started.elapsed().as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or_default();
         let model = model.clone();
         let mut opts = opts.clone();
         opts.signal = prod.cancellation_token();
 
         tokio::spawn(async move {
-            run_anthropic_stream(&mut prod, http, &model, params, &opts).await;
+            run_anthropic_stream(&mut prod, http, &model, params, &opts, params_build_ns).await;
             // `prod` drops here, closing the mpsc sender so the consumer's
             // `next()` returns `None` after the terminal event.
         });
@@ -287,8 +294,10 @@ async fn run_anthropic_stream(
     model: &Model,
     params: Result<PreparedParams, String>,
     opts: &SimpleStreamOptions,
+    params_build_ns: u64,
 ) {
     let mut diagnostics = ProviderRequestDiagnostics::new();
+    diagnostics.params_build_ns = params_build_ns;
     let mut state = MapperState::new(
         model.api.clone(),
         model.provider.clone(),
