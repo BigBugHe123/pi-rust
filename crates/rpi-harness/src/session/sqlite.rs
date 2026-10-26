@@ -25,6 +25,7 @@ use crate::session::types::{
 pub struct SqliteSessionStorage {
     db: Arc<Mutex<Connection>>,
     inner: InMemorySessionStorage,
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqliteSessionStorage {
@@ -34,14 +35,16 @@ impl SqliteSessionStorage {
         state: SessionState,
         clock: Arc<dyn Clock>,
         ids: Arc<dyn IdGenerator>,
+        gate: Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self {
             db,
             inner: InMemorySessionStorage::from_state(metadata, state, clock, ids),
+            gate,
         }
     }
 
-    fn persist(&self) -> SessionResult<()> {
+    fn persist_cas(&self, previous: &str) -> SessionResult<bool> {
         let metadata = self.inner.metadata();
         let state = serde_json::to_string(&self.inner.snapshot_state())
             .map_err(|e| SessionError::storage(format!("serialize SQLite session: {e}")))?;
@@ -50,20 +53,52 @@ impl SqliteSessionStorage {
             .lock()
             .map_err(|_| SessionError::storage("SQLite connection poisoned"))?
             .execute(
-                "UPDATE sessions SET state_json = ?1 WHERE id = ?2",
-                params![state, metadata.id],
+                "UPDATE sessions SET state_json = ?1 WHERE id = ?2 AND state_json = ?3",
+                params![state, metadata.id, previous],
             )
             .map_err(|e| SessionError::storage(format!("persist SQLite session: {e}")))?;
-        if changed != 1 {
-            return Err(SessionError::not_found(format!(
-                "Session not found: {}",
-                metadata.id
-            )));
+        Ok(changed == 1)
+    }
+
+    async fn write_retry<T, F, Fut>(&self, op: F) -> SessionResult<T>
+    where
+        F: Fn(InMemorySessionStorage) -> Fut,
+        Fut: std::future::Future<Output = SessionResult<T>>,
+    {
+        // Refresh, reduce, and CAS the exact snapshot that was refreshed. A
+        // concurrent connection either wins the CAS or causes this operation
+        // to replay against the newer state; its successful return is durable.
+        let _gate = self.gate.lock().await;
+        for _ in 0..16 {
+            let previous = self.refresh_unlocked()?;
+            match op(self.inner.clone()).await {
+                Ok(value) => match self.persist_cas(&previous) {
+                    Ok(true) => return Ok(value),
+                    Ok(false) => continue,
+                    Err(error) => {
+                        self.restore_snapshot(&previous)?;
+                        return Err(error);
+                    }
+                },
+                Err(error) => {
+                    self.restore_snapshot(&previous)?;
+                    return Err(error);
+                }
+            }
         }
+        Err(SessionError::storage(
+            "SQLite write conflicted too many times",
+        ))
+    }
+
+    fn restore_snapshot(&self, state_json: &str) -> SessionResult<()> {
+        let state = serde_json::from_str(state_json)
+            .map_err(|e| SessionError::storage(format!("decode SQLite session: {e}")))?;
+        self.inner.replace_state(state);
         Ok(())
     }
 
-    fn refresh(&self) -> SessionResult<()> {
+    fn refresh_unlocked(&self) -> SessionResult<String> {
         let id = self.inner.metadata().id;
         let state_json: String = self
             .db
@@ -78,7 +113,13 @@ impl SqliteSessionStorage {
         let state = serde_json::from_str(&state_json)
             .map_err(|e| SessionError::storage(format!("decode SQLite session: {e}")))?;
         self.inner.replace_state(state);
-        Ok(())
+        Ok(state_json)
+    }
+
+    async fn refresh_read(&self) -> SessionResult<tokio::sync::OwnedMutexGuard<()>> {
+        let gate = self.gate.clone().lock_owned().await;
+        self.refresh_unlocked()?;
+        Ok(gate)
     }
 }
 
@@ -88,37 +129,51 @@ impl SessionStorage for SqliteSessionStorage {
         self.inner.metadata()
     }
     async fn get_lanes(&self) -> SessionResult<Vec<LanePointer>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.get_lanes().await
     }
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
-        self.refresh()?;
-        self.inner.create_lane(lane, at).await?;
-        self.persist()
+        let lane = lane.to_string();
+        let at = at.map(str::to_string);
+        self.write_retry(move |inner| {
+            let lane = lane.clone();
+            let at = at.clone();
+            async move { inner.create_lane(&lane, at.as_deref()).await }
+        })
+        .await
     }
     async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
-        self.refresh()?;
-        self.inner.move_lane(lane, to).await?;
-        self.persist()
+        let lane = lane.to_string();
+        let to = to.map(str::to_string);
+        self.write_retry(move |inner| {
+            let lane = lane.clone();
+            let to = to.clone();
+            async move { inner.move_lane(&lane, to.as_deref()).await }
+        })
+        .await
     }
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
-        self.refresh()?;
-        let result = self.inner.append_entry(entry, lane).await?;
-        self.persist()?;
-        Ok(result)
+        let lane = lane.to_string();
+        self.write_retry(move |inner| {
+            let entry = entry.clone();
+            let lane = lane.clone();
+            async move { inner.append_entry(entry, &lane).await }
+        })
+        .await
     }
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
-        self.refresh()?;
-        let result = self.inner.append_record(record).await?;
-        self.persist()?;
-        Ok(result)
+        self.write_retry(move |inner| {
+            let record = record.clone();
+            async move { inner.append_record(record).await }
+        })
+        .await
     }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.get_entry(id).await
     }
     async fn find_entries(&self, query: &EntryQuery) -> SessionResult<Vec<Entry>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.find_entries(query).await
     }
     async fn find_entries_on_branch(
@@ -127,7 +182,7 @@ impl SessionStorage for SqliteSessionStorage {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<Vec<Entry>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner
             .find_entries_on_branch(query, bounds, start)
             .await
@@ -137,12 +192,12 @@ impl SessionStorage for SqliteSessionStorage {
         bounds: &BranchBounds,
         start: &str,
     ) -> SessionResult<crate::session::context::SessionContext> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         SessionStorage::context_on_branch(&self.inner, bounds, start).await
     }
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.find_records(query).await
     }
     async fn find_open_operations(
@@ -150,33 +205,41 @@ impl SessionStorage for SqliteSessionStorage {
         lane: &str,
         limit: Option<usize>,
     ) -> SessionResult<Vec<OperationStartedRecord>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.find_open_operations(lane, limit).await
     }
     async fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.get_log(options).await
     }
     async fn get_name(&self) -> SessionResult<Option<String>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.get_name().await
     }
     async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
-        self.refresh()?;
-        self.inner.set_name(name).await?;
-        self.persist()
+        let name = name.map(str::to_string);
+        self.write_retry(move |inner| {
+            let name = name.clone();
+            async move { inner.set_name(name.as_deref()).await }
+        })
+        .await
     }
     async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.get_label(id).await
     }
     async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
-        self.refresh()?;
-        self.inner.set_label(id, label).await?;
-        self.persist()
+        let id = id.to_string();
+        let label = label.map(str::to_string);
+        self.write_retry(move |inner| {
+            let id = id.clone();
+            let label = label.clone();
+            async move { inner.set_label(&id, label.as_deref()).await }
+        })
+        .await
     }
     async fn get_stats(&self) -> SessionResult<SessionStats> {
-        self.refresh()?;
+        let _gate = self.refresh_read().await?;
         self.inner.get_stats().await
     }
 }
@@ -186,6 +249,7 @@ pub struct SqliteSessionRepo {
     db: Arc<Mutex<Connection>>,
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdGenerator>,
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SqliteSessionRepo {
@@ -209,6 +273,8 @@ impl SqliteSessionRepo {
         }
         let conn = Connection::open(&path)
             .map_err(|e| SessionError::storage(format!("open SQLite database: {e}")))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| SessionError::storage(format!("configure SQLite busy timeout: {e}")))?;
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS sessions (
@@ -224,6 +290,7 @@ impl SqliteSessionRepo {
             db: Arc::new(Mutex::new(conn)),
             clock,
             ids,
+            gate: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 
@@ -300,6 +367,7 @@ impl SessionRepo for SqliteSessionRepo {
             state,
             self.clock.clone(),
             self.ids.clone(),
+            self.gate.clone(),
         ))
     }
 
@@ -313,6 +381,7 @@ impl SessionRepo for SqliteSessionRepo {
             state,
             self.clock.clone(),
             self.ids.clone(),
+            self.gate.clone(),
         ))
     }
 
@@ -375,6 +444,7 @@ impl SessionRepo for SqliteSessionRepo {
             state,
             self.clock.clone(),
             self.ids.clone(),
+            self.gate.clone(),
         ))
     }
 }
@@ -556,5 +626,127 @@ mod tests {
         .await
         .unwrap();
         assert!(repo.list().await.unwrap().is_empty());
+    }
+
+    #[derive(Default)]
+    struct ReviewGatedClock {
+        armed: std::sync::atomic::AtomicBool,
+        reached: std::sync::Mutex<usize>,
+        changed: std::sync::Condvar,
+    }
+    impl Clock for ReviewGatedClock {
+        fn now_ms(&self) -> i64 {
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst) {
+                let mut reached = self.reached.lock().unwrap();
+                *reached += 1;
+                self.changed.notify_all();
+                if *reached < 2 {
+                    // A serialized implementation may hold its transaction while
+                    // stamping, so bound this gate instead of deadlocking it.
+                    let _ = self
+                        .changed
+                        .wait_timeout_while(reached, std::time::Duration::from_secs(2), |count| {
+                            *count < 2
+                        })
+                        .unwrap();
+                }
+            }
+            1
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_sqlite_two_handles_must_preserve_both_successful_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = Arc::new(ReviewGatedClock::default());
+        let repo = SqliteSessionRepo::with_clock_ids(
+            dir.path().join("review.sqlite"),
+            clock.clone(),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .unwrap();
+        let first = repo
+            .create(&SessionCreateOptions {
+                id: Some("review".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        let second = repo.open(&first.metadata()).await.unwrap();
+        let metadata = first.metadata();
+        clock.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let append = |storage: SqliteSessionStorage, id: &'static str| {
+            tokio::spawn(async move {
+                storage
+                    .append_entry(
+                        ProvisionedEntry {
+                            id: id.into(),
+                            kind: ProvisionedKind::Message {
+                                message: AgentMessage::from(rpi_ai::types::UserMessage::new(id, 0)),
+                                terminate: None,
+                            },
+                        },
+                        "main",
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+        let left = append(first, "writer-one");
+        let right = append(second, "writer-two");
+        let (a, b) = tokio::join!(left, right);
+        let (a, b) = (a.unwrap(), b.unwrap());
+        clock
+            .armed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let reloaded = repo.open(&metadata).await.unwrap();
+        let all = reloaded.find_entries(&EntryQuery::default()).await.unwrap();
+        eprintln!(
+            "review SQLite concurrent handles: successful_seqs=({}, {}), reopened_entry_ids={:?}",
+            a.seq(),
+            b.seq(),
+            all.iter().map(Entry::id).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            all.len(),
+            2,
+            "both appends returned success, but one whole-state snapshot overwrote the other"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_sqlite_failed_persist_rolls_back_memory_and_disk() {
+        let (repo, _dir) = repo();
+        let session = repo
+            .create(&SessionCreateOptions {
+                id: Some("rollback".into()),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        session
+            .db
+            .lock()
+            .unwrap()
+            .execute_batch("CREATE TRIGGER reject_session_update BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'review rejection'); END;")
+            .unwrap();
+        let result = session
+            .append_entry(
+                ProvisionedEntry {
+                    id: "rejected".into(),
+                    kind: ProvisionedKind::Message {
+                        message: AgentMessage::from(rpi_ai::types::UserMessage::new("rejected", 1)),
+                        terminate: None,
+                    },
+                },
+                "main",
+            )
+            .await;
+        assert!(result.is_err());
+        assert!(session.get_entry("rejected").await.unwrap().is_none());
+        let reopened = repo.open(&session.metadata()).await.unwrap();
+        assert!(reopened.get_entry("rejected").await.unwrap().is_none());
     }
 }

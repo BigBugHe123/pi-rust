@@ -451,6 +451,20 @@ impl SessionState {
         Ok(open)
     }
 
+    pub(crate) fn has_open_operation_except(
+        &self,
+        lane: &str,
+        except_run_id: Option<&str>,
+    ) -> bool {
+        self.open_operations_by_lane
+            .get(lane)
+            .map(|open| {
+                open.values()
+                    .any(|started| Some(started.base.id.as_str()) != except_run_id)
+            })
+            .unwrap_or(false)
+    }
+
     pub fn get_log(&self, options: &LogOptions) -> SessionResult<Vec<LogItem>> {
         validate_limit(options.limit)?;
         let mut results = Vec::new();
