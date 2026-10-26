@@ -11,6 +11,22 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.9.3](https://github.com/bigfish1913/pi-rust/compare/v0.9.2...v0.9.3) - 2026-10-26
+
+### Added
+
+- *(tools)* add truncate_file to the FileSystem trait
+
+### Fixed
+
+- *(tui)* give every transcript block the same trailing spacer
+- *(tui)* highlight fullscreen mouse selections and extract at the live width
+- *(harness)* cut back a failed append before the session can retry
+
+### Other
+
+- keep the workspace buildable on the declared Rust 1.78 MSRV ([#112](https://github.com/bigfish1913/pi-rust/pull/112))
+
 ## [0.9.2](https://github.com/bigfish1913/pi-rust/compare/v0.9.1...v0.9.2) - 2026-10-25
 
 ### Fixed
