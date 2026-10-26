@@ -330,9 +330,6 @@ pub(super) struct TuiState {
     /// `set_pending_queue` skip redundant rebuilds + frame requests when the
     /// polled queue is unchanged.
     pub(super) pending_snapshot: std::sync::Mutex<rpi_harness::agent_harness::QueuedMessages>,
-    /// Fullscreen selection tracking for auto-copy.
-    pub(super) selection_start: std::sync::Mutex<Option<(u16, u16)>>,
-    pub(super) selection_end: std::sync::Mutex<Option<(u16, u16)>>,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS

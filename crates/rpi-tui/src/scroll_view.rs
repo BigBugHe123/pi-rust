@@ -190,6 +190,29 @@ impl ScrollView {
         self.options.primary
     }
 
+    /// Whether two scroll views share the same scroll state.
+    ///
+    /// Layout passes hand out fresh `ScrollView` clones (each with its own
+    /// `Arc`), so pointer identity cannot correlate a frame's boxes with the
+    /// view the host created. The state `Arc` is the stable identity.
+    pub fn same_state(&self, other: &ScrollView) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// The cached content rows the viewport was last rendered from.
+    ///
+    /// Empty when nothing was rendered yet or the cache was invalidated.
+    pub fn content_lines(&self, width: usize) -> Option<Vec<String>> {
+        let content_width = self.get_content_width(width);
+        let cache = self.render_cache.lock().ok()?;
+        let cache = cache.as_ref()?;
+        if cache.content_width != content_width {
+            return None;
+        }
+        let height = cache.document.len();
+        Some(cache.document.lines(0, height))
+    }
+
     /// Check if scrollbar is visible.
     pub fn is_scrollbar_visible(&self) -> bool {
         match self.options.scrollbar {

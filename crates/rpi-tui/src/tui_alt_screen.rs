@@ -171,6 +171,8 @@ pub struct TuiAltScreen {
     /// The scheduler thread, joined by [`TuiAltScreen::stop`] so a parked frame
     /// cannot repaint the terminal after shutdown.
     scheduler_thread: Mutex<Option<JoinHandle<()>>>,
+    /// Fullscreen text selection (anchor/focus in content coordinates).
+    selection: crate::selection::SelectionState,
 }
 
 impl TuiAltScreen {
@@ -213,6 +215,7 @@ impl TuiAltScreen {
             scheduler: Arc::new(RenderScheduler::new()),
             scheduler_started: AtomicBool::new(false),
             scheduler_thread: Mutex::new(None),
+            selection: crate::selection::SelectionState::new(),
         }
     }
 
@@ -446,6 +449,55 @@ impl TuiAltScreen {
         }
         self.scroll_to_bottom();
         true
+    }
+
+    /// Feed a left-button mouse event to the fullscreen selection tracker.
+    ///
+    /// Must be called before the host interprets the event itself (the host
+    /// checks overlays/indicator first, then this, then wheel scrolling).
+    /// Returns true when the selection changed and a re-render was requested.
+    pub fn handle_selection_mouse_event(&self, event: &crossterm::event::MouseEvent) -> bool {
+        if self.uses_main_screen() || self.has_overlay() {
+            return false;
+        }
+        let Some(frame) = self.current_frame.lock().ok().and_then(|f| f.clone()) else {
+            return false;
+        };
+        let (columns, rows) = {
+            let Ok(terminal) = self.terminal.lock() else {
+                return false;
+            };
+            (terminal.info().columns, terminal.info().rows)
+        };
+        let changed = self
+            .selection
+            .handle_mouse_event(event, &frame, rows, columns);
+        if changed {
+            self.request_render_reusing_scroll_content();
+        }
+        changed
+    }
+
+    /// The selected text, extracted from the scroll view's cached content
+    /// rows (or the composited screen for selections outside any scroll
+    /// view). None when no real drag has produced a non-empty selection.
+    pub fn selection_text(&self) -> Option<String> {
+        let frame = self.current_frame.lock().ok().and_then(|f| f.clone())?;
+        if !self.selection.dragged() {
+            return None;
+        }
+        crate::selection::extract_selection_text(&self.selection, &frame)
+    }
+
+    /// Whether the last completed selection press was a real drag.
+    pub fn selection_dragged(&self) -> bool {
+        self.selection.dragged()
+    }
+
+    /// Drop any selection (e.g. when an overlay opens or the host takes the
+    /// mouse for something else).
+    pub fn clear_selection(&self) {
+        self.selection.clear();
     }
 
     /// Scroll by the given number of lines.
@@ -967,6 +1019,11 @@ impl TuiAltScreen {
         for line in &mut visible {
             *line = line.replace(CURSOR_MARKER, "");
         }
+
+        // Reverse-video the selected span last, exactly where upstream applies
+        // `applySelection`: after overlays so selection stays visible behind a
+        // dialog, before the diff so the highlight reaches the terminal.
+        crate::selection::apply_selection_highlight(&mut visible, &self.selection, &frame);
 
         // Check for full redraw
         let previous = self

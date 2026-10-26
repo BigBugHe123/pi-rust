@@ -52,6 +52,9 @@ mod pet;
 mod side_questions;
 
 #[cfg(test)]
+mod selection_probe;
+
+#[cfg(test)]
 mod tests;
 
 mod state;
@@ -1251,8 +1254,6 @@ pub async fn interactive_tui(
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
 
     let _compaction_watcher = harness.watch({
@@ -1767,8 +1768,7 @@ pub async fn interactive_tui(
                     continue;
                 }
                 if tui_for_key.handle_scroll_to_end_indicator_mouse_event(&m) {
-                    *state_for_key.selection_start.lock().unwrap() = None;
-                    *state_for_key.selection_end.lock().unwrap() = None;
+                    tui_for_key.clear_selection();
                     continue;
                 }
                 use crossterm::event::MouseEventKind;
@@ -1800,55 +1800,33 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        // Start selection tracking. `selection_end` doubles as the
-                        // "a real drag happened" marker: a plain tap never sets
-                        // it, so it can never overwrite the clipboard.
-                        *state_for_key.selection_start.lock().unwrap() = Some((m.column, m.row));
-                        *state_for_key.selection_end.lock().unwrap() = None;
+                        // Begin fullscreen text selection (anchor + highlight).
+                        // The TUI owns the anchor/focus state in content
+                        // coordinates; a plain click later collapses it and
+                        // never touches the clipboard.
+                        tui_for_key.handle_selection_mouse_event(&m);
                     }
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                        // Motion with the button held = a genuine selection drag.
-                        // (Terminals only report this with button-event mouse
-                        // tracking, which `ProcessTerminal` enables.)
-                        if state_for_key.selection_start.lock().unwrap().is_some() {
-                            *state_for_key.selection_end.lock().unwrap() = Some((m.column, m.row));
-                        }
+                        // Extend the selection; the re-render paints the
+                        // reverse-video highlight as the pointer moves.
+                        tui_for_key.handle_selection_mouse_event(&m);
                     }
                     MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                        // End selection and auto-copy if enabled
-                        if let Some(start) = *state_for_key.selection_start.lock().unwrap() {
-                            let end = (m.column, m.row);
-
-                            // Only auto-copy when the pointer actually MOVED with
-                            // the button held (`Drag` set `selection_end`). A plain
-                            // click/tap — even one whose Down/Up cells differ by a
-                            // pixel over RDP — must not touch the clipboard: it used
-                            // to fire `extract_selected_text`, which copies whatever
-                            // rendered TUI line sat under the pointer, silently
-                            // clobbering the user's real clipboard so the next paste
-                            // returned that stale text.
-                            let is_drag = state_for_key.selection_end.lock().unwrap().is_some();
-                            *state_for_key.selection_end.lock().unwrap() = Some(end);
-
-                            // Check if auto-copy is enabled
+                        // Finish the selection and auto-copy when enabled.
+                        tui_for_key.handle_selection_mouse_event(&m);
+                        if tui_for_key.selection_dragged() {
                             let auto_copy = crate::settings::load_settings()
                                 .ok()
                                 .and_then(|s| s.fullscreen_copy_on_select)
                                 .unwrap_or(true);
-
-                            if auto_copy && is_drag {
-                                // Try to extract selected text from chat container
-                                if let Some(selected_text) =
-                                    extract_selected_text(&state_for_key.chat_container, start, end)
-                                {
+                            if auto_copy {
+                                if let Some(selected_text) = tui_for_key.selection_text() {
                                     if !selected_text.trim().is_empty() {
                                         let _ = copy_to_clipboard(&selected_text);
                                     }
                                 }
                             }
                         }
-                        *state_for_key.selection_start.lock().unwrap() = None;
-                        *state_for_key.selection_end.lock().unwrap() = None;
                     }
                     _ => {}
                 }
