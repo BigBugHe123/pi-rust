@@ -17,9 +17,10 @@ use crate::types::{
     AssistantMessage, Content, ImageContent, InputModality, Message, ThinkingLevel, Tool,
     ToolResultMessage,
 };
+use serde::ser::{SerializeSeq, SerializeStruct, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -207,6 +208,271 @@ pub struct AnthropicMetadata {
     pub user_id: String,
 }
 
+#[derive(Serialize)]
+struct CanonicalTextBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+}
+
+struct CanonicalTextMessages<'a> {
+    messages: &'a [Message],
+    cache_control: Option<&'a CacheControlEphemeral>,
+}
+
+impl Serialize for CanonicalTextMessages<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let last_emitted = self.cache_control.and_then(|_| {
+            self.messages
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(index, message)| {
+                    let emits = match message {
+                        Message::User(user) => matches!(
+                            &user.content,
+                            crate::types::UserContent::Text(text) if !text.trim().is_empty()
+                        ),
+                        Message::Assistant(assistant) => assistant.content.iter().any(|content| {
+                            matches!(
+                                content,
+                                Content::Text(text) if !text.text.trim().is_empty()
+                            )
+                        }),
+                        Message::ToolResult(_) => false,
+                    };
+                    emits.then_some(index)
+                })
+        });
+        let mut sequence = serializer.serialize_seq(None)?;
+        for (index, message) in self.messages.iter().enumerate() {
+            match message {
+                Message::User(user) => {
+                    let crate::types::UserContent::Text(text) = &user.content else {
+                        unreachable!("canonical text history contains a non-text user message");
+                    };
+                    if !text.trim().is_empty() {
+                        if last_emitted == Some(index) && self.cache_control.is_some() {
+                            sequence.serialize_element(&CanonicalTextCachedUser {
+                                role: "user",
+                                text,
+                                cache_control: self.cache_control.expect("checked above"),
+                            })?;
+                        } else {
+                            sequence.serialize_element(&CanonicalTextUser {
+                                role: "user",
+                                content: text,
+                            })?;
+                        }
+                    }
+                }
+                Message::Assistant(assistant) => {
+                    if assistant.content.iter().any(
+                        |content| matches!(content, Content::Text(text) if !text.text.trim().is_empty()),
+                    ) {
+                        sequence.serialize_element(&CanonicalTextAssistant(assistant))?;
+                    }
+                }
+                Message::ToolResult(_) => {
+                    unreachable!("canonical text history contains a tool result");
+                }
+            }
+        }
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalTextUser<'a> {
+    role: &'static str,
+    content: &'a str,
+}
+
+struct CanonicalTextCachedUser<'a> {
+    role: &'static str,
+    text: &'a str,
+    cache_control: &'a CacheControlEphemeral,
+}
+
+impl Serialize for CanonicalTextCachedUser<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AnthropicMessage", 2)?;
+        state.serialize_field("role", self.role)?;
+        state.serialize_field(
+            "content",
+            &CanonicalTextCachedUserBlocks {
+                text: self.text,
+                cache_control: self.cache_control,
+            },
+        )?;
+        state.end()
+    }
+}
+
+struct CanonicalTextCachedUserBlocks<'a> {
+    text: &'a str,
+    cache_control: &'a CacheControlEphemeral,
+}
+
+impl Serialize for CanonicalTextCachedUserBlocks<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(Some(1))?;
+        sequence.serialize_element(&CanonicalTextCachedBlock {
+            kind: "text",
+            text: self.text,
+            cache_control: self.cache_control,
+        })?;
+        sequence.end()
+    }
+}
+
+#[derive(Serialize)]
+struct CanonicalTextCachedBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: &'a CacheControlEphemeral,
+}
+
+struct CanonicalTextAssistant<'a>(&'a AssistantMessage);
+
+impl Serialize for CanonicalTextAssistant<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut state = serializer.serialize_struct("AnthropicMessage", 2)?;
+        state.serialize_field("role", "assistant")?;
+        state.serialize_field("content", &CanonicalTextAssistantBlocks(&self.0.content))?;
+        state.end()
+    }
+}
+
+struct CanonicalTextAssistantBlocks<'a>(&'a [Content]);
+
+impl Serialize for CanonicalTextAssistantBlocks<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut sequence = serializer.serialize_seq(None)?;
+        for content in self.0 {
+            let Content::Text(text) = content else {
+                unreachable!("canonical text history contains a non-text assistant block");
+            };
+            if !text.text.trim().is_empty() {
+                sequence.serialize_element(&CanonicalTextBlock {
+                    kind: "text",
+                    text: &text.text,
+                })?;
+            }
+        }
+        sequence.end()
+    }
+}
+
+/// Reserve enough space for the long text-history portion of a canonical body.
+/// The estimate deliberately excludes tool/schema bytes; underestimation only
+/// causes normal Vec growth and never changes the serialized output.
+fn canonical_text_body_capacity(messages: &[Message]) -> usize {
+    let text_bytes = messages.iter().fold(0usize, |total, message| {
+        let message_bytes = match message {
+            Message::User(user) => match &user.content {
+                crate::types::UserContent::Text(text) => text.len(),
+                crate::types::UserContent::Blocks(_) => 0,
+            },
+            Message::Assistant(assistant) => assistant
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    Content::Text(text) => Some(text.text.len()),
+                    _ => None,
+                })
+                .sum(),
+            Message::ToolResult(_) => 0,
+        };
+        total.saturating_add(message_bytes)
+    });
+    text_bytes
+        .saturating_add(messages.len().saturating_mul(64))
+        .saturating_add(4096)
+}
+
+struct CanonicalTextRequest<'a> {
+    request: &'a AnthropicRequest,
+    messages: &'a [Message],
+    cache_control: Option<&'a CacheControlEphemeral>,
+}
+
+impl Serialize for CanonicalTextRequest<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let request = self.request;
+        let mut state = serializer.serialize_struct("AnthropicRequest", 10)?;
+        state.serialize_field("model", &request.model)?;
+        state.serialize_field(
+            "messages",
+            &CanonicalTextMessages {
+                messages: self.messages,
+                cache_control: self.cache_control,
+            },
+        )?;
+        state.serialize_field("max_tokens", &request.max_tokens)?;
+        state.serialize_field("stream", &request.stream)?;
+        if let Some(value) = &request.system {
+            state.serialize_field("system", value)?;
+        }
+        if let Some(value) = &request.temperature {
+            state.serialize_field("temperature", value)?;
+        }
+        if let Some(value) = &request.tools {
+            state.serialize_field("tools", value)?;
+        }
+        if let Some(value) = &request.thinking {
+            state.serialize_field("thinking", value)?;
+        }
+        if let Some(value) = &request.output_config {
+            state.serialize_field("output_config", value)?;
+        }
+        if let Some(value) = &request.metadata {
+            state.serialize_field("metadata", value)?;
+        }
+        state.end()
+    }
+}
+
+/// Return the number of emitted wire messages when the history can use the
+/// borrowed text serializer. This deliberately accepts only the simplest
+/// canonical subset; all other histories use the existing converter.
+fn canonical_text_message_count(messages: &[Message], model: &Model) -> Option<usize> {
+    let mut count = 0;
+    for message in messages {
+        match message {
+            Message::User(user) => {
+                let crate::types::UserContent::Text(text) = &user.content else {
+                    return None;
+                };
+                count += usize::from(!text.trim().is_empty());
+            }
+            Message::Assistant(assistant) => {
+                if !is_same_model(assistant, model)
+                    || matches!(
+                        assistant.stop_reason,
+                        crate::types::StopReason::Error | crate::types::StopReason::Aborted
+                    )
+                    || assistant
+                        .content
+                        .iter()
+                        .any(|content| !matches!(content, Content::Text(_)))
+                {
+                    return None;
+                }
+                count += usize::from(
+                    assistant
+                        .content
+                        .iter()
+                        .any(|content| matches!(content, Content::Text(text) if !text.text.trim().is_empty())),
+                );
+            }
+            Message::ToolResult(_) => return None,
+        }
+    }
+    Some(count)
+}
+
 /// The split between immediately-served tools and transcript-loaded deferred
 /// tools. Mirrors `splitDeferredTools`'s return shape.
 #[derive(Debug, Clone, Default)]
@@ -219,12 +485,20 @@ pub struct ToolPlacement {
 }
 
 static BUILD_PARAMS_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+static BUILD_PARAMS_DIAGNOSTICS_DETAIL: OnceLock<bool> = OnceLock::new();
 
 fn build_params_diagnostics_enabled() -> bool {
     *BUILD_PARAMS_DIAGNOSTICS.get_or_init(|| {
         std::env::var_os("RPI_PROVIDER_DIAGNOSTICS")
             .or_else(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS"))
             .is_some_and(|value| value != "0")
+    })
+}
+
+fn build_params_diagnostics_detail_enabled() -> bool {
+    *BUILD_PARAMS_DIAGNOSTICS_DETAIL.get_or_init(|| {
+        build_params_diagnostics_enabled()
+            && std::env::var_os("RPI_PROVIDER_DIAGNOSTICS_DETAIL").is_some_and(|value| value != "0")
     })
 }
 
@@ -243,6 +517,8 @@ pub struct BuildParamsDiagnostics {
     pub deferred_tools_ns: u64,
     pub convert_messages_ns: u64,
     pub convert_tools_ns: u64,
+    pub context_tokens_ns: u64,
+    pub preencoded_json_ns: u64,
     pub total_ns: u64,
 }
 
@@ -328,6 +604,92 @@ fn request_messages<'a>(messages: &'a [Message], model: &Model) -> std::borrow::
         std::borrow::Cow::Borrowed(messages)
     } else {
         std::borrow::Cow::Owned(transform_messages(messages, model))
+    }
+}
+
+/// Tracks whether a message history is already in the canonical form expected
+/// by the Anthropic wire converter. This is deliberately kept separate from
+/// `request_messages`: the checked converter updates it while producing wire
+/// messages, so canonical histories do not need a second full scan.
+struct CanonicalHistory<'model, 'message> {
+    model: &'model Model,
+    supports_images: bool,
+    pending: HashSet<&'message str>,
+    canonical: bool,
+}
+
+impl<'model, 'message> CanonicalHistory<'model, 'message> {
+    fn new(model: &'model Model) -> Self {
+        Self {
+            model,
+            supports_images: model.input.contains(&InputModality::Image),
+            pending: HashSet::new(),
+            canonical: true,
+        }
+    }
+
+    fn observe_user(&mut self, user: &crate::types::UserMessage) {
+        if self.canonical
+            && (!self.pending.is_empty()
+                || (!self.supports_images
+                    && matches!(&user.content, crate::types::UserContent::Blocks(blocks)
+                        if blocks.iter().any(|block| matches!(block, Content::Image(_))))))
+        {
+            self.canonical = false;
+        }
+    }
+
+    fn observe_tool_result(&mut self, result: &ToolResultMessage) {
+        if self.canonical {
+            self.pending.remove(result.tool_call_id.as_str());
+            if !self.supports_images
+                && result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, Content::Image(_)))
+            {
+                self.canonical = false;
+            }
+        }
+    }
+
+    fn observe_assistant(&mut self, assistant: &'message AssistantMessage) {
+        if !self.canonical {
+            return;
+        }
+        if !self.pending.is_empty()
+            || !is_same_model(assistant, self.model)
+            || matches!(
+                assistant.stop_reason,
+                crate::types::StopReason::Error | crate::types::StopReason::Aborted
+            )
+        {
+            self.canonical = false;
+            return;
+        }
+        for block in &assistant.content {
+            match block {
+                Content::Thinking(thinking)
+                    if !thinking.redacted
+                        && thinking.thinking.trim().is_empty()
+                        && thinking
+                            .thinking_signature
+                            .as_deref()
+                            .is_none_or(|signature| signature.trim().is_empty()) =>
+                {
+                    self.canonical = false;
+                    return;
+                }
+                Content::ToolCall(call) => {
+                    self.pending.insert(call.id.as_str());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn is_canonical(&self) -> bool {
+        self.canonical && self.pending.is_empty()
     }
 }
 
@@ -577,6 +939,20 @@ pub fn split_deferred_tools(
     enabled: bool,
     normalize_name: &dyn Fn(&str) -> String,
 ) -> ToolPlacement {
+    // With references disabled, zero or one tool cannot be deduplicated or
+    // reordered by the normalized-name map. Preserve the normalizer callback
+    // invocation for the single-tool case because callers may make it stateful.
+    if !enabled && tools.len() <= 1 {
+        if let Some(tool) = tools.first() {
+            let _ = normalize_name(&tool.name);
+        }
+        return ToolPlacement {
+            immediate: tools.to_vec(),
+            deferred: Vec::new(),
+            deferred_names: BTreeSet::new(),
+        };
+    }
+
     // Dedupe tools by normalized name (last wins, matching Map semantics).
     let mut unique: std::collections::BTreeMap<String, Tool> = std::collections::BTreeMap::new();
     for tool in tools {
@@ -792,6 +1168,46 @@ pub fn convert_messages(
     deferred_tool_names: &BTreeSet<String>,
     normalize_name: &dyn Fn(&str) -> String,
 ) -> Vec<AnthropicMessage> {
+    convert_messages_impl(
+        messages,
+        cache_control,
+        allow_empty_signature,
+        deferred_tool_names,
+        normalize_name,
+        None,
+    )
+}
+
+/// Convert messages while checking canonicality in the same traversal. The
+/// returned wire messages are usable only when `canonical` is true; callers
+/// must fall back to `transform_messages` for non-canonical histories.
+fn convert_messages_checked(
+    messages: &[Message],
+    cache_control: Option<&CacheControlEphemeral>,
+    allow_empty_signature: bool,
+    normalize_name: &dyn Fn(&str) -> String,
+    model: &Model,
+) -> (Vec<AnthropicMessage>, bool) {
+    let mut history = CanonicalHistory::new(model);
+    let wire = convert_messages_impl(
+        messages,
+        cache_control,
+        allow_empty_signature,
+        &BTreeSet::new(),
+        normalize_name,
+        Some(&mut history),
+    );
+    (wire, history.is_canonical())
+}
+
+fn convert_messages_impl<'message>(
+    messages: &'message [Message],
+    cache_control: Option<&CacheControlEphemeral>,
+    allow_empty_signature: bool,
+    deferred_tool_names: &BTreeSet<String>,
+    normalize_name: &dyn Fn(&str) -> String,
+    mut canonical: Option<&mut CanonicalHistory<'_, 'message>>,
+) -> Vec<AnthropicMessage> {
     let mut params: Vec<AnthropicMessage> = Vec::with_capacity(messages.len());
     let mut loaded_tool_names: BTreeSet<String> = BTreeSet::new();
     let n = messages.len();
@@ -800,6 +1216,9 @@ pub fn convert_messages(
         let msg = &messages[i];
         match msg {
             Message::User(u) => {
+                if let Some(history) = canonical.as_deref_mut() {
+                    history.observe_user(u);
+                }
                 match &u.content {
                     crate::types::UserContent::Text(s) => {
                         if !s.trim().is_empty() {
@@ -844,6 +1263,9 @@ pub fn convert_messages(
             }
             Message::Assistant(a) => {
                 let a = a.as_ref();
+                if let Some(history) = canonical.as_deref_mut() {
+                    history.observe_assistant(a);
+                }
                 let mut wire_blocks: Vec<AnthropicContentBlock> = Vec::new();
                 for block in &a.content {
                     match block {
@@ -921,6 +1343,9 @@ pub fn convert_messages(
                         Message::ToolResult(tr) => tr.as_ref(),
                         _ => break,
                     };
+                    if let Some(history) = canonical.as_deref_mut() {
+                        history.observe_tool_result(tr);
+                    }
                     let (tool_result, siblings) = convert_tool_result(
                         tr,
                         deferred_tool_names,
@@ -1336,6 +1761,10 @@ pub struct BuiltParams {
     pub cache_control: CacheControlOption,
     /// The `anthropic-beta` header value (comma-joined), when any betas apply.
     pub beta_header: Option<String>,
+    /// Pre-encoded body for the borrowed canonical text fast path. The normal
+    /// owned request path leaves this unset.
+    pub(crate) preencoded_body: Option<Vec<u8>>,
+    pub(crate) preencoded_message_count: usize,
     pub diagnostics: BuildParamsDiagnostics,
 }
 
@@ -1353,6 +1782,29 @@ pub fn build_params(
     is_oauth: bool,
     opts: &SimpleStreamOptions,
 ) -> BuiltParams {
+    build_params_internal(model, ctx, is_oauth, opts, false)
+}
+
+/// Build params while allowing the provider to use the borrowed canonical text
+/// serializer. This is kept separate from the public owned projection used by
+/// tests and callers that inspect `BuiltParams.request`.
+pub(crate) fn build_params_prepared(
+    model: &Model,
+    ctx: &crate::types::Context,
+    is_oauth: bool,
+    opts: &SimpleStreamOptions,
+    allow_preencoded_canonical_text: bool,
+) -> BuiltParams {
+    build_params_internal(model, ctx, is_oauth, opts, allow_preencoded_canonical_text)
+}
+
+fn build_params_internal(
+    model: &Model,
+    ctx: &crate::types::Context,
+    is_oauth: bool,
+    opts: &SimpleStreamOptions,
+    allow_preencoded_canonical_text: bool,
+) -> BuiltParams {
     let diagnostics_enabled = build_params_diagnostics_enabled();
     let total_started = diagnostics_enabled.then(Instant::now);
     let compat = get_anthropic_compat(model);
@@ -1360,7 +1812,11 @@ pub fn build_params(
     let cache_ref = cache_control_opt.cache_control.as_ref();
 
     let phase_started = diagnostics_enabled.then(Instant::now);
-    let transformed = request_messages(&ctx.messages, model);
+    let transformed = if compat.tool_references() {
+        request_messages(&ctx.messages, model)
+    } else {
+        std::borrow::Cow::Borrowed(ctx.messages.as_slice())
+    };
     let normalize_ns = elapsed_ns(phase_started);
 
     let phase_started = diagnostics_enabled.then(Instant::now);
@@ -1380,20 +1836,55 @@ pub fn build_params(
     }
 
     let phase_started = diagnostics_enabled.then(Instant::now);
-    let messages = convert_messages(
-        &transformed,
-        cache_ref,
-        compat.empty_signature(),
-        &deferred_names,
-        &|name: &str| name.to_string(),
-    );
+    let direct_text_message_count = (allow_preencoded_canonical_text
+        && !compat.tool_references()
+        && !build_params_diagnostics_detail_enabled()
+        // serde_json rejects non-finite f64 values. The owned request path
+        // reports that encoding error; do not turn it into a fast-path panic.
+        && opts.temperature.map_or(true, f64::is_finite))
+    .then(|| canonical_text_message_count(&ctx.messages, model))
+    .flatten();
+    let direct_text = direct_text_message_count.is_some();
+    let messages = if direct_text {
+        Vec::new()
+    } else if compat.tool_references() {
+        convert_messages(
+            &transformed,
+            cache_ref,
+            compat.empty_signature(),
+            &deferred_names,
+            &|name: &str| name.to_string(),
+        )
+    } else {
+        let (wire, canonical) = convert_messages_checked(
+            &ctx.messages,
+            cache_ref,
+            compat.empty_signature(),
+            &|name: &str| name.to_string(),
+            model,
+        );
+        if canonical {
+            wire
+        } else {
+            let transformed = transform_messages(&ctx.messages, model);
+            convert_messages(
+                &transformed,
+                cache_ref,
+                compat.empty_signature(),
+                &BTreeSet::new(),
+                &|name: &str| name.to_string(),
+            )
+        }
+    };
     let convert_messages_ns = elapsed_ns(phase_started);
 
     // max_tokens: opts.max_tokens wins; else model.max_tokens. Thinking may
     // inflate this (handled below for budget-based models).
     let base_max_tokens = opts.max_tokens.unwrap_or(model.max_tokens);
+    let context_tokens_started = diagnostics_enabled.then(Instant::now);
     let context_tokens = (model.context_window != 0)
         .then(|| estimate_context_tokens(&ctx.messages, ctx.system_prompt.as_deref()));
+    let context_tokens_ns = elapsed_ns(context_tokens_started);
     let mut max_tokens =
         clamp_max_tokens_to_context_with_estimate(model, context_tokens, base_max_tokens);
 
@@ -1527,16 +2018,35 @@ pub fn build_params(
         output_config,
         metadata,
     };
+    let preencoded_started = diagnostics_enabled.then(Instant::now);
+    let preencoded_body = direct_text.then(|| {
+        let mut body = Vec::with_capacity(canonical_text_body_capacity(&ctx.messages));
+        serde_json::to_writer(
+            &mut body,
+            &CanonicalTextRequest {
+                request: &request,
+                messages: &ctx.messages,
+                cache_control: cache_ref,
+            },
+        )
+        .expect("canonical text request serialization cannot fail");
+        body
+    });
+    let preencoded_json_ns = elapsed_ns(preencoded_started);
 
     BuiltParams {
         request,
         cache_control: cache_control_opt,
         beta_header,
+        preencoded_body,
+        preencoded_message_count: direct_text_message_count.unwrap_or_default(),
         diagnostics: BuildParamsDiagnostics {
             normalize_ns,
             deferred_tools_ns,
             convert_messages_ns,
             convert_tools_ns,
+            context_tokens_ns,
+            preencoded_json_ns,
             total_ns: elapsed_ns(total_started),
         },
     }
@@ -1638,6 +2148,102 @@ mod tests {
     }
 
     #[test]
+    fn checked_canonical_conversion_matches_the_legacy_wire_projection() {
+        let model = model_with_compat(Default::default());
+        let mut assistant =
+            AssistantMessage::empty(model.api.clone(), &model.provider, &model.id, 0);
+        assistant.content = vec![
+            Content::thinking("reasoning"),
+            Content::tool_call("call", "echo", json!({"text":"hello"})),
+        ];
+        let result = ToolResultMessage {
+            role: crate::types::ToolResultRole,
+            tool_call_id: "call".into(),
+            tool_name: "echo".into(),
+            content: vec![Content::text("hello")],
+            details: None,
+            usage: None,
+            added_tool_names: vec![],
+            is_error: false,
+            timestamp: 0,
+        };
+        let messages = vec![
+            UserMessage::new("prompt", 0).into(),
+            Message::Assistant(Box::new(assistant)),
+            Message::ToolResult(Box::new(result)),
+        ];
+        let expected_messages = request_messages(&messages, &model);
+        let expected = convert_messages(
+            expected_messages.as_ref(),
+            None,
+            false,
+            &BTreeSet::new(),
+            &|name: &str| name.to_string(),
+        );
+        let (actual, canonical) = convert_messages_checked(
+            &messages,
+            None,
+            false,
+            &|name: &str| name.to_string(),
+            &model,
+        );
+        assert!(canonical);
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn checked_conversion_accepts_consecutive_tool_results() {
+        let model = model_with_compat(Default::default());
+        let mut assistant =
+            AssistantMessage::empty(model.api.clone(), &model.provider, &model.id, 0);
+        assistant.content = vec![
+            Content::tool_call("one", "echo", json!({})),
+            Content::tool_call("two", "echo", json!({})),
+        ];
+        let result = |id: &str| {
+            Message::ToolResult(Box::new(ToolResultMessage {
+                role: crate::types::ToolResultRole,
+                tool_call_id: id.into(),
+                tool_name: "echo".into(),
+                content: vec![Content::text("ok")],
+                details: None,
+                usage: None,
+                added_tool_names: vec![],
+                is_error: false,
+                timestamp: 0,
+            }))
+        };
+        let messages = vec![
+            UserMessage::new("prompt", 0).into(),
+            Message::Assistant(Box::new(assistant)),
+            result("one"),
+            result("two"),
+        ];
+        let (actual, canonical) = convert_messages_checked(
+            &messages,
+            None,
+            false,
+            &|name: &str| name.to_string(),
+            &model,
+        );
+        assert!(canonical);
+        let expected_messages = request_messages(&messages, &model);
+        let expected = convert_messages(
+            expected_messages.as_ref(),
+            None,
+            false,
+            &BTreeSet::new(),
+            &|name: &str| name.to_string(),
+        );
+        assert_eq!(
+            serde_json::to_vec(&actual).unwrap(),
+            serde_json::to_vec(&expected).unwrap()
+        );
+    }
+    #[test]
     fn borrowed_request_history_matches_normalizer_on_migrations_images_and_incomplete_tools() {
         for same_model in [false, true] {
             for stop in [StopReason::Stop, StopReason::Error, StopReason::Aborted] {
@@ -1690,7 +2296,53 @@ mod tests {
                             }
                             messages.push(UserMessage::new("next", 0).into());
                             for end in 0..=messages.len() {
-                                assert_eq!(request_messages(&messages[..end], &model).as_ref(), transform_messages(&messages[..end], &model), "same={same_model}, stop={stop:?}, thinking={thinking:?}, result={result_id:?}, images={supports_images}, end={end}");
+                                let prefix = &messages[..end];
+                                let normalized = request_messages(prefix, &model);
+                                assert_eq!(
+                                    normalized.as_ref(),
+                                    transform_messages(prefix, &model),
+                                    "same={same_model}, stop={stop:?}, thinking={thinking:?}, result={result_id:?}, images={supports_images}, end={end}"
+                                );
+                                let (checked, canonical) = convert_messages_checked(
+                                    prefix,
+                                    None,
+                                    false,
+                                    &|name: &str| name.to_string(),
+                                    &model,
+                                );
+                                let expected_input = if canonical {
+                                    prefix.to_vec()
+                                } else {
+                                    transform_messages(prefix, &model)
+                                };
+                                let expected = convert_messages(
+                                    &expected_input,
+                                    None,
+                                    false,
+                                    &BTreeSet::new(),
+                                    &|name: &str| name.to_string(),
+                                );
+                                let actual = if canonical {
+                                    checked
+                                } else {
+                                    convert_messages(
+                                        &expected_input,
+                                        None,
+                                        false,
+                                        &BTreeSet::new(),
+                                        &|name: &str| name.to_string(),
+                                    )
+                                };
+                                assert_eq!(
+                                    canonical,
+                                    matches!(normalized, std::borrow::Cow::Borrowed(_)),
+                                    "canonicality mismatch: same={same_model}, stop={stop:?}, thinking={thinking:?}, result={result_id:?}, images={supports_images}, end={end}"
+                                );
+                                assert_eq!(
+                                    serde_json::to_vec(&actual).unwrap(),
+                                    serde_json::to_vec(&expected).unwrap(),
+                                    "checked wire mismatch: same={same_model}, stop={stop:?}, thinking={thinking:?}, result={result_id:?}, images={supports_images}, end={end}"
+                                );
                             }
                         }
                     }
@@ -1747,6 +2399,19 @@ mod tests {
         let tools = vec![sample_tool("a"), sample_tool("b")];
         let placement = split_deferred_tools(&[], &tools, false, &|n| n.to_string());
         assert_eq!(placement.immediate.len(), 2);
+        assert!(placement.deferred.is_empty());
+    }
+
+    #[test]
+    fn split_deferred_single_tool_preserves_normalizer_call() {
+        let calls = std::cell::Cell::new(0);
+        let tools = vec![sample_tool("a")];
+        let placement = split_deferred_tools(&[], &tools, false, &|name| {
+            calls.set(calls.get() + 1);
+            name.to_string()
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(placement.immediate.len(), 1);
         assert!(placement.deferred.is_empty());
     }
 
@@ -1953,6 +2618,130 @@ mod tests {
             }
             _ => panic!("expected toolResult"),
         }
+    }
+
+    #[test]
+    fn borrowed_text_request_is_byte_identical_to_owned_projection() {
+        let mut compat = AnthropicMessagesCompat::default();
+        compat.supports_tool_references = Some(false);
+        let model = model_with_compat(compat);
+        let mut assistant =
+            AssistantMessage::empty(model.api.clone(), &model.provider, &model.id, 0);
+        assistant.content = vec![Content::text("answer\nwith unicode 🐈")];
+        let empty_assistant =
+            AssistantMessage::empty(model.api.clone(), &model.provider, &model.id, 1);
+        let mut ctx = crate::types::Context {
+            system_prompt: Some("system\n🧪".into()),
+            messages: vec![
+                UserMessage::new("  prompt  ", 0).into(),
+                UserMessage::new("   ", 0).into(),
+                Message::Assistant(Box::new(assistant)),
+                Message::Assistant(Box::new(empty_assistant)),
+            ],
+            tools: vec![sample_tool("search")],
+        };
+        let mut opts = SimpleStreamOptions::default();
+        opts.max_tokens = Some(1234);
+        opts.temperature = Some(0.25);
+        opts.metadata = Some(std::collections::BTreeMap::from([(
+            "user_id".into(),
+            "test-user".into(),
+        )]));
+
+        let legacy = build_params(&model, &ctx, false, &opts);
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        let legacy_bytes = serde_json::to_vec(&legacy.request).unwrap();
+        let prepared_bytes = prepared.preencoded_body.as_ref().unwrap();
+
+        assert_eq!(prepared.preencoded_message_count, 2);
+        assert_eq!(prepared_bytes, &legacy_bytes);
+        assert_eq!(
+            legacy.request.messages.len(),
+            prepared.preencoded_message_count
+        );
+        ctx.messages.push(UserMessage::new("tail", 0).into());
+        assert_ne!(
+            prepared_bytes,
+            &serde_json::to_vec(&build_params(&model, &ctx, false, &opts).request).unwrap()
+        );
+    }
+
+    #[test]
+    fn borrowed_text_request_preserves_cache_control_on_final_user() {
+        let mut compat = AnthropicMessagesCompat::default();
+        compat.supports_tool_references = Some(false);
+        let model = model_with_compat(compat);
+        let ctx = crate::types::Context::new(vec![UserMessage::new("final", 0).into()]);
+        let opts = SimpleStreamOptions::default();
+
+        let legacy = build_params(&model, &ctx, false, &opts);
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        assert_eq!(
+            prepared.preencoded_body.as_ref().unwrap(),
+            &serde_json::to_vec(&legacy.request).unwrap()
+        );
+    }
+
+    #[test]
+    fn borrowed_text_request_is_byte_identical_with_thinking() {
+        let mut compat = AnthropicMessagesCompat::default();
+        compat.supports_tool_references = Some(false);
+        let mut model = model_with_compat(compat);
+        model.reasoning = true;
+        let ctx = crate::types::Context::new(vec![UserMessage::new("prompt", 0).into()]);
+        let mut opts = SimpleStreamOptions::default();
+        opts.reasoning = Some(ThinkingLevel::High);
+        opts.max_tokens = Some(4096);
+
+        let legacy = build_params(&model, &ctx, false, &opts);
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        assert_eq!(
+            prepared.preencoded_body.as_ref().unwrap(),
+            &serde_json::to_vec(&legacy.request).unwrap()
+        );
+    }
+
+    #[test]
+    fn borrowed_text_serializer_is_disabled_for_tool_references() {
+        let model = model_with_compat(AnthropicMessagesCompat::default());
+        let ctx = crate::types::Context::new(vec![UserMessage::new("prompt", 0).into()]);
+        let prepared =
+            build_params_prepared(&model, &ctx, false, &SimpleStreamOptions::default(), true);
+        assert!(prepared.preencoded_body.is_none());
+        assert_eq!(prepared.request.messages.len(), 1);
+    }
+
+    #[test]
+    fn borrowed_text_serializer_falls_back_for_non_finite_temperature() {
+        let mut compat = AnthropicMessagesCompat::default();
+        compat.supports_tool_references = Some(false);
+        let model = model_with_compat(compat);
+        let ctx = crate::types::Context::new(vec![UserMessage::new("prompt", 0).into()]);
+        let mut opts = SimpleStreamOptions::default();
+        opts.temperature = Some(f64::NAN);
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        assert!(prepared.preencoded_body.is_none());
+        assert_eq!(prepared.request.messages.len(), 1);
+    }
+
+    #[test]
+    fn borrowed_text_serializer_falls_back_for_non_text_history() {
+        let mut compat = AnthropicMessagesCompat::default();
+        compat.supports_tool_references = Some(false);
+        let model = model_with_compat(compat);
+        let mut assistant =
+            AssistantMessage::empty(model.api.clone(), &model.provider, &model.id, 0);
+        assistant.content = vec![Content::thinking("reasoning")];
+        let ctx = crate::types::Context::new(vec![Message::Assistant(Box::new(assistant))]);
+        let legacy = build_params(&model, &ctx, false, &SimpleStreamOptions::default());
+        let prepared =
+            build_params_prepared(&model, &ctx, false, &SimpleStreamOptions::default(), true);
+
+        assert!(prepared.preencoded_body.is_none());
+        assert_eq!(
+            serde_json::to_vec(&prepared.request).unwrap(),
+            serde_json::to_vec(&legacy.request).unwrap()
+        );
     }
 
     #[test]

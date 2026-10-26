@@ -460,6 +460,8 @@ struct AssistantRequestDiagnostics {
     llm_messages: usize,
     tools: usize,
     transform_ns: u64,
+    history_clone_ns: u64,
+    context_build_ns: u64,
     convert_ns: u64,
     stream_open_ns: u64,
     stream_started: Option<Instant>,
@@ -480,6 +482,8 @@ impl AssistantRequestDiagnostics {
             llm_messages: 0,
             tools,
             transform_ns: 0,
+            history_clone_ns: 0,
+            context_build_ns: 0,
             convert_ns: 0,
             stream_open_ns: 0,
             stream_started: None,
@@ -516,11 +520,13 @@ impl Drop for AssistantRequestDiagnostics {
             .map(Self::elapsed_ns)
             .unwrap_or_default();
         eprintln!(
-            "RPI_AGENT_DIAGNOSTICS phase=assistant input_messages={} llm_messages={} tools={} transform_ns={} convert_ns={} stream_open_ns={} first_event_ns={} first_poll_ns={} provider_events={} emit_calls={} emit_ns={} fold_ns={} stream_ns={} total_ns={}",
+            "RPI_AGENT_DIAGNOSTICS phase=assistant input_messages={} llm_messages={} tools={} transform_ns={} history_clone_ns={} context_build_ns={} convert_ns={} stream_open_ns={} first_event_ns={} first_poll_ns={} provider_events={} emit_calls={} emit_ns={} fold_ns={} stream_ns={} total_ns={}",
             self.input_messages,
             self.llm_messages,
             self.tools,
             self.transform_ns,
+            self.history_clone_ns,
+            self.context_build_ns,
             self.convert_ns,
             self.stream_open_ns,
             self.first_event_ns,
@@ -609,9 +615,19 @@ async fn stream_assistant_response(
     } else {
         let transform_started = diagnostics.enabled.then(Instant::now);
         let messages = if let Some(transform) = &config.transform_context {
-            transform(context.messages.clone(), config.signal.clone()).await
+            let clone_started = diagnostics.enabled.then(Instant::now);
+            let messages = context.messages.clone();
+            if let Some(started) = clone_started {
+                diagnostics.history_clone_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+            }
+            transform(messages, config.signal.clone()).await
         } else {
-            context.messages.clone()
+            let clone_started = diagnostics.enabled.then(Instant::now);
+            let messages = context.messages.clone();
+            if let Some(started) = clone_started {
+                diagnostics.history_clone_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+            }
+            messages
         };
         if let Some(started) = transform_started {
             diagnostics.transform_ns = AssistantRequestDiagnostics::elapsed_ns(started);
@@ -625,6 +641,7 @@ async fn stream_assistant_response(
     };
     diagnostics.llm_messages = llm_messages.len();
 
+    let context_build_started = diagnostics.enabled.then(Instant::now);
     let mut llm_context = rpi_ai::types::Context {
         system_prompt: if context.system_prompt.is_empty() {
             None
@@ -634,6 +651,9 @@ async fn stream_assistant_response(
         messages: llm_messages,
         tools: context.tools.iter().map(|t| t.schema().clone()).collect(),
     };
+    if let Some(started) = context_build_started {
+        diagnostics.context_build_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+    }
 
     // Resolve API key: getApiKey(provider) ?? config.api_key.
     let resolved_api_key = if let Some(get_key) = &config.get_api_key {

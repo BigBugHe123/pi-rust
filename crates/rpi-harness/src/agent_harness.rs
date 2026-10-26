@@ -3810,16 +3810,32 @@ impl AgentHarness {
             });
         }
 
-        // Pre-run compaction evaluation.
+        // Pre-run compaction evaluation. Build the same context that the run
+        // will use, but retain it when no compaction is needed. The old path
+        // loaded and projected the complete branch here and then rebuilt it
+        // again immediately below.
+        let mut prebuilt_context: Option<crate::session::context::SessionContext> = None;
         if snap.compaction.enabled && snap.model.context_window > 0 {
-            // Do not load and clone history for an evaluation that is disabled.
-            // Keep this separate from the post-compaction read: compaction can
-            // change the branch, and caller transforms may be stateful.
-            let path = self.branch_path_oldest_first().await?;
-            let ctx = build_session_context(&path, &build_opts);
+            let ctx = if build_opts.entry_transforms.is_empty()
+                && build_opts.entry_projectors.is_empty()
+            {
+                self.branch_context_default().await?
+            } else {
+                let path = self.branch_path_oldest_first().await?;
+                build_session_context(&path, &build_opts)
+            };
             let ctx_tokens = estimate_context_tokens(&ctx.messages).tokens;
             let window = snap.model.context_window as i64;
-            if should_compact(ctx_tokens, window, &snap.compaction) {
+            if !should_compact(ctx_tokens, window, &snap.compaction) {
+                if build_opts.entry_transforms.is_empty() && build_opts.entry_projectors.is_empty()
+                {
+                    prebuilt_context = Some(ctx);
+                }
+            } else {
+                // Only materialize the full entry path when the cheap context
+                // check says compaction may actually be necessary.
+                let path = self.branch_path_oldest_first().await?;
+                let mut compaction_applied = false;
                 if let Ok(Some(prep)) = prepare_compaction(&path, snap.compaction) {
                     let compaction_provider = Self::resolve_provider(&snap.models, &snap.model)
                         .or_else(|_| {
@@ -3863,6 +3879,7 @@ impl AgentHarness {
                                         CompactionReason::Threshold,
                                     )
                                     .await?;
+                                compaction_applied = true;
                             }
                             Err(e) => {
                                 // Compaction failed; abort the run.
@@ -3902,16 +3919,23 @@ impl AgentHarness {
                         }
                     }
                 }
+                if !compaction_applied
+                    && build_opts.entry_transforms.is_empty()
+                    && build_opts.entry_projectors.is_empty()
+                {
+                    prebuilt_context = Some(ctx);
+                }
             }
         }
 
-        let ctx =
-            if build_opts.entry_transforms.is_empty() && build_opts.entry_projectors.is_empty() {
-                self.branch_context_default().await?
-            } else {
-                let path = self.branch_path_oldest_first().await?;
-                build_session_context_owned(path, &build_opts)
-            };
+        let ctx = if let Some(ctx) = prebuilt_context {
+            ctx
+        } else if build_opts.entry_transforms.is_empty() && build_opts.entry_projectors.is_empty() {
+            self.branch_context_default().await?
+        } else {
+            let path = self.branch_path_oldest_first().await?;
+            build_session_context_owned(path, &build_opts)
+        };
         let system_prompt = Self::compose_prompt(
             snap.system_prompt.as_deref(),
             &snap.resources,
