@@ -23,6 +23,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 - Preserve SQLite concurrent writes and restore state after persistence failure.
 - Validate operation starts across batched record/message writes.
 
+## [0.9.4](https://github.com/bigfish1913/pi-rust/compare/v0.9.3...v0.9.4) - 2026-10-26
+
+### Fixed
+
+- *(cli)* keep dev build output out of the TUI
+
 ## [0.9.3](https://github.com/bigfish1913/pi-rust/compare/v0.9.2...v0.9.3) - 2026-10-26
 
 ### Added
