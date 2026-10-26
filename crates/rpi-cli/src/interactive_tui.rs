@@ -79,13 +79,13 @@ use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 use rpi_tui::strip_ansi;
 use rpi_tui::{
     apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
-    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
-    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
-    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
-    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
-    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
-    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
+    AssistantMessageOptions, AutocompleteItem, AutocompleteManager, AutocompleteSuggestions,
+    BashExecutionComponent, BashTruncation, CombinedAutocompleteProvider, Component, Container,
+    DynamicBorder, Editor, EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable,
+    FollowMode, FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal,
+    ScrollView, ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList,
+    SettingItem, SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider,
+    Spacer, StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
     ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
     TUI,
 };

@@ -4496,3 +4496,99 @@ fn review_pr106_windows_pasted_interior_enter_must_not_rewrite_the_draft() {
         "an interior pasted Enter must be classified before completion can rewrite clipboard text"
     );
 }
+
+#[test]
+fn rereview_pr106_enter_in_middle_of_complete_command_must_preserve_the_command() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    editor.set_text("/clear");
+    // Move the caret back two columns, without changing any text.
+    editor.set_cursor(0, 4); // /cle|ar
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::ApplyAndSubmit)
+    );
+    assert!(accept_enter_completion(&state, &editor));
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        *submitted.lock().unwrap(),
+        vec!["/clear".to_string()],
+        "Enter with the caret inside an already complete command must not duplicate its suffix"
+    );
+}
+
+/// Self-review probe: the whole-token resolution must not silently DROP the
+/// text the user typed after the caret. With `/clearXYZ` and the caret at
+/// column 4 the prefix `/cle` still completes to `/clear`, but the token as a
+/// whole does not — so Enter must submit the text exactly as typed instead
+/// of rewriting it to `/clear` (which would lose `XYZ`).
+#[test]
+fn rereview_pr106_enter_inside_an_unknown_token_keeps_the_typed_text() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    editor.set_text("/clearXYZ");
+    editor.set_cursor(0, 4); // /cle|arXYZ
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::Submit),
+        "a token that does not complete as a whole must be submitted as typed"
+    );
+    assert!(
+        !accept_enter_completion(&state, &editor),
+        "nothing may be applied when the whole token does not complete"
+    );
+    assert_eq!(editor.get_text(), "/clearXYZ");
+}
+
+/// Self-review probe: the same whole-token rule applies when the caret is
+/// inside a token that ends the input. `/clea` + `r` is the token `/clear`,
+/// so Enter must complete it to `/clear` — the same result as typing
+/// `/clear` and pressing Enter.
+#[test]
+fn rereview_pr106_enter_inside_a_token_completes_the_whole_token() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    editor.set_text("/clear");
+    editor.set_cursor(0, 4); // /cle|ar
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::ApplyAndSubmit)
+    );
+    assert!(accept_enter_completion(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        "/clear",
+        "the whole token is completed, not just the prefix before the caret"
+    );
+}
+
+/// Self-review probe: a command with a space after it is two tokens. With
+/// the caret inside the first token (`/cle|ar now`) only the command token
+/// is completed — the trailing word must survive untouched.
+#[test]
+fn rereview_pr106_enter_inside_a_command_token_keeps_the_following_word() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    editor.set_text("/clear now");
+    editor.set_cursor(0, 4); // /cle|ar now
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::ApplyAndSubmit)
+    );
+    assert!(accept_enter_completion(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        "/clear now",
+        "only the command token is replaced; the next word is untouched"
+    );
+}
