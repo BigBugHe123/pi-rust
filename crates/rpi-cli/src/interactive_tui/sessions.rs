@@ -585,7 +585,8 @@ pub(super) async fn render_session_history(
                             add_image_preview(chat, image, show_images);
                         }
                     }
-                    chat.add_child(Arc::new(Spacer::new(1)));
+                    // The tool panel carries its own trailing spacer now (one
+                    // convention for every transcript entry) — no host spacer.
                     rendered_any = true;
                 }
                 AgentMessage::Custom(custom) => {
