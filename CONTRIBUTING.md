@@ -21,8 +21,9 @@ By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Prerequisites
 
-- Rust **1.78 or newer** (MSRV is enforced; `rust-toolchain` is not pinned, so
-  please test with stable and, for MSRV-sensitive changes, with 1.78).
+- Rust **1.88 or newer**. CI checks workspace targets and all extension features
+  on 1.88.0 on Linux and Windows, in addition to the stable-toolchain checks.
+  The default development toolchain is not pinned.
 - A C toolchain for `rusqlite` (`bundled`) and, on Windows, the MSVC linker.
 - Optional: [`task`](https://taskfile.dev/) for the release/deploy targets in
   `Taskfile.yml`. Ordinary builds do not need it.
@@ -36,6 +37,17 @@ No API key is required for the test suite: `rpi-ai` ships a deterministic
 cargo build --workspace --locked
 cargo test  --workspace --locked
 ```
+
+For changes that may affect the minimum supported Rust version:
+
+```bash
+rustup toolchain install 1.88.0 --profile minimal
+cargo +1.88.0 check --workspace --all-targets --locked
+cargo +1.88.0 check -p rpi-extensions --all-features --tests --locked
+```
+
+The minimum version matches the current locked dependencies, including
+`image`, `time`, and ICU. Using a newer stable toolchain is supported.
 
 Before opening a PR, run what CI enforces:
 

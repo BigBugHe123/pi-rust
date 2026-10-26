@@ -16,7 +16,7 @@ plugin loading.
 cargo install rpi-cli
 ```
 
-Requires Rust 1.78 or newer. Then point it at a provider and start it:
+Requires Rust 1.88 or newer. Then point it at a provider and start it:
 
 ```bash
 export ANTHROPIC_API_KEY=...     # or OPENAI_API_KEY, or ~/.rpi/agent/models.json

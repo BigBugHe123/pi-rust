@@ -12,33 +12,31 @@ permissions:
 
 jobs:
   msrv:
-    name: Supported Rust 1.78
-    runs-on: ubuntu-latest
+    name: Rust 1.88 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     env:
       RUSTFLAGS: "-D warnings"
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Install Rust 1.78
+      - uses: actions/checkout@v4
+      - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.78.0"
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-
-      - name: Check workspace targets on the declared MSRV
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace targets on MSRV
         run: cargo check --workspace --all-targets --locked
-
-      - name: Check the standalone ABI core on the declared MSRV
+      - name: Check all extension features on MSRV
+        run: cargo check -p rpi-extensions --all-features --tests --locked
+      - name: Check standalone ABI core on MSRV
         run: cargo check -p rpi-plugin-sdk --no-default-features --locked
-
-      - name: Check the provider SDK bridge on the declared MSRV
+      - name: Check provider SDK bridge on MSRV
         run: cargo check -p rpi-plugin-sdk --features provider --locked
-
-      - name: Check rpi-ai without default features on the declared MSRV
+      - name: Check AI core without default features on MSRV
         run: cargo check -p rpi-ai --no-default-features --locked
 
   windows-installer:
@@ -162,7 +160,7 @@ jobs:
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [check, test, windows-installer]
+    needs: [msrv, check, test, windows-installer]
     permissions:
       contents: write
       pull-requests: read
@@ -172,7 +170,7 @@ jobs:
   preview-version:
     name: Prepare preview release
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [check, test, windows-installer]
+    needs: [msrv, check, test, windows-installer]
     runs-on: ubuntu-latest
     permissions:
       contents: write

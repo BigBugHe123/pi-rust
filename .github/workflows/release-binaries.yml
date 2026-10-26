@@ -113,6 +113,7 @@ jobs:
           echo "Building rpi ${version} for ${{ matrix.target }}"
 
       - name: Build release binary
+        shell: bash
         env:
           PREVIEW_VERSION: ${{ steps.version.outputs.version }}
           PREVIEW: ${{ inputs.preview }}
