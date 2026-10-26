@@ -30,7 +30,15 @@ requires a merged PR from an upstream `release-plz-*` branch whose merge commit
 matches the tested main commit. A fork branch with that name does not qualify.
 Do not use `pull_request_target` to execute contribution code with release secrets.
 
-### Documentation-only updates without a release
+### Preview releases
+
+A preview merge on the `preview` branch runs only the prebuilt binary workflow. It creates a
+GitHub prerelease with a `vX.Y.Z-preview.N` tag and does **not** run release-plz, publish any
+crate to crates.io, or update Homebrew/Scoop/winget channels. The preview binary is available
+through the explicit `rpi update preview` command; normal stable update checks never select a
+prerelease. A preview binary still checks crates.io for the stable line and therefore tells the
+user to run `rpi update` when a formal release is available.
+
 
 A documentation update does not require a version bump. Keep `Cargo.toml`,
 `Cargo.lock`, existing tags and install-channel manifests unchanged, and do not

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, preview]
   pull_request:
-    branches: [main]
+    branches: [main, preview]
   workflow_dispatch:
 
 permissions:
@@ -167,4 +167,66 @@ jobs:
       contents: write
       pull-requests: read
     uses: ./.github/workflows/release.yml
+    secrets: inherit
+
+  preview-version:
+    name: Prepare preview release
+    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [check, test, windows-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out preview commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve preview version and tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as file:
+              print(tomllib.load(file)["workspace"]["package"]["version"])
+          PY
+          )"
+          IFS=. read -r major minor patch <<EOF
+          ${base}
+          EOF
+          version="${major}.${minor}.$((patch + 1))-preview.${GITHUB_RUN_NUMBER}"
+          tag="v${version}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.sha')"
+            test "${existing}" = "${GITHUB_SHA}" || {
+              echo "preview tag ${tag} already points to ${existing}, not ${GITHUB_SHA}" >&2
+              exit 1
+            }
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${tag}" -f "sha=${GITHUB_SHA}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+  preview-binaries:
+    name: Build preview binaries
+    needs: preview-version
+    uses: ./.github/workflows/release-binaries.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.preview-version.outputs.tag }}
+      version: ${{ needs.preview-version.outputs.version }}
+      preview: true
+      checkout_ref: ${{ github.sha }}
     secrets: inherit

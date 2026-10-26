@@ -707,7 +707,13 @@ pub const HOST_NAME: &str = "rpi";
 /// as of this SDK release — good for a user agent or a fallback label, and
 /// superseded at runtime by the `host.version` field of the `BeforeAgentStart`
 /// payload.
-pub const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// A preview build sets `RPI_BUILD_VERSION` so the executable and plugin
+/// bridge report the full prerelease version without changing the checked-in
+/// Cargo workspace version. Empty values are ignored for normal builds.
+pub const HOST_VERSION: &str = match option_env!("RPI_BUILD_VERSION") {
+    Some(version) if !version.is_empty() => version,
+    _ => env!("CARGO_PKG_VERSION"),
+};
 
 /// Environment variable carrying the id of the session this process serves.
 ///

@@ -200,13 +200,17 @@ rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 ### CLI 自更新
 
 `rpi update` 默认从 GitHub Release 下载预编译的 CLI，不需要本地 Rust/Cargo。
-版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
+稳定版版本按 crates.io 的发布记录解析；`rpi-release.json` 提供各平台下载地址、大小和
 压缩包/可执行文件的 SHA-256。校验目标平台、完整性和实际版本后，原子替换当前 CLI。
-Windows 会暂存更新，等待当前进程退出后完成替换。
+Windows 会暂存更新，等待当前进程退出后完成替换。稳定版不会提示或自动选择预览版。
+
+预览构建来自 `preview` 分支的合并，会创建 GitHub prerelease，但不会发布到 crates.io。
+需要体验预览版时显式运行 `rpi update preview`；它只从 GitHub prerelease 中选择最新版本。
+预览版运行普通 `rpi update` 时会检查 crates.io，发现正式版后提示切换到正式版本。
 
 `rpi update --force` 重新安装已解析的版本；`rpi update --build` 显式使用 Cargo 源码编译。
 缺少 manifest、下载失败或校验不通过都会报错并保留原版本，不会自动转为编译。
-`--offline` 仅报告缓存的版本信息，不下载也不编译。旧 Release 没有 manifest 时，
+`--offline` 仅报告稳定版缓存；预览版需要联网查询 GitHub。旧 Release 没有 manifest 时，
 可等待协议资产补齐，或显式使用 `rpi update --build`。
 
 ### TUI 历史消息滚动
