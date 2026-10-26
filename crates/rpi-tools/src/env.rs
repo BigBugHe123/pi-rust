@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::error::{ExecutionError, FileError};
+use crate::error::{ExecutionError, FileError, FileErrorCode};
 
 /// `file` | `directory` | `symlink`. Mirrors TS `FileKind`.
 ///
@@ -205,6 +205,23 @@ pub trait FileSystem: Send + Sync {
         _path: &str,
     ) -> Result<Option<Box<dyn AppendFile>>, FileError> {
         Ok(None)
+    }
+
+    /// Cut the file at `path` back to `len` bytes, discarding a tail that a
+    /// failed append left behind. It never grows a file. Backends without it
+    /// fail, so a caller cannot take a tail for clean when it was not cut.
+    async fn truncate_file(
+        &self,
+        path: &str,
+        len: u64,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        let _ = (len, cancel);
+        Err(FileError::new(
+            FileErrorCode::NotSupported,
+            "file truncation is unavailable",
+        )
+        .with_path(path))
     }
 
     async fn rename_file(
