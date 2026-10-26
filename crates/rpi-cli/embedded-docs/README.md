@@ -4,7 +4,7 @@
 [![downloads](https://img.shields.io/crates/d/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![docs.rs](https://docs.rs/rpi-cli/badge.svg)](https://docs.rs/rpi-cli)
 [![license](https://img.shields.io/crates/l/rpi-cli.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue.svg)](#install)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#install)
 [![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/bigfish1913/pi-rust?style=flat)](https://github.com/bigfish1913/pi-rust/stargazers)
 [![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/bigfish1913/pi-rust/main/scripts/in
 Verifies the published SHA-256 checksum and installs to `/usr/local/bin` or
 `~/.local/bin`. Preview first with `--dry-run`.
 
-**From crates.io** (requires Rust 1.78+):
+**From crates.io** (requires Rust 1.88+):
 
 ```bash
 cargo install rpi-cli
@@ -406,7 +406,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 | --- | --- |
 | Current release | **[0.8.5](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
-| MSRV | 1.78 |
+| MSRV | 1.88 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
 | Binary release targets | Linux (x86_64/aarch64), macOS (Intel/Apple silicon), Windows (x86_64) |
 

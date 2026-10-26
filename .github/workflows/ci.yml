@@ -11,6 +11,28 @@ permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.88 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace targets on MSRV
+        run: cargo check --workspace --all-targets --locked
+      - name: Check all extension features on MSRV
+        run: cargo check -p rpi-extensions --all-features --tests --locked
+
   windows-installer:
     name: Windows installer (${{ matrix.shell }})
     runs-on: windows-latest
@@ -132,7 +154,7 @@ jobs:
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [check, test, windows-installer]
+    needs: [msrv, check, test, windows-installer]
     permissions:
       contents: write
       pull-requests: read

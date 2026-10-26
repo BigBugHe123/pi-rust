@@ -11,6 +11,12 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the minimum supported Rust version from 1.78 to 1.88 to match the
+  current locked dependencies. Check workspace targets and all extension features on
+  Rust 1.88.0 in Linux and Windows CI before release.
+
 ## [0.8.5](https://github.com/bigfish1913/pi-rust/compare/v0.8.4...v0.8.5) - 2026-10-24
 
 ### Fixed
