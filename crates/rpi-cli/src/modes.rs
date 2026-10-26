@@ -558,6 +558,8 @@ where
                 }
                 let content = msg
                     .get("message")
+                    .or_else(|| msg.get("content"))
+                    .or_else(|| msg.get("prompt"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 let lane_task = Arc::clone(&lane);
@@ -919,6 +921,7 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
     let stats = rpc_get_stats(lane, harness).await.ok();
     serde_json::json!({
         "modelId": model.as_ref().map(|model| model.id.clone()),
+        "model": model.as_ref().map(|model| model.id.clone()),
         "provider": model.as_ref().map(|model| model.provider.clone()),
         "thinkingLevel": thinking,
         "activeTools": active_tools,
@@ -956,7 +959,7 @@ fn rpc_message_text(value: &serde_json::Value) -> String {
         .flatten()
         .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
         .collect::<Vec<_>>()
-        .join("\\n")
+        .join("\n")
 }
 
 async fn rpc_get_history(
@@ -1986,6 +1989,18 @@ mod tests {
         assert_eq!(display["title"], "Sign in");
         assert!(display.get("access_token").is_none());
         assert!(display.get("refresh_token").is_none());
+    }
+
+    #[test]
+    fn rpc_message_text_joins_content_blocks_with_real_newlines() {
+        let text = rpc_message_text(&serde_json::json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ]
+        }));
+        assert_eq!(text, "first\nsecond");
+        assert!(!text.contains("\\n"));
     }
 
     #[derive(Clone, Default)]
