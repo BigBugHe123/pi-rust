@@ -47,12 +47,14 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem};
+use rpi_tools::FileError;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::jsonl::codec::{
@@ -88,6 +90,9 @@ pub struct JsonlSessionStorage {
     /// full duration.
     tail: Mutex<()>,
     append: Mutex<Option<Box<dyn rpi_tools::env::AppendFile>>>,
+    /// Set when a failed append could not be cut back, so the file may end in
+    /// bytes this session cannot account for. Writes are refused until reopen.
+    uncertain: AtomicBool,
 }
 
 impl JsonlSessionStorage {
@@ -107,6 +112,7 @@ impl JsonlSessionStorage {
             ids,
             tail: Mutex::new(()),
             append: Mutex::new(None),
+            uncertain: AtomicBool::new(false),
         }
     }
 
@@ -340,7 +346,16 @@ impl JsonlSessionStorage {
 
     /// Append a mutation line to the file (no in-memory apply). Mirrors TS
     /// `appendMutation`.
+    ///
+    /// A reported failure can leave part of the line on disk, so the tail is cut
+    /// back before the caller may retry. See [`Self::settle_failed_append`].
     async fn append_mutation_line(&self, mutation: &SessionMutation) -> SessionResult<()> {
+        if self.uncertain.load(Ordering::SeqCst) {
+            return Err(SessionError::storage(format!(
+                "Session {} has an unsettled append; reopen it before writing",
+                self.metadata.path
+            )));
+        }
         let line = encode_mutation(mutation);
         let mut append = self.append.lock().await;
         if append.is_none() {
@@ -353,22 +368,74 @@ impl JsonlSessionStorage {
             // The tail lock still orders every append, and the writer flushes
             // before acknowledgement. A failed handle is discarded for retry.
             let result = writer.append(line.as_bytes()).await;
-            if result.is_err() {
+            if let Err(error) = result {
                 *append = None;
+                drop(append);
+                return self.settle_failed_append(&line, error).await;
             }
-            return file_result(
-                result,
-                &format!("Failed to append session {}", self.metadata.path),
-            );
+            return Ok(());
         }
         drop(append);
-        file_result(
-            self.fs
-                .append_file(&self.metadata.path, FileContent::Text(line), None)
-                .await,
-            &format!("Failed to append session {}", self.metadata.path),
-        )
+        match self
+            .fs
+            .append_file(&self.metadata.path, FileContent::Text(line.clone()), None)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self.settle_failed_append(&line, error).await,
+        }
     }
+
+    /// Report a failed append, first making the file safe for the next one.
+    ///
+    /// The append did not commit, so its state is not applied and the caller
+    /// may retry with the same sequence number. The bytes it left behind must
+    /// not be built on, so the tail is cut back to where `line` began. If the
+    /// tail cannot be proven to be this line's own bytes, or the cut fails, the
+    /// session becomes uncertain and refuses writes until it is reopened, which
+    /// repairs the tail through [`Self::load`].
+    async fn settle_failed_append(&self, line: &str, error: FileError) -> SessionResult<()> {
+        let failure = file_result::<()>(
+            Err(error),
+            &format!("Failed to append session {}", self.metadata.path),
+        );
+        if self.cut_back_failed_append(line).await.is_err() {
+            self.uncertain.store(true, Ordering::SeqCst);
+        }
+        failure
+    }
+
+    /// Truncate the file to where the failed `line` began. Fails when the
+    /// trailing bytes cannot be proven to be this line's own.
+    async fn cut_back_failed_append(&self, line: &str) -> Result<(), ()> {
+        let path = &self.metadata.path;
+        let bytes = self.fs.read_binary_file(path, None).await.map_err(|_| ())?;
+        let start = failed_append_start(&bytes, line.as_bytes()).ok_or(())?;
+        if start == bytes.len() {
+            return Ok(());
+        }
+        self.fs
+            .truncate_file(path, start as u64, None)
+            .await
+            .map_err(|_| ())
+    }
+}
+
+/// Where a failed append of `line` began in `bytes`, or `None` when the bytes
+/// after the last newline cannot be proven to be a fragment of `line`.
+///
+/// Every acknowledged line ends in a newline, so the bytes after the last one
+/// are never acknowledged content. A complete copy of `line` at the end is also
+/// this append's own, because its state was never applied.
+fn failed_append_start(bytes: &[u8], line: &[u8]) -> Option<usize> {
+    if bytes.ends_with(line) {
+        return Some(bytes.len() - line.len());
+    }
+    let start = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    line.starts_with(&bytes[start..]).then_some(start)
 }
 
 /// Normalize an entry's parent onto the lane's current leaf before applying.
@@ -974,6 +1041,241 @@ mod tests {
         assert!(storage.get_entry("retry").await.unwrap().is_none());
         assert_eq!(freed.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(storage.append_entry(entry, "main").await.unwrap().seq(), 1);
+    }
+
+    /// How a reusable append handle left the file when it reported failure.
+    #[derive(Clone, Copy)]
+    enum Tear {
+        /// The first half of the line landed, then the write failed.
+        Half,
+        /// The whole line landed, but the write still reported failure.
+        Whole,
+        /// Bytes that are not a prefix of the line.
+        Foreign,
+    }
+
+    /// A reusable append handle that writes part of a line and then fails, the
+    /// way `write_all` does when the disk fills or an I/O error interrupts it.
+    struct TearingAppend {
+        fs: Arc<dyn FileSystem>,
+        path: String,
+        tear: Tear,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi_tools::env::AppendFile for TearingAppend {
+        async fn append(&mut self, bytes: &[u8]) -> Result<(), rpi_tools::FileError> {
+            let torn: &[u8] = match self.tear {
+                Tear::Half => &bytes[..bytes.len() / 2],
+                Tear::Whole => bytes,
+                Tear::Foreign => b"XYZ",
+            };
+            self.fs
+                .append_file(
+                    &self.path,
+                    FileContent::Text(String::from_utf8_lossy(torn).into_owned()),
+                    None,
+                )
+                .await?;
+            Err(rpi_tools::FileError::new(
+                rpi_tools::FileErrorCode::Unknown,
+                "injected partial write",
+            ))
+        }
+    }
+
+    fn provisioned_message(id: &str) -> ProvisionedEntry {
+        ProvisionedEntry {
+            id: id.into(),
+            kind: ProvisionedKind::Message {
+                message: user_msg(id),
+                terminate: None,
+            },
+        }
+    }
+
+    /// A session on a real directory, so the retry uses the production reusable
+    /// append handle rather than the one-shot fallback.
+    async fn session_on_disk(
+        temp: &tempfile::TempDir,
+    ) -> (
+        Arc<dyn FileSystem>,
+        JsonlSessionStorage,
+        Arc<dyn Clock>,
+        Arc<dyn IdGenerator>,
+    ) {
+        let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(
+            temp.path().to_path_buf(),
+        ));
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+        let storage = JsonlSessionStorage::create(
+            fs.clone(),
+            "session.jsonl",
+            header(),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
+        (fs, storage, clock, ids)
+    }
+
+    async fn install_tearing_writer(
+        storage: &JsonlSessionStorage,
+        fs: &Arc<dyn FileSystem>,
+        tear: Tear,
+    ) {
+        *storage.append.lock().await = Some(Box::new(TearingAppend {
+            fs: fs.clone(),
+            path: "session.jsonl".into(),
+            tear,
+        }));
+    }
+
+    #[tokio::test]
+    async fn failed_append_that_tore_a_prefix_is_cut_back_before_the_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, storage, clock, ids) = session_on_disk(&temp).await;
+        storage
+            .append_entry(provisioned_message("kept"), "main")
+            .await
+            .unwrap();
+        install_tearing_writer(&storage, &fs, Tear::Half).await;
+        assert!(storage
+            .append_entry(provisioned_message("retry"), "main")
+            .await
+            .is_err());
+        storage
+            .append_entry(provisioned_message("retry"), "main")
+            .await
+            .expect("the retry is acknowledged");
+        // A later line stops the retry from being the physical last line, so a
+        // fragment left in front of it would make the file unopenable.
+        storage
+            .append_entry(provisioned_message("later"), "main")
+            .await
+            .unwrap();
+        let reloaded = JsonlSessionStorage::load(fs, "session.jsonl", clock, ids)
+            .await
+            .expect("the session reloads after a torn append and a retry");
+        for id in ["kept", "retry", "later"] {
+            assert!(
+                reloaded.get_entry(id).await.unwrap().is_some(),
+                "acknowledged entry {id} must survive reload"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_append_start_proves_only_the_fragment_of_its_own_line() {
+        let line: &[u8] = b"{\"seq\":2}\n";
+        let head: &[u8] = b"h\n{\"seq\":1}\n";
+        // Nothing was written: the tail is clean and nothing needs cutting.
+        assert_eq!(failed_append_start(head, line), Some(head.len()));
+        // A fragment of this line after the last newline is this append's own.
+        let torn = [head, b"{\"se"].concat();
+        assert_eq!(failed_append_start(&torn, line), Some(head.len()));
+        // A fragment that differs from the line is not provably this append's.
+        let foreign = [head, b"{\"seq\":3"].concat();
+        assert_eq!(failed_append_start(&foreign, line), None);
+        let unknown = [head, b"XYZ"].concat();
+        assert_eq!(failed_append_start(&unknown, line), None);
+        // A whole copy of the line at the end is removed from its start.
+        let whole = [head, line].concat();
+        assert_eq!(failed_append_start(&whole, line), Some(head.len()));
+        // Without a trailing newline, a complete line is still this append's.
+        let unterminated = [head, &line[..line.len() - 1]].concat();
+        assert_eq!(failed_append_start(&unterminated, line), Some(head.len()));
+        assert_eq!(failed_append_start(b"", line), Some(0));
+    }
+
+    #[tokio::test]
+    async fn acknowledged_retry_after_a_torn_prefix_survives_reload_when_nothing_follows() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, storage, clock, ids) = session_on_disk(&temp).await;
+        install_tearing_writer(&storage, &fs, Tear::Half).await;
+        assert!(storage
+            .append_entry(provisioned_message("retry"), "main")
+            .await
+            .is_err());
+        storage
+            .append_entry(provisioned_message("retry"), "main")
+            .await
+            .expect("the retry is acknowledged");
+        // The retry is the last physical line, so load's torn-tail repair would
+        // drop the whole line, fragment and acknowledged retry together.
+        let reloaded = JsonlSessionStorage::load(fs, "session.jsonl", clock, ids)
+            .await
+            .expect("the session reloads");
+        assert!(
+            reloaded.get_entry("retry").await.unwrap().is_some(),
+            "an acknowledged append must survive reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_append_that_landed_whole_is_removed_before_the_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, storage, clock, ids) = session_on_disk(&temp).await;
+        storage
+            .append_entry(provisioned_message("kept"), "main")
+            .await
+            .unwrap();
+        install_tearing_writer(&storage, &fs, Tear::Whole).await;
+        assert!(storage
+            .append_entry(provisioned_message("rejected"), "main")
+            .await
+            .is_err());
+        // The caller may retry with different content. The rejected line must not
+        // reappear on reload and shadow the acknowledged retry.
+        storage
+            .append_entry(provisioned_message("retry"), "main")
+            .await
+            .expect("the retry is acknowledged");
+        let reloaded = JsonlSessionStorage::load(fs, "session.jsonl", clock, ids)
+            .await
+            .expect("the session reloads");
+        assert!(reloaded.get_entry("retry").await.unwrap().is_some());
+        assert!(
+            reloaded.get_entry("rejected").await.unwrap().is_none(),
+            "a rejected append must not be committed on reload"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_append_with_an_unknown_tail_stays_uncertain_until_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let (fs, storage, clock, ids) = session_on_disk(&temp).await;
+        storage
+            .append_entry(provisioned_message("kept"), "main")
+            .await
+            .unwrap();
+        install_tearing_writer(&storage, &fs, Tear::Foreign).await;
+        assert!(storage
+            .append_entry(provisioned_message("rejected"), "main")
+            .await
+            .is_err());
+        assert!(
+            storage
+                .append_entry(provisioned_message("retry"), "main")
+                .await
+                .is_err(),
+            "writes must be refused while the tail cannot be proven to be this append's"
+        );
+        let reopened =
+            JsonlSessionStorage::load(fs.clone(), "session.jsonl", clock.clone(), ids.clone())
+                .await
+                .expect("reopen repairs the unknown tail");
+        reopened
+            .append_entry(provisioned_message("retry"), "main")
+            .await
+            .expect("writes are accepted after reopen");
+        let reloaded = JsonlSessionStorage::load(fs, "session.jsonl", clock, ids)
+            .await
+            .expect("the session reloads");
+        assert!(reloaded.get_entry("kept").await.unwrap().is_some());
+        assert!(reloaded.get_entry("retry").await.unwrap().is_some());
     }
 
     #[tokio::test]
