@@ -57,22 +57,24 @@ use crate::compaction::{
 use crate::error::{SessionError, SessionErrorCode};
 use crate::events::{HarnessEvent, HarnessEventBus, RunEndEvent, RunEndOutcome, RunStartEvent};
 use crate::messages::{
-    convert_to_llm as harness_convert_to_llm, create_compaction_summary_message,
+    convert_to_llm as harness_convert_to_llm,
+    convert_to_llm_incremental as harness_convert_to_llm_incremental,
+    create_compaction_summary_message,
 };
 use crate::prompt_templates::format_prompt_template_invocation;
 use crate::result::{HarnessError, HarnessResult, OperationKind};
 use crate::session::context::{
-    build_session_context, ContextEntryTransform, CustomEntryContextMessageProjector,
-    SessionContextBuildOptions,
+    build_session_context, build_session_context_owned, ContextEntryTransform,
+    CustomEntryContextMessageProjector, SessionContextBuildOptions,
 };
 use crate::session::session::Session;
 use crate::session::types::{
-    BranchBounds, CompactionReason, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord,
-    OperationError, OperationFinishedRecord, OperationIntent, OperationOutcome,
-    OperationStartedRecord, ProvisionedEntry, ProvisionedKind, QueueCancelledRecord,
-    QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery, RetryPendingRecord, SessionStats,
-    SessionTree, StepAttemptRecord, StepKind, ToolReplay, ToolStartedRecord, UsageCause,
-    UsageRecord, WriteDeferredRecord,
+    AssistantFrameOp, AssistantFrameRecord, BranchBounds, CompactionReason, Entry, EntryOrder,
+    EntryQuery, JsonValue, LaneRecord, OperationError, OperationFinishedRecord, OperationIntent,
+    OperationOutcome, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+    QueueCancelledRecord, QueueEnqueuedRecord, QueueKind, RecordBase, RecordQuery,
+    RetryPendingRecord, SessionStats, SessionTree, StepAttemptRecord, StepKind, ToolReplay,
+    ToolStartedRecord, UsageCause, UsageRecord, WriteDeferredRecord,
 };
 use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
@@ -1996,6 +1998,7 @@ impl AgentHarness {
     fn deferred_stream_options(&self, snap: &ConfigSnapshot) -> rpi_ai::SimpleStreamOptions {
         rpi_ai::SimpleStreamOptions {
             timeout: snap.stream_options.timeout,
+            stream_idle_timeout: snap.stream_options.stream_idle_timeout,
             session_id: None,
             signal: CancellationToken::new(),
             reasoning: match snap.thinking_level {
@@ -2075,10 +2078,7 @@ impl AgentHarness {
         }
         // Prepare everything against a pinned target before publishing the swap.
         // A failed read must leave the old session and its queues untouched.
-        let target = Session::new(
-            session.storage(),
-            Some(Arc::clone(self.session.id_generator())),
-        );
+        let target = session.pin(Arc::clone(self.session.id_generator()));
         let lanes = target.get_lanes().await.map_err(session_to_harness_err)?;
         if !lanes.iter().any(|lane| lane.lane == self.lane) {
             return Err(HarnessError::io(
@@ -2117,7 +2117,7 @@ impl AgentHarness {
             scope.cancel();
             *scope = CancellationToken::new();
         }
-        self.session.set_storage(target.storage());
+        self.session.rebind_to(&target);
         Ok(())
     }
 
@@ -2953,7 +2953,10 @@ impl AgentHarness {
                 match provider {
                     Some(p) => {
                         let model = model.clone();
-                        let mut ctx = ctx.clone();
+                        // Hooks usually observe the context without replacing it.
+                        // Keep the history borrowed until an actual patch needs
+                        // a private mutable copy for this request.
+                        let mut ctx = std::borrow::Cow::Borrowed(ctx);
                         // B4 [merge_into]: the loop builds `opts` via
                         // `AgentLoopConfig::to_stream_options`, which DROPS the
                         // harness's pinned `headers`/`metadata` (AgentLoopConfig
@@ -2970,7 +2973,9 @@ impl AgentHarness {
                             // request carries — and only this one, since `ctx` is
                             // rebuilt per call from the loop's context.
                             if let Some(patch) = hooks.transform_context(&model, &ctx) {
-                                patch.apply(&mut ctx);
+                                if patch != rpi_ai::ContextPatch::default() {
+                                    patch.apply(ctx.to_mut());
+                                }
                             }
                             if let Some(patch) = hooks.before_request(&model, &ctx, &opts) {
                                 patch.apply(&mut opts);
@@ -2993,10 +2998,13 @@ impl AgentHarness {
                             format!("No provider registered for '{}'", model.provider),
                             0,
                         );
-                        let _ = producer.push(rpi_ai::types::AssistantMessageEvent::Error {
-                            reason: rpi_ai::types::ErrorReason::Error,
-                            error: msg,
-                        });
+                        // Terminal publication never waits for ordinary queue capacity.
+                        let _ = futures::executor::block_on(producer.push(
+                            rpi_ai::types::AssistantMessageEvent::Error {
+                                reason: rpi_ai::types::ErrorReason::Error,
+                                error: msg,
+                            },
+                        ));
                         stream
                     }
                 }
@@ -3033,6 +3041,9 @@ impl AgentHarness {
     /// Load this lane's branch path, oldest-first. Returns an empty vec when
     /// the lane is empty (no leaf).
     async fn branch_path_oldest_first(&self) -> HarnessResult<Vec<Entry>> {
+        let diagnostics =
+            std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0");
+        let started = diagnostics.then(std::time::Instant::now);
         let leaf = self
             .session
             .view(&self.lane)
@@ -3050,9 +3061,30 @@ impl AgentHarness {
             start: Some(leaf_id),
             ..Default::default()
         };
-        self.session
+        let result = self
+            .session
             .view(&self.lane)
             .find_entries_on_branch(&query, &bounds)
+            .await
+            .map_err(session_to_harness_err);
+        if let Some(started) = started {
+            eprintln!(
+                "RPI_CONTEXT_DIAGNOSTICS path_load_ns={} path_entries={}",
+                started.elapsed().as_nanos().min(u64::MAX as u128),
+                result.as_ref().map(Vec::len).unwrap_or_default(),
+            );
+        }
+        result
+    }
+
+    /// Load the default context through the storage binding. This avoids
+    /// materializing the complete branch; storage validates the same parent
+    /// chain and clones only model-visible messages.
+    async fn branch_context_default(
+        &self,
+    ) -> HarnessResult<crate::session::context::SessionContext> {
+        self.session
+            .context_on_branch_for_lane(&self.lane, &BranchBounds::default())
             .await
             .map_err(session_to_harness_err)
     }
@@ -3162,6 +3194,48 @@ impl AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    /// Commit the frame-stream binding, assistant entry, and step attempt in
+    /// one durable append. The logical order remains binding → entry → step.
+    pub(crate) async fn append_bound_provisioned_with_step_attempt(
+        &self,
+        entry: ProvisionedEntry,
+        run_id: &str,
+        attempt: u32,
+        stream_index: usize,
+    ) -> HarnessResult<Entry> {
+        let bind = LaneRecord::AssistantFrame(AssistantFrameRecord {
+            base: RecordBase {
+                id: self.session.id_generator().next(),
+                seq: 0,
+                lane: self.lane.clone(),
+                timestamp: 0,
+            },
+            run_id: run_id.to_string(),
+            stream_index,
+            op: AssistantFrameOp::CommitStream,
+            frame: Some(serde_json::json!({"entryId": entry.id})),
+        });
+        let step = LaneRecord::StepAttempt(StepAttemptRecord {
+            base: RecordBase {
+                id: self.session.id_generator().next(),
+                seq: 0,
+                lane: self.lane.clone(),
+                timestamp: 0,
+            },
+            run_id: run_id.to_string(),
+            step: StepKind::Assistant,
+            attempt,
+            result_entry_id: entry.id.clone(),
+            compaction_reason: None,
+        });
+        let (_, committed, _) = self
+            .session
+            .append_record_entry_and_record(bind, entry, &self.lane, step)
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(committed)
+    }
+
     /// Record that another attempt is scheduled for `run_id`.
     ///
     /// Written before the backoff wait, so a crash during the wait is
@@ -3184,19 +3258,6 @@ impl AgentHarness {
             .await
             .map_err(session_to_harness_err)?;
         Ok(())
-    }
-
-    /// Write a `step_attempt` record on this harness's lane.
-    pub(crate) async fn write_step_attempt_record(
-        &self,
-        run_id: &str,
-        step: StepKind,
-        attempt: u32,
-        result_entry_id: &str,
-        compaction_reason: Option<CompactionReason>,
-    ) -> HarnessResult<()> {
-        self.write_step_attempt(run_id, step, attempt, result_entry_id, compaction_reason)
-            .await
     }
 
     /// Persist a `Compaction` entry and return the stamped `Entry`.
@@ -3305,6 +3366,24 @@ impl AgentHarness {
         Ok(())
     }
 
+    fn operation_started_record(
+        &self,
+        run_id: &str,
+        source_leaf_id: Option<String>,
+        intent: OperationIntent,
+    ) -> LaneRecord {
+        LaneRecord::OperationStarted(OperationStartedRecord {
+            base: RecordBase {
+                id: run_id.to_string(),
+                seq: 0,
+                lane: self.lane.clone(),
+                timestamp: 0,
+            },
+            source_leaf_id,
+            intent,
+        })
+    }
+
     /// Write an `operation_started` record. Returns the stamped record (its
     /// `base.id` is the run_id the caller generated; `seq`/`lane`/`timestamp`
     /// are overwritten by storage).
@@ -3314,25 +3393,36 @@ impl AgentHarness {
         source_leaf_id: Option<String>,
         intent: OperationIntent,
     ) -> HarnessResult<OperationStartedRecord> {
-        let record = LaneRecord::OperationStarted(OperationStartedRecord {
-            base: RecordBase {
-                id: run_id.to_string(),
-                seq: 0,
-                lane: self.lane.clone(),
-                timestamp: 0,
-            },
-            source_leaf_id,
-            intent,
-        });
         let stamped = self
             .session
-            .append_record(record)
+            .append_record(self.operation_started_record(run_id, source_leaf_id, intent))
             .await
             .map_err(session_to_harness_err)?;
         match stamped {
             LaneRecord::OperationStarted(s) => Ok(s),
             _ => unreachable!("append_record(OperationStarted) stamps into OperationStarted"),
         }
+    }
+
+    /// Commit `operation_started` followed by the first prompt entry in one
+    /// durable append when the backend supports it. The record remains first.
+    async fn append_operation_started_and_entry(
+        &self,
+        run_id: &str,
+        source_leaf_id: Option<String>,
+        intent: OperationIntent,
+        entry: ProvisionedEntry,
+    ) -> HarnessResult<Entry> {
+        let (_, committed) = self
+            .session
+            .append_record_and_entry(
+                self.operation_started_record(run_id, source_leaf_id, intent),
+                entry,
+                &self.lane,
+            )
+            .await
+            .map_err(session_to_harness_err)?;
+        Ok(committed)
     }
 
     /// Write an `operation_finished` record.
@@ -3630,11 +3720,35 @@ impl AgentHarness {
             system_prompt_override: None,
             resume_data,
         };
-        self.write_operation_started(&run_id, source_leaf.clone(), intent)
+        let prompt_start = if let Some(first) = prompts.first() {
+            let first_entry_id = queued_ids
+                .first()
+                .cloned()
+                .unwrap_or_else(|| self.next_entry_id());
+            self.append_operation_started_and_entry(
+                &run_id,
+                source_leaf.clone(),
+                intent,
+                ProvisionedEntry {
+                    id: first_entry_id,
+                    kind: ProvisionedKind::Message {
+                        message: first.clone(),
+                        terminate: None,
+                    },
+                },
+            )
             .await?;
+            1
+        } else {
+            self.write_operation_started(&run_id, source_leaf.clone(), intent)
+                .await?;
+            0
+        };
 
-        // Persist prompts (the user's input) BEFORE the run so they're durable.
-        for (index, msg) in prompts.iter().enumerate() {
+        // Persist the remaining prompts (the user's input) BEFORE the run so
+        // they're durable. The first prompt, when present, was committed with
+        // operation_started above.
+        for (index, msg) in prompts.iter().enumerate().skip(prompt_start) {
             if let Some(entry_id) = queued_ids.get(index) {
                 self.append_provisioned(ProvisionedEntry {
                     id: entry_id.clone(),
@@ -3655,8 +3769,8 @@ impl AgentHarness {
         self.emit_appended_messages(prompts.iter().take(queued_ids.len()).cloned().collect())
             .await;
 
-        // Snapshot config.
         let snap = self.snapshot_config()?;
+        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
         if snap.models.is_empty() {
             let _ = self
                 .write_operation_finished(
@@ -3686,16 +3800,32 @@ impl AgentHarness {
             });
         }
 
-        // Build the branch path (now includes the just-persisted prompts).
-        let path = self.branch_path_oldest_first().await?;
-        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
-
-        // Pre-run compaction evaluation.
+        // Pre-run compaction evaluation. Build the same context that the run
+        // will use, but retain it when no compaction is needed. The old path
+        // loaded and projected the complete branch here and then rebuilt it
+        // again immediately below.
+        let mut prebuilt_context: Option<crate::session::context::SessionContext> = None;
         if snap.compaction.enabled && snap.model.context_window > 0 {
-            let ctx = build_session_context(&path, &build_opts);
+            let ctx = if build_opts.entry_transforms.is_empty()
+                && build_opts.entry_projectors.is_empty()
+            {
+                self.branch_context_default().await?
+            } else {
+                let path = self.branch_path_oldest_first().await?;
+                build_session_context(&path, &build_opts)
+            };
             let ctx_tokens = estimate_context_tokens(&ctx.messages).tokens;
             let window = snap.model.context_window as i64;
-            if should_compact(ctx_tokens, window, &snap.compaction) {
+            if !should_compact(ctx_tokens, window, &snap.compaction) {
+                if build_opts.entry_transforms.is_empty() && build_opts.entry_projectors.is_empty()
+                {
+                    prebuilt_context = Some(ctx);
+                }
+            } else {
+                // Only materialize the full entry path when the cheap context
+                // check says compaction may actually be necessary.
+                let path = self.branch_path_oldest_first().await?;
+                let mut compaction_applied = false;
                 if let Ok(Some(prep)) = prepare_compaction(&path, snap.compaction) {
                     let compaction_provider = Self::resolve_provider(&snap.models, &snap.model)
                         .or_else(|_| {
@@ -3719,6 +3849,7 @@ impl AgentHarness {
                                 None
                             },
                             custom_instructions: None,
+                            stream_options: snap.stream_options.clone(),
                         };
                         match {
                             let _progress = crate::events::CompactionProgressGuard::new(
@@ -3738,6 +3869,7 @@ impl AgentHarness {
                                         CompactionReason::Threshold,
                                     )
                                     .await?;
+                                compaction_applied = true;
                             }
                             Err(e) => {
                                 // Compaction failed; abort the run.
@@ -3777,13 +3909,23 @@ impl AgentHarness {
                         }
                     }
                 }
+                if !compaction_applied
+                    && build_opts.entry_transforms.is_empty()
+                    && build_opts.entry_projectors.is_empty()
+                {
+                    prebuilt_context = Some(ctx);
+                }
             }
         }
 
-        // Rebuild path after potential compaction.
-        let path = self.branch_path_oldest_first().await?;
-        let build_opts = Self::build_opts(&snap.entry_projectors, &snap.entry_transforms);
-        let ctx = build_session_context(&path, &build_opts);
+        let ctx = if let Some(ctx) = prebuilt_context {
+            ctx
+        } else if build_opts.entry_transforms.is_empty() && build_opts.entry_projectors.is_empty() {
+            self.branch_context_default().await?
+        } else {
+            let path = self.branch_path_oldest_first().await?;
+            build_session_context_owned(path, &build_opts)
+        };
         let system_prompt = Self::compose_prompt(
             snap.system_prompt.as_deref(),
             &snap.resources,
@@ -3798,7 +3940,13 @@ impl AgentHarness {
         };
 
         // Build the config.
+        let custom_converter = snap.to_provider_messages.is_some();
         let convert = Self::build_convert_to_llm(snap.to_provider_messages);
+        let convert_to_llm_incremental = if custom_converter {
+            None
+        } else {
+            Some(Arc::new(harness_convert_to_llm_incremental) as rpi_agent::IncrementalConvertToLlm)
+        };
         let stream_fn = Self::build_stream_fn(
             snap.models.clone(),
             snap.provider_hooks.clone(),
@@ -3856,6 +4004,7 @@ impl AgentHarness {
         let mut config = AgentLoopConfig {
             model: snap.model.clone(),
             convert_to_llm: convert,
+            convert_to_llm_incremental,
             transform_context: snap.transform_context.clone(),
             get_api_key: None,
             should_stop_after_turn,
@@ -3864,6 +4013,7 @@ impl AgentHarness {
                 let harness = self.clone();
                 let enabled = snap.compaction.enabled;
                 let settings = snap.compaction;
+                let stream_options = snap.stream_options.clone();
                 let model = snap.model.clone();
                 let provider = snap
                     .models
@@ -3880,6 +4030,7 @@ impl AgentHarness {
                         let provider = provider.clone().expect("checked above");
                         let cut = Arc::clone(&cut_for_hook);
                         let compaction_signal = compaction_signal.clone();
+                        let stream_options = stream_options.clone();
                         let compaction_run_id = compaction_run_id.clone();
                         let context = ctx.context.clone();
                         let new_messages_len = ctx.new_messages.len();
@@ -3893,7 +4044,7 @@ impl AgentHarness {
                                 message: message.clone(), terminate: None,
                             })).collect();
                             let prep = match prepare_compaction(&entries, settings) { Ok(Some(p)) => p, _ => return None };
-                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None };
+                            let opts = CompactionLlmOptions { provider, model: model.clone(), api_key: None, signal: compaction_signal, thinking_level: None, retry: None, custom_instructions: None, stream_options };
                             let result = match { let _progress = crate::events::CompactionProgressGuard::new(&harness.bus, &harness.lane, false); compact(&prep, &opts).await } { Ok(r) => r, Err(_) => return None };
                             // Mid-loop compaction fires because the turn pushed the
                             // context over the threshold.
@@ -3937,6 +4088,7 @@ impl AgentHarness {
             thinking_level: snap.thinking_level,
             api_key: None,
             timeout: snap.stream_options.timeout,
+            stream_idle_timeout: snap.stream_options.stream_idle_timeout,
             // Pi's `retry.maxRetries` is an assistant-level retry budget. The
             // provider/SDK retry budget is intentionally independent and
             // defaults to zero, so transient failures are retried by the
@@ -3984,6 +4136,7 @@ impl AgentHarness {
             self.lane.clone(),
             run_id.clone(),
         ));
+        settle_state.set_frame_recorder(Arc::clone(&frame_recorder));
         let emitter: Arc<dyn AgentEmitter> = frame_recorder.clone();
 
         // Drive the loop. We pass an EMPTY prompts vec to `run_agent_loop`
@@ -4006,11 +4159,18 @@ impl AgentHarness {
             self.clone(),
         ));
         let result = loop {
+            // An attempt owns its history. A retry reloads the durable branch
+            // below, so retaining a deep copy of these messages is unnecessary.
+            let attempt_context = AgentContext {
+                system_prompt: agent_context.system_prompt.clone(),
+                messages: std::mem::take(&mut agent_context.messages),
+                tools: agent_context.tools.clone(),
+            };
             // Entering from an assistant runs that message's tools as its very
             // first action, which is exactly why it is never retried (see below).
             let attempt_result = if from_assistant {
                 run_agent_loop_from_assistant(
-                    agent_context.clone(),
+                    attempt_context,
                     config.clone(),
                     Arc::clone(&emitter),
                     Arc::clone(&stream_fn),
@@ -4019,7 +4179,7 @@ impl AgentHarness {
             } else {
                 run_agent_loop(
                     Vec::new(),
-                    agent_context.clone(),
+                    attempt_context,
                     config.clone(),
                     Arc::clone(&emitter),
                     Arc::clone(&stream_fn),
@@ -4112,8 +4272,14 @@ impl AgentHarness {
             post_compaction_cut.store(0, Ordering::Release);
             // Prior tools and delivered context are durable. Rebuild after the
             // wait so any writes accepted during it are included as well.
-            let path = self.branch_path_oldest_first().await?;
-            agent_context.messages = build_session_context(&path, &build_opts).messages;
+            agent_context.messages = if build_opts.entry_transforms.is_empty()
+                && build_opts.entry_projectors.is_empty()
+            {
+                self.branch_context_default().await?.messages
+            } else {
+                let path = self.branch_path_oldest_first().await?;
+                build_session_context_owned(path, &build_opts).messages
+            };
         };
 
         if let Some(error) = context_write_error.lock().unwrap().take() {
@@ -4365,6 +4531,7 @@ impl AgentHarness {
                             None
                         },
                         custom_instructions: custom_instructions.clone(),
+                        stream_options: snap.stream_options.clone(),
                     };
                     match {
                         let _progress = crate::events::CompactionProgressGuard::new(
@@ -5836,5 +6003,90 @@ mod session_switch_tests {
                     )
             )
         }));
+    }
+}
+
+#[cfg(test)]
+mod borrowed_context_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct Probe(Arc<Mutex<(usize, Option<String>)>>);
+    #[async_trait::async_trait]
+    impl rpi_ai::Provider for Probe {
+        fn id(&self) -> &str {
+            "probe"
+        }
+        fn models(&self) -> &[Model] {
+            &[]
+        }
+        async fn stream_simple(
+            &self,
+            model: &Model,
+            context: &rpi_ai::Context,
+            _: &rpi_ai::SimpleStreamOptions,
+        ) -> rpi_ai::AssistantMessageEventStream {
+            *self.0.lock().unwrap() = (
+                context.messages.as_ptr() as usize,
+                context.system_prompt.clone(),
+            );
+            let (mut producer, stream) =
+                rpi_ai::event_stream::create_assistant_message_event_stream();
+            producer
+                .push(rpi_ai::AssistantMessageEvent::Done {
+                    reason: rpi_ai::DoneReason::Stop,
+                    message: AssistantMessage::empty(model.api.clone(), "probe", "m", 0),
+                })
+                .await;
+            stream
+        }
+    }
+    struct Hook(u8);
+    impl rpi_ai::ProviderHooks for Hook {
+        fn transform_context(
+            &self,
+            _: &Model,
+            _: &rpi_ai::Context,
+        ) -> Option<rpi_ai::ContextPatch> {
+            match self.0 {
+                0 => None,
+                1 => Some(Default::default()),
+                _ => Some(rpi_ai::ContextPatch {
+                    system_prompt: Some("patched".into()),
+                }),
+            }
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn observational_hooks_borrow_history_and_mutating_hooks_are_isolated() {
+        for hook in [None, Some(0), Some(1), Some(2)] {
+            let observed = Arc::new(Mutex::new((0, None)));
+            let provider = Arc::new(Probe(Arc::clone(&observed)));
+            let stream_fn = AgentHarness::build_stream_fn(
+                vec![provider],
+                hook.map(|kind| Arc::new(Hook(kind)) as Arc<dyn rpi_ai::ProviderHooks>),
+                Default::default(),
+            )
+            .unwrap();
+            let mut context =
+                rpi_ai::Context::new(vec![
+                    rpi_ai::UserMessage::new("history".repeat(4096), 0).into()
+                ]);
+            context.system_prompt = Some("original".into());
+            let model = Model::new("m", "M", rpi_ai::Api::Faux, "probe", "http://localhost");
+            stream_fn(&model, &context, &Default::default())
+                .result()
+                .await
+                .unwrap();
+            let (pointer, prompt) = observed.lock().unwrap().clone();
+            if hook == Some(2) {
+                assert_ne!(pointer, context.messages.as_ptr() as usize);
+                assert_eq!(prompt.as_deref(), Some("patched"));
+            } else {
+                assert_eq!(pointer, context.messages.as_ptr() as usize);
+                assert_eq!(prompt.as_deref(), Some("original"));
+            }
+            assert_eq!(context.system_prompt.as_deref(), Some("original"));
+        }
     }
 }

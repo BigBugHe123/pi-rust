@@ -64,6 +64,8 @@ struct ShellConfig {
     transport: CommandTransport,
 }
 
+mod append;
+
 /// Environment variables the **host** sets for its own runtime plumbing, which
 /// must not be handed to a shell it spawns.
 ///
@@ -393,6 +395,43 @@ async fn kill_process_tree(pid: u32) {
 
 #[async_trait]
 impl FileSystem for OsExecutionEnv {
+    async fn open_append_file(
+        &self,
+        path: &str,
+    ) -> Result<Option<Box<dyn crate::env::AppendFile>>, FileError> {
+        let path = Self::resolve_path(&self.cwd, path);
+        Ok(Some(Box::new(append::OsAppendFile::open(path).await?)))
+    }
+
+    async fn truncate_file(
+        &self,
+        path: &str,
+        len: u64,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(), FileError> {
+        check_cancel_file(cancel, Some(path))?;
+        let abs = Self::resolve_path(&self.cwd, path);
+        let error_path = abs.to_string_lossy().into_owned();
+        tokio::task::spawn_blocking(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(&abs)?;
+            if len > file.metadata()?.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "truncation cannot grow a file",
+                ));
+            }
+            file.set_len(len)
+        })
+        .await
+        .map_err(|error| {
+            FileError::new(
+                FileErrorCode::Unknown,
+                format!("file truncation task failed: {error}"),
+            )
+        })?
+        .map_err(|error| io_to_file_error(error, Some(&error_path)))
+    }
+
     fn cwd(&self) -> &Path {
         &self.cwd
     }

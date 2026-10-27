@@ -2,15 +2,16 @@
 //! Authentication and model binding are applied once, outside every factory.
 use super::binding::{ExecutionBinding, RequestAuth};
 use super::*;
-use rpi_extensions::{ExtensionSession, ProviderManifest};
+use crate::ProviderDeclaration as ProviderManifest;
 
 trait ProviderFactory: Send + Sync {
     fn create(
         &self,
         provider_id: &str,
         models: Vec<Model>,
-        settings: &settings::Settings,
-    ) -> Arc<dyn Provider>;
+        settings: &crate::RuntimeSettings,
+        values: &dyn ValueSource,
+    ) -> Result<Arc<dyn Provider>, ResolveError>;
 }
 
 struct ProtocolFactory(rpi_ai::Api);
@@ -19,15 +20,16 @@ impl ProviderFactory for ProtocolFactory {
         &self,
         provider_id: &str,
         models: Vec<Model>,
-        settings: &settings::Settings,
-    ) -> Arc<dyn Provider> {
+        settings: &crate::RuntimeSettings,
+        values: &dyn ValueSource,
+    ) -> Result<Arc<dyn Provider>, ResolveError> {
         let fallback = if self.0 == rpi_ai::Api::AnthropicMessages {
             "https://api.anthropic.com"
         } else {
             "https://api.openai.com/v1"
         };
-        let http = provider_http_client(&models, fallback, settings);
-        match self.0 {
+        let http = provider_http_client(&models, fallback, settings, values)?;
+        let provider: Arc<dyn Provider> = match self.0 {
             rpi_ai::Api::AnthropicMessages => Arc::new(
                 AnthropicProvider::with_models_without_env_api_key(None, http, models),
             ),
@@ -48,21 +50,27 @@ impl ProviderFactory for ProtocolFactory {
                 ))
             }
             _ => unreachable!("only supported wire protocols are registered"),
-        }
+        };
+        Ok(provider)
     }
 }
 
 struct ExtensionFactory(Arc<dyn Provider>);
 impl ProviderFactory for ExtensionFactory {
-    fn create(&self, _: &str, _: Vec<Model>, _: &settings::Settings) -> Arc<dyn Provider> {
-        self.0.clone()
+    fn create(
+        &self,
+        _: &str,
+        _: Vec<Model>,
+        _: &crate::RuntimeSettings,
+        _: &dyn ValueSource,
+    ) -> Result<Arc<dyn Provider>, ResolveError> {
+        Ok(self.0.clone())
     }
 }
 
-pub(super) struct RuntimeFactories {
+pub struct RuntimeFactories {
     protocols: BTreeMap<String, Arc<dyn ProviderFactory>>,
-    providers: BTreeMap<String, Arc<dyn ProviderFactory>>,
-    provider_apis: BTreeMap<String, String>,
+    providers: BTreeMap<(String, String), Arc<dyn ProviderFactory>>,
     pub manifests: Vec<ProviderManifest>,
 }
 
@@ -84,63 +92,57 @@ impl Default for RuntimeFactories {
         Self {
             protocols,
             providers: BTreeMap::new(),
-            provider_apis: BTreeMap::new(),
             manifests: Vec::new(),
         }
     }
 }
 
 impl RuntimeFactories {
-    pub fn from_session(session: &ExtensionSession) -> Self {
-        let mut factories = Self::default();
-        if let Some(snapshot) = session.snapshot() {
-            factories.provider_apis = snapshot
-                .providers()
-                .iter()
-                .map(|provider| (provider.provider_id.clone(), provider.api_style.clone()))
-                .collect();
-            factories.providers = rpi_extensions::PluggableProvider::from_session(
-                session,
-                tokio::runtime::Handle::current(),
-            )
-            .into_iter()
-            .map(|provider| {
-                (
-                    provider.id().to_string(),
-                    Arc::new(ExtensionFactory(provider)) as Arc<dyn ProviderFactory>,
-                )
-            })
-            .collect();
-            factories.manifests = manifests_from_session(session);
-        }
-        factories
+    /// Add a declaration without loading an implementation (catalog discovery).
+    pub fn declare(&mut self, declaration: ProviderManifest) {
+        self.manifests.retain(|known| known.id != declaration.id);
+        self.manifests.push(declaration);
+    }
+    /// Register a host-owned implementation. Its Arc keeps the original loader
+    /// lease alive for all requests resolved from this registry.
+    pub fn register(&mut self, provider: Arc<dyn Provider>, api: rpi_ai::Api) {
+        let id = provider.id().to_string();
+        self.providers.insert(
+            (id, api.as_str().into()),
+            Arc::new(ExtensionFactory(provider)),
+        );
     }
 
-    pub fn configure(
+    pub(super) fn configure(
         &self,
         provider_id: &str,
         api: &rpi_ai::Api,
         models: Vec<Model>,
         auth: RequestAuth,
-        settings: &settings::Settings,
-    ) -> Option<(Arc<dyn Provider>, Arc<ExecutionBinding>)> {
+        settings: &crate::RuntimeSettings,
+        values: &dyn ValueSource,
+    ) -> Result<(Arc<dyn Provider>, Arc<ExecutionBinding>), ResolveError> {
         let factory = self
             .providers
-            .get(provider_id)
-            .filter(|_| {
-                self.provider_apis
-                    .get(provider_id)
-                    .map_or(true, |declared| declared == api.as_str())
-            })
-            .or_else(|| self.protocols.get(api.as_str()))?;
+            .get(&(provider_id.into(), api.as_str().into()))
+            .or_else(|| self.protocols.get(api.as_str()))
+            .ok_or_else(|| ResolveError::UnsupportedApi {
+                provider: provider_id.into(),
+                api: api.as_str().into(),
+            })?;
         let binding = Arc::new(ExecutionBinding::new(provider_id, models, auth));
-        let inner = factory.create(provider_id, binding.models().to_vec(), settings);
+        let inner = factory.create(
+            provider_id,
+            binding.descriptors().to_vec(),
+            settings,
+            values,
+        )?;
         let provider = Arc::new(ConfiguredProvider {
             id: provider_id.into(),
             inner,
             binding: binding.clone(),
         });
-        Some((provider, binding))
+        Ok((provider, binding))
     }
 }
 
@@ -213,24 +215,26 @@ impl Provider for RoutedProvider {
         });
         match route {
             Some(route) => route.stream_simple(model, context, options).await,
-            None => unbound_model_error(model, &self.id),
+            None => unbound_model_error(model, &self.id).await,
         }
     }
 }
 
-fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessageEventStream {
+async fn unbound_model_error(model: &Model, provider_id: &str) -> AssistantMessageEventStream {
     let (mut producer, stream) = rpi_ai::event_stream::create_assistant_message_event_stream();
-    producer.push(rpi_ai::AssistantMessageEvent::Error {
-        reason: rpi_ai::types::ErrorReason::Error,
-        error: rpi_ai::types::AssistantMessage::terminal(
-            model.api.clone(),
-            provider_id,
-            model.id.clone(),
-            rpi_ai::types::StopReason::Error,
-            "model is not registered in this provider execution binding",
-            0,
-        ),
-    });
+    producer
+        .push(rpi_ai::AssistantMessageEvent::Error {
+            reason: rpi_ai::types::ErrorReason::Error,
+            error: rpi_ai::types::AssistantMessage::terminal(
+                model.api.clone(),
+                provider_id,
+                model.id.clone(),
+                rpi_ai::types::StopReason::Error,
+                "model is not registered in this provider execution binding",
+                0,
+            ),
+        })
+        .await;
     stream
 }
 
@@ -240,7 +244,7 @@ impl Provider for ConfiguredProvider {
         &self.id
     }
     fn models(&self) -> &[Model] {
-        self.binding.models()
+        self.binding.descriptors()
     }
     async fn stream_simple(
         &self,
@@ -249,7 +253,7 @@ impl Provider for ConfiguredProvider {
         options: &SimpleStreamOptions,
     ) -> AssistantMessageEventStream {
         let Some((model, options)) = self.binding.prepare(model, options) else {
-            return unbound_model_error(model, &self.id);
+            return unbound_model_error(model, &self.id).await;
         };
         self.inner.stream_simple(&model, context, &options).await
     }
@@ -268,12 +272,18 @@ mod tests {
     struct RecordingFactory(Calls);
     struct RecordingProvider(Calls);
     impl ProviderFactory for RecordingFactory {
-        fn create(&self, _: &str, models: Vec<Model>, _: &settings::Settings) -> Arc<dyn Provider> {
+        fn create(
+            &self,
+            _: &str,
+            models: Vec<Model>,
+            _: &crate::RuntimeSettings,
+            _: &dyn ValueSource,
+        ) -> Result<Arc<dyn Provider>, ResolveError> {
             assert!(
                 models.iter().all(|model| model.headers.is_none()),
                 "factories receive public descriptors"
             );
-            Arc::new(RecordingProvider(self.0.clone()))
+            Ok(Arc::new(RecordingProvider(self.0.clone())))
         }
     }
     #[async_trait::async_trait]
@@ -296,15 +306,17 @@ mod tests {
                 .push((model.clone(), options.clone()));
             let (mut producer, stream) =
                 rpi_ai::event_stream::create_assistant_message_event_stream();
-            producer.push(AssistantMessageEvent::Done {
-                reason: DoneReason::Stop,
-                message: AssistantMessage::empty(
-                    model.api.clone(),
-                    model.provider.clone(),
-                    model.id.clone(),
-                    0,
-                ),
-            });
+            producer
+                .push(AssistantMessageEvent::Done {
+                    reason: DoneReason::Stop,
+                    message: AssistantMessage::empty(
+                        model.api.clone(),
+                        model.provider.clone(),
+                        model.id.clone(),
+                        0,
+                    ),
+                })
+                .await;
             stream
         }
     }
@@ -329,7 +341,7 @@ mod tests {
                 "Same model",
                 api.clone(),
                 "deepseek",
-                &format!("https://configured.example/{}", api.as_str()),
+                format!("https://configured.example/{}", api.as_str()),
             );
             model.headers = Some(BTreeMap::from([("x-route".into(), token.into())]));
             runtimes.push(
@@ -339,7 +351,8 @@ mod tests {
                         &api,
                         vec![model],
                         RequestAuth::ApiKey(token.into()),
-                        &settings::Settings::default(),
+                        &crate::RuntimeSettings::default(),
+                        &BTreeMap::<String, String>::new(),
                     )
                     .unwrap()
                     .0,
@@ -373,7 +386,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let recorded = calls.lock().unwrap();
+        let recorded = calls.lock().unwrap().clone();
         assert_eq!(recorded.len(), 2);
         for (call, (api, token)) in recorded.iter().zip([
             (Api::OpenaiCompletions, "completions-token"),
@@ -415,12 +428,9 @@ mod tests {
         let protocol_calls = Calls::default();
         let mut factories = RuntimeFactories::default();
         factories.providers.insert(
-            "deepseek".into(),
+            ("deepseek".into(), "openai-completions".into()),
             Arc::new(RecordingFactory(extension_calls.clone())),
         );
-        factories
-            .provider_apis
-            .insert("deepseek".into(), "openai-completions".into());
         factories.protocols.insert(
             "openai-responses".into(),
             Arc::new(RecordingFactory(protocol_calls.clone())),
@@ -439,7 +449,8 @@ mod tests {
                     &api,
                     vec![model],
                     RequestAuth::None,
-                    &settings::Settings::default(),
+                    &crate::RuntimeSettings::default(),
+                    &BTreeMap::<String, String>::new(),
                 )
                 .unwrap();
             provider
@@ -472,7 +483,9 @@ mod tests {
             let mut factories = RuntimeFactories::default();
             let factory = Arc::new(RecordingFactory(calls.clone())) as Arc<dyn ProviderFactory>;
             if extension {
-                factories.providers.insert("account".into(), factory);
+                factories
+                    .providers
+                    .insert(("account".into(), "openai-completions".into()), factory);
             } else {
                 factories
                     .protocols
@@ -495,7 +508,8 @@ mod tests {
                     &raw.api.clone(),
                     vec![raw],
                     RequestAuth::ApiKey("private-credential".into()),
-                    &settings::Settings::default(),
+                    &crate::RuntimeSettings::default(),
+                    &BTreeMap::<String, String>::new(),
                 )
                 .unwrap();
             let serialized = serde_json::to_string(provider.models()).unwrap();
@@ -520,7 +534,7 @@ mod tests {
                 .result()
                 .await
                 .unwrap();
-            let recorded = calls.lock().unwrap();
+            let recorded = calls.lock().unwrap().clone();
             assert_eq!(recorded.len(), 1);
             assert_eq!(recorded[0].0.base_url, "https://configured.example/v1");
             assert_eq!(
@@ -562,9 +576,10 @@ mod tests {
     async fn request_overrides_and_model_headers_remain_scoped_to_their_execution() {
         let calls = Calls::default();
         let mut factories = RuntimeFactories::default();
-        factories
-            .providers
-            .insert("gateway".into(), Arc::new(RecordingFactory(calls.clone())));
+        factories.providers.insert(
+            ("gateway".into(), "anthropic-messages".into()),
+            Arc::new(RecordingFactory(calls.clone())),
+        );
         let mut models = vec![];
         for (id, token) in [("first", "first-token"), ("second", "second-token")] {
             let mut model = Model::new(
@@ -586,7 +601,8 @@ mod tests {
                     "authorization".into(),
                     "Bearer default".into(),
                 )])),
-                &settings::Settings::default(),
+                &crate::RuntimeSettings::default(),
+                &BTreeMap::<String, String>::new(),
             )
             .unwrap();
         let options = SimpleStreamOptions {
@@ -604,7 +620,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let recorded = calls.lock().unwrap();
+        let recorded = calls.lock().unwrap().clone();
         assert_eq!(
             recorded[0].0.headers.as_ref().unwrap()["x-api-key"],
             "first-token"

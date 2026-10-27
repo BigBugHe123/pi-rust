@@ -13,13 +13,12 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use crate::ansi::bold;
 use crate::ansi::strip_ansi;
-use crate::spacer::Spacer;
 use crate::theme::{theme, theme_revision, Theme, ThemeColors};
 use crate::tool_panel::ToolPanel;
 use crate::utils::{truncate_to_width, wrap_text_with_ansi};
@@ -58,7 +57,7 @@ struct BashRenderCache {
     width: usize,
     revision: u64,
     theme_revision: u64,
-    lines: Vec<String>,
+    lines: Arc<Vec<String>>,
 }
 
 /// Component that displays a bash command execution with streaming output.
@@ -293,7 +292,7 @@ impl BashExecutionComponent {
         let content_width = panel.content_width;
         let panel_line = |content: &str| panel.line(content);
         let blank = panel.blank();
-        let mut lines = Spacer::new(1).render(width);
+        let mut lines = Vec::new();
         lines.extend(std::iter::repeat(blank.clone()).take(panel.padding_y));
 
         let excluded = *self.exclude_from_context.lock().unwrap();
@@ -363,12 +362,15 @@ impl BashExecutionComponent {
             }
         }
         lines.extend(std::iter::repeat(blank).take(panel.padding_y));
+        // Trailing spacer (one convention for every panel: each transcript
+        // entry ends with its own blank row; nothing adds a leading one).
+        lines.push(String::new());
         lines
     }
 }
 
-impl Component for BashExecutionComponent {
-    fn render(&self, width: usize) -> Vec<String> {
+impl BashExecutionComponent {
+    fn shared_lines(&self, width: usize) -> Arc<Vec<String>> {
         let status = *self.status.lock().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let theme_revision = theme_revision();
@@ -389,7 +391,7 @@ impl Component for BashExecutionComponent {
             }
         }
 
-        let lines = self.render_panel(width, status, &theme());
+        let lines = Arc::new(self.render_panel(width, status, &theme()));
 
         if status != BashStatus::Running {
             if let Ok(mut cache) = self.cache.lock() {
@@ -406,6 +408,16 @@ impl Component for BashExecutionComponent {
 
         lines
     }
+}
+
+impl Component for BashExecutionComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.shared_lines(width).as_ref().clone()
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.shared_lines(width))
+    }
 
     fn invalidate(&self) {
         self.bump();
@@ -419,6 +431,97 @@ impl Component for BashExecutionComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finalized_documents_share_rows_and_refresh_after_changes() {
+        for (exit_code, cancelled) in [(0, false), (1, false), (0, true)] {
+            let panel = BashExecutionComponent::new("echo output");
+            *panel.started_at.lock().unwrap() = None;
+            let output = (1..=30)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            panel.append_output(&output);
+            panel.set_complete(Some(exit_code), cancelled, BashTruncation::default());
+            let first = panel.shared_lines(80);
+            assert!(Arc::ptr_eq(&first, &panel.shared_lines(80)));
+            let references = Arc::strong_count(&first);
+            let document = panel.render_document(80);
+            let second_document = panel.render_document(80);
+            assert_eq!(Arc::strong_count(&first), references + 2);
+            assert_eq!(document.lines(0, document.len()), first.as_ref().clone());
+            assert_eq!(second_document.len(), document.len());
+            assert_eq!(panel.render(80), first.as_ref().clone());
+
+            panel.set_expanded(true);
+            let expanded = panel.shared_lines(80);
+            assert!(!Arc::ptr_eq(&first, &expanded));
+            assert!(expanded
+                .iter()
+                .any(|row| strip_ansi(row).trim() == "line 1"));
+            assert!(!first.iter().any(|row| strip_ansi(row).trim() == "line 1"));
+            assert!(expanded.len() > first.len());
+
+            panel.append_output("late output");
+            let updated = panel.shared_lines(80);
+            assert!(!Arc::ptr_eq(&expanded, &updated));
+            assert!(strip_ansi(&updated.join("\n")).contains("late output"));
+            panel.set_command("echo corrected");
+            let corrected = panel.shared_lines(80);
+            assert!(!Arc::ptr_eq(&updated, &corrected));
+            assert!(strip_ansi(&corrected.join("\n")).contains("echo corrected"));
+            let narrow = panel.shared_lines(24);
+            assert!(!Arc::ptr_eq(&corrected, &narrow));
+            assert!(narrow
+                .iter()
+                .all(|row| crate::utils::visible_width(row) <= 24));
+            panel.invalidate();
+            let invalidated = panel.shared_lines(24);
+            assert!(!Arc::ptr_eq(&narrow, &invalidated));
+            assert_eq!(narrow, invalidated);
+            assert!(Arc::ptr_eq(&invalidated, &panel.shared_lines(24)));
+        }
+    }
+
+    #[test]
+    fn running_documents_do_not_cache_output_or_elapsed_rows() {
+        let panel = BashExecutionComponent::new("echo live");
+        let first = panel.shared_lines(80);
+        assert!(!Arc::ptr_eq(&first, &panel.shared_lines(80)));
+        panel.append_output("live output");
+        let updated = panel.shared_lines(80);
+        assert!(strip_ansi(&updated.join("\n")).contains("live output"));
+        assert!(!strip_ansi(&first.join("\n")).contains("live output"));
+        *panel.started_at.lock().unwrap() = Some(Instant::now() - Duration::from_secs(65));
+        let later = panel.shared_lines(80);
+        let text = strip_ansi(&later.join("\n"));
+        assert!(text.contains("1m5s"));
+        assert!(text.contains("Esc / Ctrl+C"));
+        assert!(!Arc::ptr_eq(&updated, &later));
+        assert!(panel.cache.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn panel_carries_a_trailing_spacer_and_no_leading_one() {
+        // Trailing-spacing convention (see tool_execution tests): the panel
+        // ends with one blank row and opens directly with its border/padding.
+        let theme = Theme::default();
+        let c = BashExecutionComponent::new("echo hi");
+        *c.started_at.lock().unwrap() = None;
+        c.append_output("hi");
+        c.set_complete(Some(0), false, BashTruncation::default());
+        let lines = c.render_panel(40, BashStatus::Complete, &theme);
+        assert_eq!(
+            lines.last(),
+            Some(&String::new()),
+            "bash panel must end with the trailing spacer: {lines:?}"
+        );
+        assert_ne!(
+            lines.first(),
+            Some(&String::new()),
+            "bash panel must not open with a spacer: {lines:?}"
+        );
+    }
 
     #[test]
     fn panel_has_themed_insets_in_every_execution_state() {
@@ -442,13 +545,19 @@ mod tests {
                 BashStatus::Error | BashStatus::Cancelled => theme.colors.tool_error_bg,
             };
             let lines = c.render_panel(width, status, &theme);
-            assert_eq!(lines[0], "", "outer spacer must remain uncolored");
-            assert_eq!(lines[1], bg.bg(&" ".repeat(width)));
-            assert_eq!(lines.last().unwrap(), &lines[1]);
-            let plain: Vec<_> = lines[1..].iter().map(|line| strip_ansi(line)).collect();
+            assert_eq!(lines[0], bg.bg(&" ".repeat(width)));
+            assert_eq!(
+                lines.last().unwrap(),
+                &String::new(),
+                "trailing spacer must remain uncolored"
+            );
+            let plain: Vec<_> = lines[..lines.len() - 1]
+                .iter()
+                .map(|line| strip_ansi(line))
+                .collect();
             assert_eq!(plain[1].trim_end(), "  $ echo hi");
             assert!(plain.iter().any(|line| line.trim_end() == "  hi"));
-            for (styled, text) in lines[1..].iter().zip(&plain) {
+            for (styled, text) in lines[..lines.len() - 1].iter().zip(&plain) {
                 assert!(styled.starts_with(&bg.to_bg()));
                 assert_eq!(crate::utils::visible_width(text), width);
                 assert!(text.starts_with("  ") && text.ends_with("  "), "{text:?}");
@@ -468,9 +577,13 @@ mod tests {
         c.set_complete(Some(0), false, BashTruncation::default());
         let lines = c.render_panel(40, BashStatus::Complete, &theme);
         let blank = theme.colors.tool_success_bg.bg(&" ".repeat(40));
-        assert_eq!(lines[1..3], [blank.clone(), blank.clone()]);
-        assert_eq!(lines[lines.len() - 2..], [blank.clone(), blank]);
-        assert_eq!(strip_ansi(&lines[3]).trim_end(), "    $ echo hi");
+        assert_eq!(lines[0..2], [blank.clone(), blank.clone()]);
+        assert_eq!(
+            lines[lines.len() - 3..],
+            [blank.clone(), blank, String::new()],
+            "panel ends with padding + trailing spacer"
+        );
+        assert_eq!(strip_ansi(&lines[2]).trim_end(), "    $ echo hi");
         assert!(lines
             .iter()
             .any(|line| strip_ansi(line).trim_end() == "    hi"));
@@ -478,8 +591,8 @@ mod tests {
         theme.spacing.tool_panel_padding_x = 0;
         theme.spacing.tool_panel_padding_y = 0;
         let lines = c.render_panel(40, BashStatus::Complete, &theme);
-        assert_eq!(strip_ansi(&lines[1]).trim_end(), "$ echo hi");
-        assert_eq!(strip_ansi(lines.last().unwrap()).trim_end(), "hi");
+        assert_eq!(strip_ansi(&lines[0]).trim_end(), "$ echo hi");
+        assert_eq!(strip_ansi(&lines[lines.len() - 2]).trim_end(), "hi");
     }
 
     #[test]
@@ -493,7 +606,7 @@ mod tests {
         for expanded in [false, true] {
             c.set_expanded(expanded);
             let lines = c.render_panel(12, BashStatus::Complete, &theme);
-            let output_rows = &lines[3..lines.len() - 1];
+            let output_rows = &lines[2..lines.len() - 2];
             let reconstructed: String = output_rows
                 .iter()
                 .map(|line| strip_ansi(line).trim().to_string())

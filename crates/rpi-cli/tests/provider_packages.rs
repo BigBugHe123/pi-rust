@@ -516,6 +516,11 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains("models.json:"),
+            "reload diagnostics must be returned to the UI: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         return;
     }
     let cwd = PathBuf::from(std::env::var_os("RPI_TEST_PACKAGE_CWD").unwrap());
@@ -578,13 +583,22 @@ async fn reload_updates_the_catalog_endpoint_and_runtime_without_a_restart() {
     });
     for index in 0..2 {
         std::fs::write(agent.join("models.json"), serde_json::json!({"providers":{"proxy":{
-            "baseUrl":base,"apiKey":format!("reload-key-{index}"),"models":[{"id":"default"},{"id":"second"}]
+            "baseUrl":base,"apiKey":format!("reload-key-{index}"),"models":[{"id":"default","compat":{"misspelledReloadFlag":true}},{"id":"second"}]
         }}}).to_string()).unwrap();
         let outcome = rpi_cli::session::reload_extension_resources(&harness, &context).await;
         assert!(
             !outcome.had_errors,
             "{} {:?}",
             outcome.summary, outcome.details
+        );
+        assert!(outcome.had_warnings);
+        assert_eq!(
+            outcome
+                .details
+                .iter()
+                .filter(|detail| detail.contains("misspelledReloadFlag"))
+                .count(),
+            1
         );
         assert!(context
             .catalog
@@ -729,6 +743,9 @@ fn linked_package_is_discovered_and_unlinked_cleanly() {
             .current_dir(temp.path())
             .env("RPI_CODING_AGENT_DIR", temp.path().join("agent"))
             .env("RPI_OFFLINE", "1")
+            // package link spawns Cargo. Do not contend with the parent test
+            // runner's target lock or another workspace's build artifacts.
+            .env("CARGO_TARGET_DIR", temp.path().join("cargo-target"))
             .stdin(Stdio::null())
             .args(args)
             .output()

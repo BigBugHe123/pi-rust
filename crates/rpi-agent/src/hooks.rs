@@ -91,6 +91,12 @@ pub type AfterToolCall = Arc<
 >;
 
 /// The config bundle handed to `run_agent_loop` / `run_agent_loop_continue`.
+///
+/// An optional incremental converter for the common case where the context is
+/// unchanged except for messages appended at its tail. It must preserve the
+/// same projection as `convert_to_llm` for the supplied suffix.
+pub type IncrementalConvertToLlm = Arc<dyn Fn(&[AgentMessage]) -> Vec<Message> + Send + Sync>;
+
 /// Mirrors TS `AgentLoopConfig`. Hook fields are `Option` except `convert_to_llm`
 /// (required). The provider-options subset (`api_key`, `timeout`, `cache_retention`,
 /// `session_id`, `max_retries`, `max_retry_delay`, `signal`) is kept as plain
@@ -103,6 +109,10 @@ pub struct AgentLoopConfig {
     /// `AgentBuilder` installs `default_convert_to_llm` (drop custom roles) when
     /// the caller doesn't supply one.
     pub convert_to_llm: ConvertToLlm,
+    /// Optional fast path for appending provider messages when no context
+    /// transform is installed. Custom converters can leave this unset and use
+    /// the original full conversion path.
+    pub convert_to_llm_incremental: Option<IncrementalConvertToLlm>,
 
     pub transform_context: Option<TransformContext>,
     pub get_api_key: Option<GetApiKey>,
@@ -121,6 +131,8 @@ pub struct AgentLoopConfig {
     pub thinking_level: ThinkingLevel,
     pub api_key: Option<String>,
     pub timeout: Option<Duration>,
+    /// Maximum silence between streamed response bytes; zero disables it.
+    pub stream_idle_timeout: Option<Duration>,
     pub max_retries: Option<u32>,
     pub max_retry_delay: Option<Duration>,
     pub cache_retention: CacheRetention,
@@ -138,6 +150,10 @@ impl std::fmt::Debug for AgentLoopConfig {
             .field("cache_retention", &self.cache_retention)
             .field("session_id", &self.session_id)
             .field("transform_context", &self.transform_context.is_some())
+            .field(
+                "convert_to_llm_incremental",
+                &self.convert_to_llm_incremental.is_some(),
+            )
             .field("get_api_key", &self.get_api_key.is_some())
             .field(
                 "should_stop_after_turn",
@@ -167,6 +183,7 @@ impl AgentLoopConfig {
         let mut opts = SimpleStreamOptions {
             api_key,
             timeout: self.timeout,
+            stream_idle_timeout: self.stream_idle_timeout,
             max_retries: self.max_retries,
             max_retry_delay: self.max_retry_delay,
             headers: None,
@@ -191,15 +208,34 @@ impl AgentLoopConfig {
 /// The default `convert_to_llm`: keep only `user`/`assistant`/`toolResult`
 /// messages, drop `custom`. Mirrors TS `defaultConvertToLlm`.
 pub fn default_convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
+    let mut converted = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            AgentMessage::User(user) => converted.push(Message::User(user)),
+            AgentMessage::Assistant(assistant) => converted.push(Message::Assistant(assistant)),
+            AgentMessage::ToolResult(tool_result) => {
+                converted.push(Message::ToolResult(tool_result))
+            }
+            AgentMessage::Custom(_) => {}
+        }
+    }
+    converted
+}
+
+pub fn default_convert_to_llm_incremental(messages: &[AgentMessage]) -> Vec<Message> {
     messages
-        .into_iter()
-        .filter_map(|m| match m {
-            AgentMessage::User(u) => Some(Message::User(u)),
-            AgentMessage::Assistant(a) => Some(Message::Assistant(a)),
-            AgentMessage::ToolResult(t) => Some(Message::ToolResult(t)),
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::User(user) => Some(Message::User(user.clone())),
+            AgentMessage::Assistant(assistant) => Some(Message::Assistant(assistant.clone())),
+            AgentMessage::ToolResult(tool_result) => Some(Message::ToolResult(tool_result.clone())),
             AgentMessage::Custom(_) => None,
         })
         .collect()
+}
+
+pub fn default_convert_to_llm_incremental_fn() -> IncrementalConvertToLlm {
+    Arc::new(default_convert_to_llm_incremental)
 }
 
 /// Wrap a `default_convert_to_llm` into the `ConvertToLlm` Arc shape expected

@@ -20,6 +20,45 @@ use common::{
 use rpi_agent::{AgentContext, AgentEvent};
 use rpi_ai::types::StopReason;
 
+#[tokio::test]
+async fn loop_keeps_the_owned_history_payload_instead_of_copying_it() {
+    let (echo, _) = EchoTool::new();
+    let mut context = context_with_tools(vec![Arc::new(echo)]);
+    let history = "owned history".repeat(4096);
+    let original = history.as_ptr() as usize;
+    context.messages.push(user_message(history));
+    let mut config = base_config();
+    config.should_stop_after_turn = Some(Arc::new(move |turn| {
+        let rpi_agent::AgentMessage::User(user) = &turn.context.messages[0] else {
+            panic!("history must remain first");
+        };
+        let rpi_ai::UserContent::Text(text) = &user.content else {
+            panic!("expected text history");
+        };
+        assert_eq!(
+            text.as_ptr() as usize,
+            original,
+            "an owned history needs no defensive copy"
+        );
+        Box::pin(async { true })
+    }));
+    let (_, messages) = run_and_collect(
+        vec![user_message("echo something")],
+        context,
+        config,
+        mock_stream_fn(vec![assistant_tool_calls(
+            vec![("tool-1", "echo", serde_json::json!({"value":"hello"}))],
+            StopReason::ToolUse,
+        )]),
+    )
+    .await;
+    assert_eq!(
+        messages.len(),
+        3,
+        "returned messages contain only this run's additions"
+    );
+}
+
 /// A scripted echo tool — mirrors the TS `echo` tool used across
 /// `agent-loop.test.ts`. Records every `value` it executed so tests can assert
 /// ordering + that (un)expected calls did/didn't run.
@@ -222,26 +261,31 @@ async fn emits_message_update_events_on_streaming_deltas() {
             );
             partial.content.push(rpi_ai::types::Content::text(""));
             let p = std::sync::Arc::new(partial.clone());
-            prod.push(AssistantMessageEvent::Start { partial: p.clone() });
+            prod.push(AssistantMessageEvent::Start { partial: p.clone() })
+                .await;
             prod.push(AssistantMessageEvent::TextStart {
                 content_index: 0,
                 partial: p.clone(),
-            });
+            })
+            .await;
             prod.push(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "Hi ".into(),
                 partial: p.clone(),
-            });
+            })
+            .await;
             prod.push(AssistantMessageEvent::TextDelta {
                 content_index: 0,
                 delta: "there!".into(),
                 partial: p.clone(),
-            });
+            })
+            .await;
             prod.push(AssistantMessageEvent::TextEnd {
                 content_index: 0,
                 content: "Hi there!".into(),
                 partial: p.clone(),
-            });
+            })
+            .await;
             let mut final_msg = (*p).clone();
             final_msg.stop_reason = StopReason::Stop;
             final_msg.content.clear();
@@ -251,7 +295,8 @@ async fn emits_message_update_events_on_streaming_deltas() {
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Stop,
                 message: final_msg,
-            });
+            })
+            .await;
         });
         stream
     });
@@ -302,13 +347,15 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
             let snapshot = Arc::new(partial.clone());
             prod.push(AssistantMessageEvent::Start {
                 partial: Arc::clone(&snapshot),
-            });
+            })
+            .await;
             for delta in ["Hi ", "there!"] {
                 prod.push(AssistantMessageEvent::TextDelta {
                     content_index: 0,
                     delta: delta.into(),
                     partial: Arc::clone(&snapshot),
-                });
+                })
+                .await;
             }
             let mut final_msg = (*snapshot).clone();
             final_msg.stop_reason = StopReason::Stop;
@@ -319,7 +366,8 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
             prod.push(AssistantMessageEvent::Done {
                 reason: DoneReason::Stop,
                 message: final_msg,
-            });
+            })
+            .await;
         });
         stream
     });

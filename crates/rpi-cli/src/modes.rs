@@ -24,11 +24,11 @@ use rpi_harness::agent_harness::{
     AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome,
 };
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
-use rpi_harness::session::types::{EntryOrder, LaneRecord, RecordQuery};
+use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
 
 use crate::args::Args;
 use crate::rpc::protocol as rpc_protocol;
-use crate::rpc::writer::{start_rpc_writer, write_line, RpcWriter};
+use crate::rpc::writer::{start_rpc_writer, write_agent_event, write_line, RpcWriter};
 
 /// Extract the concatenated text content from an assistant message. Mirrors the
 /// TS print-mode loop (`for content of assistantMsg.content if type===text`).
@@ -349,7 +349,7 @@ where
                     event = rx.recv() => event,
                 };
                 match received {
-                    Ok(event) => write_line(&out, &agent_event_json(&event)).await,
+                    Ok(event) => write_agent_event(&out, &event).await,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -578,6 +578,8 @@ where
                 }
                 let content = msg
                     .get("message")
+                    .or_else(|| msg.get("content"))
+                    .or_else(|| msg.get("prompt"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 let lane_task = Arc::clone(&lane);
@@ -682,6 +684,8 @@ where
             "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
+            "get_session_branch" => rpc_get_session_branch(harness).await,
+            "append_entry" => rpc_append_entry(harness, &msg).await,
             "get_stats" => rpc_get_stats(&lane, harness).await,
             "get_queue" => rpc_get_queue(&lane, harness, &msg).await,
             "queue_message" => rpc_queue_message(&lane, &msg).await,
@@ -799,7 +803,7 @@ async fn drain_rpc_events(
 ) {
     loop {
         match events.try_recv() {
-            Ok(event) => write_line(out, &agent_event_json(&event)).await,
+            Ok(event) => write_agent_event(out, &event).await,
             Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
             Err(_) => break,
         }
@@ -995,6 +999,7 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
     let stats = rpc_get_stats(lane, harness).await.ok();
     serde_json::json!({
         "modelId": model.as_ref().map(|model| model.id.clone()),
+        "model": model.as_ref().map(|model| model.id.clone()),
         "provider": model.as_ref().map(|model| model.provider.clone()),
         "thinkingLevel": thinking,
         "activeTools": active_tools,
@@ -1032,7 +1037,7 @@ fn rpc_message_text(value: &serde_json::Value) -> String {
         .flatten()
         .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
         .collect::<Vec<_>>()
-        .join("\\n")
+        .join("\n")
 }
 
 async fn rpc_get_history(
@@ -1090,6 +1095,41 @@ async fn rpc_get_history(
         "leafId": lane.get_leaf_id().await.ok().flatten(),
         "openOperations": open_operations.iter().map(|record| serde_json::to_value(record).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>(),
     }))
+}
+
+async fn rpc_get_session_branch(harness: &AgentHarness) -> Result<serde_json::Value, String> {
+    let entries = harness
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let entries = entries
+        .iter()
+        .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({"entries": entries, "count": entries.len()}))
+}
+
+async fn rpc_append_entry(
+    harness: &AgentHarness,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let custom_type = msg
+        .get("customType")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "append_entry requires a non-empty string `customType`".to_string())?;
+    let entry_id = harness
+        .session()
+        .append_custom_entry(custom_type, msg.get("data").cloned())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"entryId": entry_id, "customType": custom_type}))
 }
 
 async fn rpc_get_stats(
@@ -1494,23 +1534,32 @@ fn rpc_get_auth_status(
 ) -> serde_json::Value {
     let store = crate::config::read_auth().unwrap_or_default();
     let models = crate::config::load_models_config().unwrap_or_default();
+    let manifests = oauth_snapshot.map_or_else(Vec::new, |snapshot| {
+        snapshot
+            .providers()
+            .iter()
+            .filter_map(|provider| snapshot.provider_manifest(&provider.provider_id).cloned())
+            .collect()
+    });
+    let auth_states = crate::credentials::statuses(&models, &store, &manifests);
     let providers = rpc_auth_provider_ids(model_catalog)
         .into_iter()
         .map(|provider| {
             let credential = store.get(&provider);
-            let source = crate::credentials::resolve(
-                &provider,
-                models.providers.get(&provider),
-                &store,
-                None,
+            let state = auth_states.get(&provider).cloned().unwrap_or(
+                rpi_runtime::credentials::AuthState {
+                    status: rpi_runtime::credentials::AuthStatus::Missing,
+                    source: crate::credentials::CredentialSource::Missing,
+                },
             );
             let oauth = matches!(credential, Some(crate::config::Credential::Oauth { .. }));
             let oauth_available =
                 oauth_snapshot.is_some_and(|snapshot| snapshot.oauth_provider(&provider).is_some());
             serde_json::json!({
                 "provider": provider,
-                "ready": source.source.is_present(),
-                "source": source.source.as_json_str(),
+                "ready": state.is_ready(),
+                "source": state.source.as_json_str(),
+                "status": state.status,
                 "oauth": oauth,
                 "oauthAvailable": oauth_available,
             })
@@ -1681,7 +1730,7 @@ async fn rpc_set_model(
         .iter()
         .find(|m| {
             m.id.eq_ignore_ascii_case(id)
-                && provider.is_none_or(|provider| m.provider.eq_ignore_ascii_case(provider))
+                && provider.map_or(true, |provider| m.provider.eq_ignore_ascii_case(provider))
         })
         .cloned()
         .ok_or_else(|| format!("unknown model: {id}"))?;
@@ -2018,6 +2067,46 @@ mod tests {
     }
 
     #[test]
+    fn rpc_auth_status_shares_header_readiness_and_expired_token_state() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        struct RestoreConfig(Option<std::ffi::OsString>);
+        impl Drop for RestoreConfig {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+        let _restore = RestoreConfig(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let directory = tempfile::tempdir().unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, directory.path());
+        std::fs::write(directory.path().join("models.json"), serde_json::json!({"providers": {
+            "header-gateway": {"api":"openai-completions", "headers":{"Authorization":"Bearer header-secret"}, "models":[{"id":"model"}]},
+            "expired-account": {"api":"openai-completions", "models":[]}
+        }}).to_string()).unwrap();
+        std::fs::write(directory.path().join("auth.json"), serde_json::json!({
+            "expired-account": {"type":"oauth", "access":"expired-secret", "refresh":"refresh-secret", "expires":1}
+        }).to_string()).unwrap();
+        let status = rpc_get_auth_status(&[], None);
+        let providers = status["providers"].as_array().unwrap();
+        let header = providers
+            .iter()
+            .find(|row| row["provider"] == "header-gateway")
+            .unwrap();
+        assert_eq!(header["ready"], true);
+        assert_eq!(header["source"], "headers");
+        assert_eq!(header["status"], "ready");
+        let expired = providers
+            .iter()
+            .find(|row| row["provider"] == "expired-account")
+            .unwrap();
+        assert_eq!(expired["ready"], false);
+        assert_eq!(expired["status"], "expired");
+        assert!(!status.to_string().contains("secret"));
+    }
+
+    #[test]
     fn oauth_display_drops_token_like_fields() {
         let display = oauth_display(&serde_json::json!({
             "display": {
@@ -2031,6 +2120,18 @@ mod tests {
         assert_eq!(display["title"], "Sign in");
         assert!(display.get("access_token").is_none());
         assert!(display.get("refresh_token").is_none());
+    }
+
+    #[test]
+    fn rpc_message_text_joins_content_blocks_with_real_newlines() {
+        let text = rpc_message_text(&serde_json::json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ]
+        }));
+        assert_eq!(text, "first\nsecond");
+        assert!(!text.contains("\\n"));
     }
 
     #[derive(Clone, Default)]

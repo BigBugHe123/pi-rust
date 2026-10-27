@@ -212,13 +212,17 @@ pub(super) async fn cycle_model(
 }
 
 /// Commit UI/default changes only after the live lane accepts the model.
+///
+/// `save_default` is the *only* way this function touches `settings.json`:
+/// session-scoped switches (`/model`, the Ctrl+P cycle) pass `false` and stay
+/// in memory, so they can never silently overwrite the persisted default.
+/// Callers that mean to persist (`/settings` → Default model) pass `true`.
 pub(super) async fn apply_model_selection(
     lane: &Arc<dyn AgentLane>,
     state: &Arc<TuiState>,
     model: rpi_ai::Model,
     save_default: bool,
 ) -> Result<String, String> {
-    let current = lane.get_model().await.map_err(|error| error.to_string())?;
     lane.set_model(model.clone())
         .await
         .map_err(|error| format!("Could not switch model: {error}"))?;
@@ -227,11 +231,15 @@ pub(super) async fn apply_model_selection(
         "Model set to {}/{} — applies to the next message.",
         model.provider, model.id
     );
-    if save_default || current.provider != model.provider {
+    if save_default {
         match set_default_model(&model.provider, &model.id) {
             Ok(_) => note.push_str(" Default saved."),
             Err(error) => note.push_str(&format!(" Could not save the default: {error}")),
         }
+    } else {
+        // Session-scoped switch: point at the explicit way to make it stick
+        // instead of writing the default behind the user's back.
+        note.push_str(" Not saved as the default — use /settings to change it.");
     }
     Ok(note)
 }
@@ -297,21 +305,19 @@ pub(super) fn cycle_prev_model(
 }
 
 /// Build + open the `/session` selector. Lists JSONL session files under the
-/// default session dir (`<cwd>/.rpi/sessions`
-/// fallback), newest-first, labelled with the session name or first prompt so
-/// two sessions are distinguishable. Header-only sessions are skipped: there is
-/// nothing to switch to.
+/// selected session directory, newest-first, labelled with the session name or
+/// first prompt so two sessions are distinguishable. Header-only sessions are
+/// skipped: there is nothing to switch to.
 pub(super) fn open_session_selector(
     state: &Arc<TuiState>,
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
-    cwd: &std::path::Path,
     tx: &mpsc::UnboundedSender<TuiMessage>,
 ) {
-    let dir = crate::session::default_session_dir(cwd);
+    let dir = &state.session_dir;
     let mut items: Vec<SelectItem> = Vec::new();
-    for path in crate::session::list_session_files_sync(&dir) {
+    for path in crate::session::list_session_files_sync(dir) {
         let summary = crate::session::summarize_session_file(&path);
         if summary.empty {
             continue;

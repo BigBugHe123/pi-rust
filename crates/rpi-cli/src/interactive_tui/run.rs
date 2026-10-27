@@ -281,6 +281,84 @@ pub(super) async fn run_prompt_streaming(
     tui.request_render(false);
 }
 
+/// Drive an explicitly selected skill through the live transcript path.
+/// `AgentLane::skill` performs the canonical `<skill>` invocation; this helper
+/// keeps the TUI status, pending queue, final assistant message, and errors in
+/// sync with ordinary prompts.
+pub(super) async fn run_skill_streaming(
+    lane: &Arc<dyn AgentLane>,
+    name: &str,
+    additional_instructions: Option<&str>,
+    tui: &Arc<TuiAltScreen>,
+    state: &Arc<TuiState>,
+    streaming: bool,
+) {
+    state.set_status(RunStatus::Working);
+    tui.request_render(false);
+    let outcome = lane.skill(name, additional_instructions).await;
+    if streaming {
+        let final_message = match &outcome {
+            Ok(result) => match &result.outcome {
+                HarnessRunOutcome::Completed { final_message, .. }
+                | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
+                HarnessRunOutcome::Failed { final_message, .. } => final_message.as_ref(),
+                HarnessRunOutcome::Suspended { .. } => None,
+            },
+            Err(_) => None,
+        };
+        reconcile_streamed_assistant_completion(
+            &state.current_assistant,
+            &state.last_assistant_text,
+            final_message,
+        );
+    }
+
+    state.set_status(RunStatus::Idle);
+    refresh_pending_messages(state, lane).await;
+
+    match outcome {
+        Ok(result) => match result.outcome {
+            HarnessRunOutcome::Completed { final_message, .. } => {
+                if !streaming {
+                    let text = assistant_text(&final_message);
+                    if !text.is_empty() {
+                        add_assistant_message_blocking(
+                            &state.chat_container,
+                            &text,
+                            state.markdown_transformer(),
+                        );
+                        *state.last_assistant_text.lock().unwrap() = text;
+                    }
+                }
+            }
+            HarnessRunOutcome::Aborted { .. } => {
+                if !streaming {
+                    add_error_message(&state.chat_container, "Skill invocation aborted.");
+                }
+            }
+            HarnessRunOutcome::Suspended { .. } => add_error_message(
+                &state.chat_container,
+                "Skill invocation suspended (deferred) — resume is not supported in v1.",
+            ),
+            HarnessRunOutcome::Failed {
+                error,
+                final_message,
+                ..
+            } => {
+                if !(streaming && final_message.is_some()) {
+                    let message = final_message
+                        .as_ref()
+                        .and_then(|m| m.error_message.clone())
+                        .unwrap_or_else(|| format!("{error:?}"));
+                    add_error_message(&state.chat_container, &message);
+                }
+            }
+        },
+        Err(error) => add_error_message(&state.chat_container, &error.to_string()),
+    }
+    tui.request_render(false);
+}
+
 /// `/compact`: drive a compaction on the lane (mirrors TS `app.compact`).
 /// Reports the outcome as a transcript note; the harness progress watcher
 /// displays the compaction indicator while the summary is generated.
@@ -334,46 +412,6 @@ pub(super) fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) 
             ),
         );
     }
-}
-
-/// Extract text from the chat container within the given screen coordinates.
-/// Returns None if the selection is invalid or empty.
-pub(super) fn extract_selected_text(
-    chat_container: &Arc<Container>,
-    start: (u16, u16),
-    end: (u16, u16),
-) -> Option<String> {
-    use rpi_tui::Component;
-
-    // Get the rendered lines from the chat container
-    let lines = chat_container.render(80); // Use a reasonable width
-    if lines.is_empty() {
-        return None;
-    }
-
-    // Normalize coordinates (ensure start is before end)
-    let (start_row, end_row) = if start.1 <= end.1 {
-        (start.1 as usize, end.1 as usize)
-    } else {
-        (end.1 as usize, start.1 as usize)
-    };
-
-    // Clamp to valid range
-    let start_row = start_row.min(lines.len().saturating_sub(1));
-    let end_row = end_row.min(lines.len().saturating_sub(1));
-
-    if start_row > end_row {
-        return None;
-    }
-
-    // Extract the selected lines
-    let selected_lines: Vec<String> = lines[start_row..=end_row].to_vec();
-
-    if selected_lines.is_empty() {
-        return None;
-    }
-
-    Some(selected_lines.join("\n"))
 }
 
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature

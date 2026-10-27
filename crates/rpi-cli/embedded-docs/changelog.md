@@ -5,11 +5,238 @@ All notable changes to the `rpi-*` crate family are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-The nine published crates share one workspace version and are released together
+The rpi-* crates share one workspace version and are released together
 in dependency order. `git tag vX.Y.Z` marks the commit that a release was cut
 from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
+
+## [0.10.1](https://github.com/bigfish1913/pi-rust/compare/v0.10.0...v0.10.1) - 2026-10-27
+
+### Added
+
+- *(tui)* expose skill activation and slash invocation
+
+### Fixed
+
+- *(cli)* browse into a directory when a path prefix ends at a separator
+- *(cli)* keep the path directory and apply one Enter snapshot
+- *(cli)* complete the whole command token on Enter
+- *(cli)* classify Windows paste before Enter completion and stamp explicit selection
+- *(cli)* resolve slash completion on Enter before submitting the prefix
+- *(session)* --fork takes a session file outside the session directory
+
+### Other
+
+- Merge branch 'main' into fix/enter-accept-completion
+- Merge branch 'main' into feat/tui-skill-invocation
+- *(cli)* compare the completed path reference by normalized separator
+- Merge branch 'main' into fix/fork-session-file
+
+## [0.10.0](https://github.com/bigfish1913/pi-rust/compare/v0.9.6...v0.10.0) - 2026-10-27
+
+### Added
+
+- add preview release channel
+- *(anthropic)* add per-phase build diagnostics and refactor clamping
+- *(harness)* add optional compressed frame sidecars
+- *(harness)* add opt-in frame sidecar storage
+- *(harness)* add optional frame sidecar codec
+
+### Fixed
+
+- restore RPC compatibility and remove perf artifacts
+- *(btw)* align side chat footer
+- *(btw)* animate side chat progress
+- *(session)* preserve durable commits and validate batched operations
+
+### Other
+
+- sync stable 0.9.6 into reviewed preview
+- sync latest stable 0.9.4 before preview build
+- integrate reviewed features-1025 fixes into preview
+- Merge remote-tracking branch 'origin/main' into preview
+- raise minimum supported Rust to 1.88
+- 更新文档开篇说明与来源许可章节
+- 补充 rpi-extcore 复用边界并更新 SDK 版本
+- *(harness)* batch durable recovery mutations
+- optimize long Anthropic request preparation
+- *(agent)* cache incrementally converted provider messages
+- *(agent)* preallocate provider message conversions
+- *(session)* 优化上下文构建与帧写入
+- *(harness)* await persisted retry frames before crash recovery
+- *(harness)* move JSONL append buffers without cloning
+- *(harness)* encode JSONL batches into one buffer
+- *(harness)* preallocate batched JSONL appends
+- *(harness)* remove unused frame sidecar prototype
+- *(harness)* keep sidecar codec out of core storage
+- *(harness)* deduplicate frame sidecar payloads
+- *(harness)* guard extension entries around frames
+- *(harness)* measure compressed frame sidecars
+- *(harness)* audit durable record sizes
+
+### Changed
+
+- Raise the minimum supported Rust version to 1.88 and check Linux and Windows.
+- Reduce repeated request preparation, context projection and stream-frame copies.
+
+### Fixed
+
+- Keep JSONL durable appends and reducer commits consistent after cancellation.
+- Reject conflicting JSONL sequence numbers without deleting source records.
+- Preserve SQLite concurrent writes and restore state after persistence failure.
+- Validate operation starts across batched record/message writes.
+
+## [0.9.6](https://github.com/bigfish1913/pi-rust/compare/v0.9.5...v0.9.6) - 2026-10-27
+
+### Fixed
+
+- *(cli)* preserve the two-argument default system prompt API for existing library callers
+- *(prompt)* list only the active tools and drop guidelines for absent ones ([#119](https://github.com/bigfish1913/pi-rust/pull/119))
+- *(edit)* the display diff shows replaced lines old then new ([#121](https://github.com/bigfish1913/pi-rust/pull/121))
+
+## [0.9.5](https://github.com/bigfish1913/pi-rust/compare/v0.9.4...v0.9.5) - 2026-10-27
+
+### Fixed
+
+- *(tui)* recognize Shift+Enter on Windows via native key state ([#108](https://github.com/bigfish1913/pi-rust/pull/108))
+
+## [0.9.4](https://github.com/bigfish1913/pi-rust/compare/v0.9.3...v0.9.4) - 2026-10-26
+
+### Fixed
+
+- *(cli)* keep dev build output out of the TUI
+
+## [0.9.3](https://github.com/bigfish1913/pi-rust/compare/v0.9.2...v0.9.3) - 2026-10-26
+
+### Added
+
+- *(tools)* add truncate_file to the FileSystem trait
+
+### Fixed
+
+- *(tui)* give every transcript block the same trailing spacer
+- *(tui)* highlight fullscreen mouse selections and extract at the live width
+- *(harness)* cut back a failed append before the session can retry
+
+### Other
+
+- keep the workspace buildable on the declared Rust 1.78 MSRV ([#112](https://github.com/bigfish1913/pi-rust/pull/112))
+
+## [0.9.2](https://github.com/bigfish1913/pi-rust/compare/v0.9.1...v0.9.2) - 2026-10-25
+
+### Fixed
+
+- *(cli)* restore the session's model and footer usage on switch ([#104](https://github.com/bigfish1913/pi-rust/pull/104))
+
+## [0.9.1](https://github.com/bigfish1913/pi-rust/compare/v0.9.0...v0.9.1) - 2026-10-25
+
+### Fixed
+
+- *(cli)* stop buffering IME commits as pastes on Windows ([#91](https://github.com/bigfish1913/pi-rust/pull/91))
+
+## [0.9.0](https://github.com/bigfish1913/pi-rust/compare/v0.8.5...v0.9.0) - 2026-10-25
+
+### Added
+
+- *(runtime)* extract reusable runtime and optimize execution
+- add optional binary serialization benchmark
+- add zero-copy archived payloads
+
+### Fixed
+
+- *(release)* sync workspace lock and embedded docs
+- *(cli)* keep temporary model switches out of settings.json
+
+### Other
+
+- Merge origin/main into feature-0.9.0
+- Merge branch 'main' into fix/model-switch-not-persisted
+- Merge remote-tracking branch 'origin/main' into feature-0.9.0
+- reduce repeated context and message copies
+- remove zero-copy from plugin sdk
+- compare zero-copy with json and cbor
+
+## [0.8.5](https://github.com/bigfish1913/pi-rust/compare/v0.8.4...v0.8.5) - 2026-10-24
+
+### Fixed
+
+- *(cli)* rebuild the banner and start a real session on /new ([#98](https://github.com/bigfish1913/pi-rust/pull/98))
+
+## [0.8.4](https://github.com/bigfish1913/pi-rust/compare/v0.8.3...v0.8.4) - 2026-10-23
+
+### Added
+
+- apply lossless backpressure throughout provider streaming
+
+### Fixed
+
+- drain queued assistant events before terminal delivery
+
+### Other
+
+- *(ai)* clarify bounded stream API and async production
+- *(extensions)* await applied metadata before saturation cancellation
+
+## [0.8.3](https://github.com/bigfish1913/pi-rust/compare/v0.8.2...v0.8.3) - 2026-10-23
+
+### Added
+
+- add plugin lifecycle and reusable provider contexts
+
+### Fixed
+
+- *(cli)* invalidate host actions before plugin shutdown
+- propagate provider HTTP client construction errors
+
+### Other
+
+- clarify lifecycle ownership and Rust API migration
+- record provider context reuse and shutdown checks
+- verify plugin workers join before DLL unload
+
+## [0.8.2](https://github.com/bigfish1913/pi-rust/compare/v0.8.1...v0.8.2) - 2026-10-23
+
+### Added
+
+- *(ai)* add stream idle timeout and model compat diagnostics
+
+### Fixed
+
+- *(cli)* preserve session roots and safely fork and import logs
+- *(providers)* close cancellation and compat diagnostic gaps
+- *(providers)* preserve manifest diagnostics and thinking constraints
+- *(ai)* dispatch CR-delimited SSE frames without waiting for bytes
+- *(ai)* preserve initial SSE events after a UTF-8 BOM
+- *(ai)* merge and remove HTTP headers case insensitively
+- *(ai)* classify retries and honor SSE control boundaries
+- *(extensions)* saturate oversized stream idle durations
+
+### Other
+
+- consolidate provider transport and session fixes
+- *(cli)* isolate and restore session directory overrides
+
+## [0.8.1](https://github.com/bigfish1913/pi-rust/compare/v0.8.0...v0.8.1) - 2026-10-23
+
+### Added
+
+- *(extensions)* drive wake-capable tools without idle blocking workers
+
+### Fixed
+
+- *(tui)* preserve working caret and isolate theme cache revisions
+- *(rpc)* release extension session lock before awaiting RPC
+- keep wake token allocation compatible with stable Rust
+
+### Other
+
+- Merge remote-tracking branch 'origin/main' into codex/fix-pr74-cursor
+- Merge branch 'main' into ui
+- add RPI_CODING_AGENT_SESSION_DIR env config
+- share transcript rows and slice the viewport in fullscreen
+- measure idle tool workers and check Windows ownership
+- *(harness)* serialize run budget environment tests
 
 ## [0.8.0](https://github.com/bigfish1913/pi-rust/compare/v0.7.1...v0.8.0) - 2026-10-22
 

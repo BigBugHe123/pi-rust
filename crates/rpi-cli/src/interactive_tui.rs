@@ -52,6 +52,9 @@ mod pet;
 mod side_questions;
 
 #[cfg(test)]
+mod selection_probe;
+
+#[cfg(test)]
 mod tests;
 
 mod state;
@@ -70,19 +73,19 @@ use tokio_util::sync::CancellationToken;
 use rpi_agent::{AgentEvent, AgentMessage};
 use rpi_ai::types::{AssistantMessage, Content, UserMessage};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
-use rpi_harness::session::types::{Entry, EntryOrder, EntryQuery};
+use rpi_harness::session::types::{BranchBounds, Entry, EntryOrder, EntryQuery};
 use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 #[cfg(test)]
 use rpi_tui::strip_ansi;
 use rpi_tui::{
     apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
-    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
-    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
-    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
-    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
-    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
-    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
+    AssistantMessageOptions, AutocompleteItem, AutocompleteManager, AutocompleteSuggestions,
+    BashExecutionComponent, BashTruncation, CombinedAutocompleteProvider, Component, Container,
+    DynamicBorder, Editor, EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable,
+    FollowMode, FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal,
+    ScrollView, ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList,
+    SettingItem, SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider,
+    Spacer, StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
     ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
     TUI,
 };
@@ -274,6 +277,8 @@ struct CommandContext {
     /// reads, export, or usage stats go through this instead of reaching into
     /// the harness directly, so the product surface is one object.
     session: Arc<crate::agent_session::AgentSession>,
+    /// Whether the live AgentEvent drain is available for this TUI session.
+    streaming: bool,
 }
 
 /// One slash command.
@@ -521,6 +526,21 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
             true
         }
         None => false,
+    }
+}
+
+/// Normalize a decoded event before it enters the key loop.
+///
+/// [`rpi_tui::terminal::normalize_key_event`] samples platform state (Apple
+/// Terminal, Windows console) that describes the keyboard *now*, so it runs
+/// here — right after `crossterm::event::read`, before paste probing, routing
+/// and rendering. Sampling later would let a Shift press meant for the next
+/// keystroke be attributed to an Enter that is already queued. The protocol
+/// pass in the loop deliberately does not sample again.
+fn normalize_decoded_event(event: Event) -> Event {
+    match event {
+        Event::Key(key) => Event::Key(rpi_tui::terminal::normalize_key_event(key)),
+        other => other,
     }
 }
 
@@ -1019,7 +1039,7 @@ pub async fn interactive_tui(
             .or(saved_settings.collapse_changelog)
             .unwrap_or(false);
     maybe_add_startup_changelog(
-        &harness,
+        harness,
         &chat_container,
         &saved_settings,
         collapse_changelog,
@@ -1043,11 +1063,14 @@ pub async fn interactive_tui(
     // conversation history. This fixes stale prompts appearing every startup.
     if launch_restores_history(args) {
         render_session_history(
-            &harness,
+            harness,
             &chat_container,
             initial_transformer.clone(),
             Some(reload_context.extension_session.clone()),
             show_images,
+            // The footer is built later in this function, so there is nothing
+            // to fold replayed usage into yet.
+            None,
         )
         .await;
     }
@@ -1191,6 +1214,7 @@ pub async fn interactive_tui(
         .get_as::<bool>("display.tool_outputs_expanded")
         .unwrap_or(false);
     let state = Arc::new(TuiState {
+        session_dir: reload_context.session_dir(),
         current_assistant: Arc::new(std::sync::Mutex::new(None)),
         tool_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
         bash_components: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1226,6 +1250,7 @@ pub async fn interactive_tui(
         autocomplete_container: autocomplete_container.clone(),
         autocomplete_max_visible,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
         tui: Some(tui.clone()),
@@ -1247,8 +1272,6 @@ pub async fn interactive_tui(
         pending_snapshot: std::sync::Mutex::new(
             rpi_harness::agent_harness::QueuedMessages::default(),
         ),
-        selection_start: std::sync::Mutex::new(None),
-        selection_end: std::sync::Mutex::new(None),
     });
 
     let _compaction_watcher = harness.watch({
@@ -1298,6 +1321,8 @@ pub async fn interactive_tui(
     let editor_container = Arc::new(Container::new());
     editor_container.add_child(editor.clone());
 
+    let footer_panels: Arc<dyn Component> =
+        Arc::new(panels::FooterPanels(reload_context.ext_status.clone()));
     let dock = Arc::new(VStack::from_children(vec![
         StackChild::Entry(StackEntry::new(Arc::new(panels::RegularPanels {
             mailbox: reload_context.ext_status.clone(),
@@ -1318,9 +1343,7 @@ pub async fn interactive_tui(
         ),
         StackChild::Entry(StackEntry::new(state.search_bar.clone())),
         StackChild::Entry(StackEntry::new(footer.clone())),
-        StackChild::Entry(StackEntry::new(Arc::new(panels::FooterPanels(
-            reload_context.ext_status.clone(),
-        )))),
+        StackChild::Entry(StackEntry::new(footer_panels.clone())),
     ]));
 
     let transcript_stack = Arc::new(rpi_tui::HStack::from_entries(vec![StackEntry::new(
@@ -1345,6 +1368,9 @@ pub async fn interactive_tui(
         Arc::new(root),
         editor.clone(),
         matches!(args.tui_mode, crate::args::TuiMode::Regular),
+        show_terminal_progress,
+        footer.clone(),
+        footer_panels,
     )));
     tui.set_layout_root(Some(side_ui.lock().unwrap().root()));
     tui.set_focus(Some(editor.clone()));
@@ -1377,6 +1403,7 @@ pub async fn interactive_tui(
         scoped_models,
         cwd.clone(),
     ));
+    let streaming = event_rx.is_some();
     let ctx = CommandContext {
         chat: chat_container.clone(),
         tui: tui.clone(),
@@ -1391,6 +1418,7 @@ pub async fn interactive_tui(
         startup_context,
         reload_context: Arc::new(reload_context.clone()),
         session: agent_session.clone(),
+        streaming,
     };
 
     let ctx_for_cb = ctx.clone();
@@ -1710,18 +1738,19 @@ pub async fn interactive_tui(
                 ev
             } else {
                 // `event::read()` blocks indefinitely. Poll first so shutdown can
-                // stop and join this worker even when no further key arrives.
-                match crossterm::event::poll(
-                    if cfg!(windows) && !windows_paste_run.text.is_empty() {
-                        windows_paste_run.grace()
-                    } else {
-                        std::time::Duration::from_millis(50)
-                    },
-                ) {
+                // stop and join this worker even when no further key arrives. A
+                // paste run being collected may pause for the rest of the
+                // payload; ordinary typing must be taken at once.
+                let idle = if cfg!(windows) && windows_paste_run.is_buffering() {
+                    std::time::Duration::from_millis(120)
+                } else {
+                    std::time::Duration::from_millis(50)
+                };
+                match crossterm::event::poll(idle) {
                     Ok(true) => {}
                     Ok(false) => {
-                        if cfg!(windows) && !windows_paste_run.text.is_empty() {
-                            windows_paste_run.flush(&editor_for_key);
+                        if cfg!(windows) && windows_paste_run.is_buffering() {
+                            windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
                             refresh_autocomplete(&state_for_key, &editor_for_key);
                             tui_for_key.request_render_reusing_scroll_content();
                         }
@@ -1738,7 +1767,7 @@ pub async fn interactive_tui(
                     let _ = tx_for_key.send(TuiMessage::Exit);
                     break;
                 };
-                ev
+                normalize_decoded_event(ev)
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
@@ -1762,8 +1791,7 @@ pub async fn interactive_tui(
                     continue;
                 }
                 if tui_for_key.handle_scroll_to_end_indicator_mouse_event(&m) {
-                    *state_for_key.selection_start.lock().unwrap() = None;
-                    *state_for_key.selection_end.lock().unwrap() = None;
+                    tui_for_key.clear_selection();
                     continue;
                 }
                 use crossterm::event::MouseEventKind;
@@ -1795,55 +1823,33 @@ pub async fn interactive_tui(
                         }
                     }
                     MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                        // Start selection tracking. `selection_end` doubles as the
-                        // "a real drag happened" marker: a plain tap never sets
-                        // it, so it can never overwrite the clipboard.
-                        *state_for_key.selection_start.lock().unwrap() = Some((m.column, m.row));
-                        *state_for_key.selection_end.lock().unwrap() = None;
+                        // Begin fullscreen text selection (anchor + highlight).
+                        // The TUI owns the anchor/focus state in content
+                        // coordinates; a plain click later collapses it and
+                        // never touches the clipboard.
+                        tui_for_key.handle_selection_mouse_event(&m);
                     }
                     MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                        // Motion with the button held = a genuine selection drag.
-                        // (Terminals only report this with button-event mouse
-                        // tracking, which `ProcessTerminal` enables.)
-                        if state_for_key.selection_start.lock().unwrap().is_some() {
-                            *state_for_key.selection_end.lock().unwrap() = Some((m.column, m.row));
-                        }
+                        // Extend the selection; the re-render paints the
+                        // reverse-video highlight as the pointer moves.
+                        tui_for_key.handle_selection_mouse_event(&m);
                     }
                     MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                        // End selection and auto-copy if enabled
-                        if let Some(start) = *state_for_key.selection_start.lock().unwrap() {
-                            let end = (m.column, m.row);
-
-                            // Only auto-copy when the pointer actually MOVED with
-                            // the button held (`Drag` set `selection_end`). A plain
-                            // click/tap — even one whose Down/Up cells differ by a
-                            // pixel over RDP — must not touch the clipboard: it used
-                            // to fire `extract_selected_text`, which copies whatever
-                            // rendered TUI line sat under the pointer, silently
-                            // clobbering the user's real clipboard so the next paste
-                            // returned that stale text.
-                            let is_drag = state_for_key.selection_end.lock().unwrap().is_some();
-                            *state_for_key.selection_end.lock().unwrap() = Some(end);
-
-                            // Check if auto-copy is enabled
+                        // Finish the selection and auto-copy when enabled.
+                        tui_for_key.handle_selection_mouse_event(&m);
+                        if tui_for_key.selection_dragged() {
                             let auto_copy = crate::settings::load_settings()
                                 .ok()
                                 .and_then(|s| s.fullscreen_copy_on_select)
                                 .unwrap_or(true);
-
-                            if auto_copy && is_drag {
-                                // Try to extract selected text from chat container
-                                if let Some(selected_text) =
-                                    extract_selected_text(&state_for_key.chat_container, start, end)
-                                {
+                            if auto_copy {
+                                if let Some(selected_text) = tui_for_key.selection_text() {
                                     if !selected_text.trim().is_empty() {
                                         let _ = copy_to_clipboard(&selected_text);
                                     }
                                 }
                             }
                         }
-                        *state_for_key.selection_start.lock().unwrap() = None;
-                        *state_for_key.selection_end.lock().unwrap() = None;
                     }
                     _ => {}
                 }
@@ -2395,7 +2401,9 @@ pub async fn interactive_tui(
                         state
                             .footer
                             .set_thinking_level(Some(thinking_level_name(next)));
-                        state.tui.as_ref().map(|tui| tui.request_render(false));
+                        if let Some(tui) = state.tui.as_ref() {
+                            tui.request_render(false)
+                        }
                     }
                 });
                 continue;
@@ -2431,17 +2439,14 @@ pub async fn interactive_tui(
                     tui_for_key.request_render(false);
                     continue;
                 }
-                match read_clipboard_image() {
-                    Ok(Some(image)) => {
-                        state_for_key.queue_image(image);
-                        add_note_message(
-                            &state_for_key.chat_container,
-                            "Clipboard image attached to the next prompt.",
-                        );
-                        tui_for_key.request_render(false);
-                        continue;
-                    }
-                    Ok(None) | Err(_) => {}
+                if let Ok(Some(image)) = read_clipboard_image() {
+                    state_for_key.queue_image(image);
+                    add_note_message(
+                        &state_for_key.chat_container,
+                        "Clipboard image attached to the next prompt.",
+                    );
+                    tui_for_key.request_render(false);
+                    continue;
                 }
                 // Local Ctrl+V can paste clipboard text as Pi does. Under SSH,
                 // text must arrive from the client via bracketed paste rather
@@ -2693,19 +2698,65 @@ pub async fn interactive_tui(
                     if ch == '\r' || ch == '\n' {
                         // Treat these the same as KeyCode::Enter below.
                     } else {
-                        windows_paste_run.feed(ch, std::time::Instant::now());
-                        #[cfg(windows)]
-                        if windows_paste_run.burst
-                            && windows_paste_run.text.len() >= 64
-                            && pending_event.is_none()
-                            && state_for_key
-                                .extension_claimed_keys
-                                .lock()
-                                .unwrap()
-                                .is_empty()
-                        {
-                            windows_paste_run.read_queued_text();
+                        let now = std::time::Instant::now();
+                        // Feed first: `feed` is what detects the burst, and the
+                        // fold threshold is what decides whether this run is an
+                        // established paste.
+                        windows_paste_run.feed(ch, now);
+                        // An established paste is drained straight out of the
+                        // console. Probing here would stash the next event, which
+                        // is what made that drain unreachable. `pending_event` is
+                        // `None` at this point (the loop took it above), so
+                        // reading the console cannot reorder input.
+                        if !windows_paste_run.probe_needed() {
+                            #[cfg(windows)]
+                            if should_drain_queued_text(
+                                &windows_paste_run,
+                                state_for_key
+                                    .extension_claimed_keys
+                                    .lock()
+                                    .unwrap()
+                                    .is_empty(),
+                            ) {
+                                windows_paste_run.read_queued_text();
+                            }
+                            continue;
                         }
+                        // Paste vs typing is decided by the console queue, not
+                        // by elapsed time. A clipboard payload is handed over
+                        // already queued, so a *real* key still waiting behind
+                        // this one means the run is a paste to collect and fold.
+                        // An empty queue means these are keystrokes — and an IME
+                        // commit, which delivers a whole word with no gap at all,
+                        // looks exactly like this — so they go straight to the
+                        // editor instead of waiting out a timer.
+                        //
+                        // `probe_paste_input` is essential here: Windows queues
+                        // every key's Release directly behind its Press, so a raw
+                        // poll would report "more input" for ordinary typing.
+                        let (more_queued, stashed) =
+                            probe_paste_input(pending_event.take(), || {
+                                if crossterm::event::poll(std::time::Duration::ZERO)
+                                    .unwrap_or(false)
+                                {
+                                    crossterm::event::read().ok().map(normalize_decoded_event)
+                                } else {
+                                    None
+                                }
+                            });
+                        pending_event = stashed;
+                        if more_queued {
+                            // Real input was queued behind this character, which
+                            // is the only proof that this run is a paste. IME
+                            // commits never reach here: their queue is empty.
+                            windows_paste_run.mark_collected();
+                            continue;
+                        }
+                        // Nothing queued behind it: hand the run over now. This
+                        // is the typing path, so it must not wait on a timer.
+                        windows_paste_run.flush(&editor_for_key, now);
+                        refresh_autocomplete(&state_for_key, &editor_for_key);
+                        tui_for_key.request_render_reusing_scroll_content();
                         continue;
                     }
                 }
@@ -2717,27 +2768,67 @@ pub async fn interactive_tui(
                 {
                     let (more_queued, stashed) = probe_paste_input(pending_event.take(), || {
                         if crossterm::event::poll(PASTE_PROBE).unwrap_or(false) {
-                            crossterm::event::read().ok()
+                            crossterm::event::read().ok().map(normalize_decoded_event)
                         } else {
                             None
                         }
                     });
                     pending_event = stashed;
-                    let clipboard = if !more_queued && windows_paste_run.burst {
+                    let now = std::time::Instant::now();
+                    // Read the clipboard only when some text here could be a
+                    // paste still waiting for its trailing newline — the live
+                    // run or a batch flushed within `PASTE_CARRY_GAP`.
+                    let clipboard = if !more_queued && windows_paste_run.has_paste_evidence(now) {
                         read_clipboard_text()
                     } else {
                         None
                     };
-                    if windows_enter_in_paste(&windows_paste_run, more_queued, clipboard.as_deref())
-                    {
-                        windows_paste_run.feed('\n', std::time::Instant::now());
+                    if windows_enter_in_paste(
+                        &windows_paste_run,
+                        more_queued,
+                        clipboard.as_deref(),
+                        now,
+                    ) {
+                        windows_paste_run.feed('\n', now);
                         crate::key_trace::note("windows paste run -> newline");
                         continue;
                     }
                     crate::key_trace::note("windows paste run -> flush + submit");
-                    windows_paste_run.flush(&editor_for_key);
+                    windows_paste_run.flush(&editor_for_key, now);
                 } else {
-                    windows_paste_run.flush(&editor_for_key);
+                    windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
+                }
+            }
+
+            // 5a-ter. A bare Enter in a completion context (`/` or `@`)
+            //     resolves the completion before submitting, mirroring the
+            //     TS editor's `tui.select.confirm` (`editor.ts:757-815`):
+            //     apply the sole/highlighted item, then let a `/` completion
+            //     fall through to submit while an `@`-path one consumes the
+            //     Enter. Unambiguous only — a fresh ambiguous popup submits
+            //     the typed text, and unknown `/skill:name` still reaches
+            //     the model untouched.
+            //
+            //     Placement is load-bearing: this runs AFTER the Windows
+            //     paste classification and flush above, immediately before
+            //     the confirmed submit Enter is forwarded to the editor, so
+            //     an Enter that belongs to a paste never reaches it — the
+            //     paste paths have already `continue`d. At this point the
+            //     editor also holds any buffered typed prefix the Windows
+            //     handler just flushed, so the completion sees the full
+            //     token.
+            if key.modifiers == KeyModifiers::NONE
+                && (key.code == KeyCode::Enter
+                    || key.code == KeyCode::Char('\n')
+                    || key.code == KeyCode::Char('\r'))
+            {
+                // One resolution, one replacement: `route_enter_completion`
+                // applies the same snapshot it decided on and reports whether
+                // this Enter is consumed by an `@`-path completion.
+                if route_enter_completion(&state_for_key, &editor_for_key) {
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
                 }
             }
 
@@ -2927,7 +3018,7 @@ pub async fn interactive_tui(
                     tui.request_render(false);
                 } else {
                     open_tree_selector(
-                        &harness,
+                        harness,
                         &state,
                         &editor_container,
                         &editor,
@@ -2942,14 +3033,23 @@ pub async fn interactive_tui(
                 match lane.navigate_tree(Some(&entry_id), false, None, None).await {
                     Ok(result) => match result.outcome {
                         rpi_harness::agent_harness::NavigationOutcome::Completed { .. } => {
+                            state.reset_session_state();
                             chat_container.clear();
-                            add_welcome_message(&chat_container);
+                            let (tools, skills, context_files) =
+                                current_capabilities(harness, &lane).await;
+                            add_welcome_message_with_capabilities(
+                                &chat_container,
+                                &tools,
+                                &skills,
+                                &context_files,
+                            );
                             render_session_history(
-                                &harness,
+                                harness,
                                 &chat_container,
                                 state.markdown_transformer(),
                                 Some(state.extension_session.clone()),
                                 state.images_visible(),
+                                Some(&state.footer),
                             )
                             .await;
                             add_note_message(
@@ -2973,8 +3073,19 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ClearChat) => {
-                chat_container.clear();
-                add_welcome_message(&chat_container);
+                // `/new` starts a genuinely new session instead of only wiping
+                // the transcript: the harness swaps its JSONL backing, the
+                // banner is rebuilt from the real capability snapshot, and the
+                // footer counters are reset.
+                start_new_session(
+                    harness,
+                    &lane,
+                    &cwd,
+                    &chat_container,
+                    &state,
+                    &reload_context.tool_context,
+                )
+                .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::Compact) => {
@@ -2990,32 +3101,34 @@ pub async fn interactive_tui(
             }
             Some(TuiMessage::SwitchSession(id)) => {
                 switch_to_session(
-                    &harness,
+                    harness,
                     &lane,
                     &id,
                     &cwd,
                     &chat_container,
                     &state,
                     &reload_context.tool_context,
+                    &reload_context.catalog,
                 )
                 .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::ImportSession(path)) => {
                 import_session(
-                    &harness,
+                    harness,
                     &lane,
                     &path,
                     &cwd,
                     &chat_container,
                     &state,
                     &reload_context.tool_context,
+                    &reload_context.catalog,
                 )
                 .await;
                 tui.request_render(false);
             }
             Some(TuiMessage::ShareSession) => {
-                share_session(&harness, &chat_container).await;
+                share_session(harness, &chat_container).await;
                 tui.request_render(false);
             }
             Some(TuiMessage::SetSessionName(name)) => {
@@ -3115,7 +3228,7 @@ pub async fn interactive_tui(
             }
             Some(TuiMessage::ForkSession) => {
                 fork_session(
-                    &harness,
+                    harness,
                     &cwd,
                     &chat_container,
                     &state,
@@ -3280,7 +3393,7 @@ pub async fn interactive_tui(
                 add_note_message(&chat_container, "Reloading extensions + resources…");
                 tui.request_render(false);
                 let outcome =
-                    crate::session::reload_extension_resources(&harness, &reload_ctx).await;
+                    crate::session::reload_extension_resources(harness, &reload_ctx).await;
                 if !outcome.had_errors {
                     if let Ok(resources) = harness.get_resources().await {
                         update_resource_listing(
@@ -3353,7 +3466,7 @@ pub async fn interactive_tui(
     // a terminal that scrolled away can be recovered. Mirrors
     // `formatResumeCommand` (id + `--session-dir` only when non-default).
     let session_id = harness.session().storage().metadata().id;
-    if let Some(command) = format_resume_command(&session_id, &cwd, args.session_dir.as_deref()) {
+    if let Some(command) = format_resume_command(&session_id, &cwd, Some(&state.session_dir)) {
         println!("\x1b[2mTo resume this session:\x1b[0m {command}");
     }
     println!("\nGoodbye!");

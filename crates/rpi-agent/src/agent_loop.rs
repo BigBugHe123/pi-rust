@@ -31,16 +31,24 @@ use crate::types::{
 };
 
 use rpi_ai::types::{
-    AssistantMessage, AssistantMessageEvent, Content, StopReason, ToolCall, ToolCallType,
+    AssistantMessage, AssistantMessageEvent, Content, Message, StopReason, ToolCall, ToolCallType,
     ToolResultMessage, ToolResultRole,
 };
 use rpi_ai::validate_tool_arguments;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 /// The messages a single `run_agent_loop` invocation added (prompt + assistant
 /// + tool results + injected steering/follow-ups). Returned to the caller.
 pub type NewMessages = Vec<AgentMessage>;
+
+static AGENT_DIAGNOSTICS: OnceLock<bool> = OnceLock::new();
+
+fn agent_diagnostics_enabled() -> bool {
+    *AGENT_DIAGNOSTICS
+        .get_or_init(|| std::env::var_os("RPI_AGENT_DIAGNOSTICS").is_some_and(|value| value != "0"))
+}
 
 /// Why a run ended. `Completed` is the normal exit; `Aborted`/`Failed` are set
 /// when the terminal assistant message carried `Aborted`/`Error`.
@@ -77,15 +85,10 @@ pub async fn run_agent_loop(
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
     let mut new_messages: Vec<AgentMessage> = prompts.clone();
-    let mut current_context = AgentContext {
-        system_prompt: context.system_prompt.clone(),
-        messages: {
-            let mut v = context.messages.clone();
-            v.extend(prompts);
-            v
-        },
-        tools: context.tools.clone(),
-    };
+    // The caller transferred ownership. Only prompts need a separate copy for
+    // the returned additions; the existing history can move into the loop.
+    let mut current_context = context;
+    current_context.messages.extend(prompts);
 
     emit_event(&emit, AgentEvent::AgentStart).await;
     emit_event(&emit, AgentEvent::TurnStart).await;
@@ -231,6 +234,7 @@ async fn run_loop(
     pending_assistant: Option<AssistantMessage>,
 ) -> Result<LoopOutcome, AgentError> {
     let mut pending_assistant = pending_assistant;
+    let mut provider_cache = ProviderMessageCache::new();
     let mut first_turn = true;
     // Check for steering messages at start (user may have typed while waiting).
     let mut pending_messages = drain_steering(config).await;
@@ -250,6 +254,12 @@ async fn run_loop(
 
             // Inject pending (steering/follow-up) messages before the next LLM call.
             if !pending_messages.is_empty() {
+                // Steering/follow-up hooks may return any AgentMessage, not
+                // only append-safe user messages. In particular, an injected
+                // ToolResult can be orphaned; the full converter is responsible
+                // for repairing/filtering that history. Do not feed such a
+                // suffix through the incremental converter.
+                provider_cache.invalidate();
                 for message in pending_messages.drain(..) {
                     emit_event(
                         emit,
@@ -275,8 +285,14 @@ async fn run_loop(
             let message = match pending_assistant.take() {
                 Some(message) => message,
                 None => {
-                    let message =
-                        stream_assistant_response(current_context, config, emit, stream_fn).await?;
+                    let message = stream_assistant_response(
+                        current_context,
+                        config,
+                        &mut provider_cache,
+                        emit,
+                        stream_fn,
+                    )
+                    .await?;
                     new_messages.push(AgentMessage::Assistant(Box::new(message.clone())));
                     message
                 }
@@ -343,6 +359,7 @@ async fn run_loop(
                 {
                     if let Some(ctx) = upd.context {
                         *current_context = ctx;
+                        provider_cache.invalidate();
                     }
                 }
             }
@@ -371,6 +388,7 @@ async fn run_loop(
             {
                 if let Some(ctx) = upd.context {
                     *current_context = ctx;
+                    provider_cache.invalidate();
                 }
             }
 
@@ -435,26 +453,196 @@ async fn run_loop(
 // streamAssistantResponse
 // ----------------------------------------------------------------------------
 
+struct AssistantRequestDiagnostics {
+    enabled: bool,
+    started: Instant,
+    input_messages: usize,
+    llm_messages: usize,
+    tools: usize,
+    transform_ns: u64,
+    history_clone_ns: u64,
+    context_build_ns: u64,
+    convert_ns: u64,
+    stream_open_ns: u64,
+    stream_started: Option<Instant>,
+    first_poll_ns: u64,
+    provider_events: u64,
+    first_event_ns: u64,
+    emit_calls: u64,
+    emit_ns: u64,
+    fold_ns: u64,
+}
+
+impl AssistantRequestDiagnostics {
+    fn new(input_messages: usize, tools: usize) -> Self {
+        Self {
+            enabled: agent_diagnostics_enabled(),
+            started: Instant::now(),
+            input_messages,
+            llm_messages: 0,
+            tools,
+            transform_ns: 0,
+            history_clone_ns: 0,
+            context_build_ns: 0,
+            convert_ns: 0,
+            stream_open_ns: 0,
+            stream_started: None,
+            first_poll_ns: 0,
+            provider_events: 0,
+            first_event_ns: 0,
+            emit_calls: 0,
+            emit_ns: 0,
+            fold_ns: 0,
+        }
+    }
+
+    fn elapsed_ns(started: Instant) -> u64 {
+        started.elapsed().as_nanos().min(u64::MAX as u128) as u64
+    }
+
+    async fn emit_agent_event(&mut self, emit: &Arc<dyn AgentEmitter>, event: AgentEvent) {
+        let started = self.enabled.then(Instant::now);
+        emit_event(emit, event).await;
+        if let Some(started) = started {
+            self.emit_calls += 1;
+            self.emit_ns += Self::elapsed_ns(started);
+        }
+    }
+}
+
+impl Drop for AssistantRequestDiagnostics {
+    fn drop(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        let stream_ns = self
+            .stream_started
+            .map(Self::elapsed_ns)
+            .unwrap_or_default();
+        eprintln!(
+            "RPI_AGENT_DIAGNOSTICS phase=assistant input_messages={} llm_messages={} tools={} transform_ns={} history_clone_ns={} context_build_ns={} convert_ns={} stream_open_ns={} first_event_ns={} first_poll_ns={} provider_events={} emit_calls={} emit_ns={} fold_ns={} stream_ns={} total_ns={}",
+            self.input_messages,
+            self.llm_messages,
+            self.tools,
+            self.transform_ns,
+            self.history_clone_ns,
+            self.context_build_ns,
+            self.convert_ns,
+            self.stream_open_ns,
+            self.first_event_ns,
+            self.first_poll_ns,
+            self.provider_events,
+            self.emit_calls,
+            self.emit_ns,
+            self.fold_ns,
+            stream_ns,
+            Self::elapsed_ns(self.started),
+        );
+    }
+}
+
+struct ProviderMessageCache {
+    initialized: bool,
+    source_len: usize,
+    messages: Vec<Message>,
+}
+
+impl ProviderMessageCache {
+    fn new() -> Self {
+        Self {
+            initialized: false,
+            source_len: 0,
+            messages: Vec::new(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.initialized = false;
+        self.source_len = 0;
+        self.messages.clear();
+    }
+
+    fn take_messages(
+        &mut self,
+        context: &AgentContext,
+        config: &AgentLoopConfig,
+    ) -> Option<Vec<Message>> {
+        if config.transform_context.is_some() {
+            return None;
+        }
+        let convert = config.convert_to_llm_incremental.as_ref()?;
+        // The first request must use the full converter: harness conversion
+        // repairs orphaned/interleaved tool history before caching it.
+        if !self.initialized {
+            return None;
+        }
+        if self.source_len > context.messages.len() {
+            self.invalidate();
+            return None;
+        }
+        let suffix = &context.messages[self.source_len..];
+        self.messages.extend(convert(suffix));
+        self.source_len = context.messages.len();
+        Some(std::mem::take(&mut self.messages))
+    }
+
+    fn restore_messages(&mut self, messages: Vec<Message>) {
+        self.initialized = true;
+        self.messages = messages;
+    }
+}
+
 /// Stream one assistant response, folding protocol events into the partial
 /// message and emitting agent `Message*` events. Mirrors TS
 /// `streamAssistantResponse`.
 async fn stream_assistant_response(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
+    provider_cache: &mut ProviderMessageCache,
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
 ) -> Result<AssistantMessage, AgentError> {
-    // Apply optional transform_context (AgentMessage[] → AgentMessage[]).
-    let messages = if let Some(transform) = &config.transform_context {
-        transform(context.messages.clone(), config.signal.clone()).await
+    let mut diagnostics =
+        AssistantRequestDiagnostics::new(context.messages.len(), context.tools.len());
+    // The incremental path owns the converted provider messages between turns.
+    // Moving them into `Context` avoids cloning the full provider history; the
+    // synchronous stream factory cannot retain the borrowed context.
+    let cached_messages = provider_cache.take_messages(context, config);
+    let cache_enabled =
+        config.transform_context.is_none() && config.convert_to_llm_incremental.is_some();
+    let llm_messages = if let Some(messages) = cached_messages {
+        messages
     } else {
-        context.messages.clone()
+        let transform_started = diagnostics.enabled.then(Instant::now);
+        let messages = if let Some(transform) = &config.transform_context {
+            let clone_started = diagnostics.enabled.then(Instant::now);
+            let messages = context.messages.clone();
+            if let Some(started) = clone_started {
+                diagnostics.history_clone_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+            }
+            transform(messages, config.signal.clone()).await
+        } else {
+            let clone_started = diagnostics.enabled.then(Instant::now);
+            let messages = context.messages.clone();
+            if let Some(started) = clone_started {
+                diagnostics.history_clone_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+            }
+            messages
+        };
+        if let Some(started) = transform_started {
+            diagnostics.transform_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        }
+        let convert_started = diagnostics.enabled.then(Instant::now);
+        let converted = (config.convert_to_llm)(messages).await;
+        if let Some(started) = convert_started {
+            diagnostics.convert_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        }
+        converted
     };
+    diagnostics.llm_messages = llm_messages.len();
 
-    // convert_to_llm (AgentMessage[] → Message[]).
-    let llm_messages = (config.convert_to_llm)(messages).await;
-
-    let llm_context = rpi_ai::types::Context {
+    let context_build_started = diagnostics.enabled.then(Instant::now);
+    let mut llm_context = rpi_ai::types::Context {
         system_prompt: if context.system_prompt.is_empty() {
             None
         } else {
@@ -463,6 +651,9 @@ async fn stream_assistant_response(
         messages: llm_messages,
         tools: context.tools.iter().map(|t| t.schema().clone()).collect(),
     };
+    if let Some(started) = context_build_started {
+        diagnostics.context_build_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+    }
 
     // Resolve API key: getApiKey(provider) ?? config.api_key.
     let resolved_api_key = if let Some(get_key) = &config.get_api_key {
@@ -474,17 +665,47 @@ async fn stream_assistant_response(
     };
 
     let opts = config.to_stream_options(resolved_api_key);
+    let stream_open_started = diagnostics.enabled.then(Instant::now);
     let mut response = stream_fn(&config.model, &llm_context, &opts);
+    if cache_enabled {
+        provider_cache.source_len = context.messages.len();
+        provider_cache.restore_messages(std::mem::take(&mut llm_context.messages));
+    }
+    if let Some(started) = stream_open_started {
+        diagnostics.stream_open_ns = AssistantRequestDiagnostics::elapsed_ns(started);
+        diagnostics.stream_started = Some(Instant::now());
+    }
 
     let mut added_partial = false;
+    let mut first_poll = true;
 
-    while let Some(event) = response.next().await {
+    loop {
+        let poll_started = diagnostics.enabled.then(Instant::now);
+        let next = response.next().await;
+        let poll_ns = poll_started.map(AssistantRequestDiagnostics::elapsed_ns);
+        let Some(event) = next else {
+            break;
+        };
+        let event_started = diagnostics.enabled.then(Instant::now);
+        if diagnostics.enabled {
+            diagnostics.provider_events += 1;
+            if first_poll {
+                diagnostics.first_poll_ns = poll_ns.unwrap_or_default();
+                if let Some(stream_started) = diagnostics.stream_started {
+                    diagnostics.first_event_ns =
+                        AssistantRequestDiagnostics::elapsed_ns(stream_started);
+                }
+                first_poll = false;
+            }
+        }
         match &event {
             AssistantMessageEvent::Start { partial } => {
                 let am = AgentMessage::Assistant(Box::new((**partial).clone()));
                 context.messages.push(am.clone());
                 added_partial = true;
-                emit_event(emit, AgentEvent::MessageStart { message: am }).await;
+                diagnostics
+                    .emit_agent_event(emit, AgentEvent::MessageStart { message: am })
+                    .await;
             }
             AssistantMessageEvent::TextStart { partial, .. }
             | AssistantMessageEvent::TextDelta { partial, .. }
@@ -502,17 +723,18 @@ async fn stream_assistant_response(
                     // terminal arm replaces it with the finalized message. Keeping
                     // the old `*last = am.clone()` copied the whole growing message
                     // once per delta for no observable effect.
-                    emit_event(
-                        emit,
-                        AgentEvent::MessageUpdate {
-                            // `Arc` bump, not a deep clone: this fires once per
-                            // streaming delta, and the provider already built the
-                            // snapshot it hands us.
-                            message: Arc::clone(partial),
-                            assistant_message_event: event.clone(),
-                        },
-                    )
-                    .await;
+                    diagnostics
+                        .emit_agent_event(
+                            emit,
+                            AgentEvent::MessageUpdate {
+                                // `Arc` bump, not a deep clone: this fires once per
+                                // streaming delta, and the provider already built the
+                                // snapshot it hands us.
+                                message: Arc::clone(partial),
+                                assistant_message_event: event,
+                            },
+                        )
+                        .await;
                 }
             }
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
@@ -528,17 +750,26 @@ async fn stream_assistant_response(
                     }
                 } else {
                     context.messages.push(am.clone());
-                    emit_event(
-                        emit,
-                        AgentEvent::MessageStart {
-                            message: am.clone(),
-                        },
-                    )
-                    .await;
+                    diagnostics
+                        .emit_agent_event(
+                            emit,
+                            AgentEvent::MessageStart {
+                                message: am.clone(),
+                            },
+                        )
+                        .await;
                 }
-                emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+                diagnostics
+                    .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+                    .await;
+                if let Some(started) = event_started {
+                    diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
+                }
                 return Ok(final_message);
             }
+        }
+        if let Some(started) = event_started {
+            diagnostics.fold_ns += AssistantRequestDiagnostics::elapsed_ns(started);
         }
     }
 
@@ -554,15 +785,18 @@ async fn stream_assistant_response(
         }
     } else {
         context.messages.push(am.clone());
-        emit_event(
-            emit,
-            AgentEvent::MessageStart {
-                message: am.clone(),
-            },
-        )
-        .await;
+        diagnostics
+            .emit_agent_event(
+                emit,
+                AgentEvent::MessageStart {
+                    message: am.clone(),
+                },
+            )
+            .await;
     }
-    emit_event(emit, AgentEvent::MessageEnd { message: am }).await;
+    diagnostics
+        .emit_agent_event(emit, AgentEvent::MessageEnd { message: am })
+        .await;
     Ok(final_message)
 }
 
@@ -724,6 +958,16 @@ async fn execute_tool_calls_parallel(
     }
 
     let mut entries: Vec<Entry> = Vec::with_capacity(tool_calls.len());
+    // When an after-tool callback is installed, every parallel task observes
+    // the same immutable snapshots. Clone the expensive history once per
+    // batch, then only bump the Arcs for each task; the common no-callback
+    // path still performs no history clone at all.
+    let after_context = config.after_tool_call.as_ref().map(|_| {
+        (
+            Arc::new(current_context.clone()),
+            Arc::new(assistant_message.clone()),
+        )
+    });
 
     for tool_call in tool_calls {
         if let Some(reason) = invalid_tool_call_reason(tool_call) {
@@ -761,14 +1005,27 @@ async fn execute_tool_calls_parallel(
                 // The on_update closure captures an `Arc<AtomicBool>` gate so calls
                 // made after `execute` resolves are no-ops (late-update suppression).
                 let tc = tool_call.clone();
-                let am = assistant_message.clone();
-                let ctx = current_context.clone();
+                // The task only needs history for an after-tool callback. Most
+                // runs have no callback, so do not deep-copy the whole branch
+                // merely to finalize an already-owned tool result.
+                let after_context = after_context
+                    .as_ref()
+                    .map(|(ctx, am)| (Arc::clone(ctx), Arc::clone(am)));
                 let cfg = config.clone();
                 let emit2 = Arc::clone(emit);
                 let handle = tokio::spawn(async move {
                     let executed =
                         execute_prepared_tool_call(&tc, &tool, &args, &cfg, &emit2).await;
-                    finalize_executed_tool_call(&ctx, &am, &tc, &args, executed, &cfg).await
+                    match after_context {
+                        Some((ctx, am)) => {
+                            finalize_executed_tool_call(&ctx, &am, &tc, &args, executed, &cfg).await
+                        }
+                        None => FinalizedToolCall {
+                            tool_call: tc,
+                            result: executed.result,
+                            is_error: executed.is_error,
+                        },
+                    }
                 });
                 entries.push(Entry::Running(handle));
             }
@@ -1106,6 +1363,7 @@ async fn execute_prepared_tool_call(
     let accepting_updates = Arc::new(AtomicBool::new(true));
     let tool_call_id = tool_call.id.clone();
     let tool_name = tool_call.name.clone();
+    let diagnostic_tool_name = tool_name.clone();
     let args_clone = args.clone();
     let emit_clone = Arc::clone(emit);
 
@@ -1132,7 +1390,8 @@ async fn execute_prepared_tool_call(
     };
 
     let child_token = config.signal.child_token();
-    match tool
+    let execute_started = agent_diagnostics_enabled().then(Instant::now);
+    let outcome = match tool
         .execute(&tool_call.id, args.clone(), child_token, on_update)
         .await
     {
@@ -1150,7 +1409,17 @@ async fn execute_prepared_tool_call(
                 is_error: true,
             }
         }
+    };
+    if let Some(started) = execute_started {
+        eprintln!(
+            "RPI_TOOL_DIAGNOSTICS tool={} call_id={} is_error={} execute_ns={}",
+            diagnostic_tool_name,
+            tool_call.id,
+            outcome.is_error,
+            started.elapsed().as_nanos().min(u64::MAX as u128),
+        );
     }
+    outcome
 }
 
 /// Result of `execute` before `after_tool_call` overrides. Mirrors TS

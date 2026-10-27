@@ -15,7 +15,7 @@
 use std::any::Any;
 use std::sync::{Arc, Mutex};
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use super::container::Container;
 use super::image::{Image, ImageOptions};
 use super::markdown::Markdown;
@@ -202,10 +202,11 @@ impl AssistantMessageComponent {
             return;
         }
 
-        // No leading spacer here — the host adds a Spacer(1) after each
-        // transcript entry, which already separates this message from the
-        // one above. A leading spacer stacked with the host's trailing one
-        // produced a double blank between messages.
+        // No leading spacer here — every transcript entry (including this
+        // one) contributes one blank row AFTER itself (the host's trailing
+        // Spacer / the panel's trailing spacer), and no block opens with a
+        // leading one. A leading spacer stacked with the previous entry's
+        // trailing one would produce a double blank between blocks.
         let mut i = 0;
         while i < blocks.len() {
             let block = &blocks[i];
@@ -396,6 +397,17 @@ impl Component for AssistantMessageComponent {
             lines.extend((0..*self.trailing_spacing.lock().unwrap()).map(|_| String::new()));
         }
         lines
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        let mut document = self.content_container.render_document(width);
+        if !document.is_empty() {
+            let spacing = *self.trailing_spacing.lock().unwrap();
+            if spacing > 0 {
+                document.append(RenderedDocument::from_lines(vec![String::new(); spacing]));
+            }
+        }
+        document
     }
 
     fn invalidate(&self) {

@@ -20,6 +20,7 @@ pub struct Request {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
     Prompt {
+        #[serde(alias = "content", alias = "prompt")]
         message: String,
     },
     Abort,
@@ -46,6 +47,14 @@ pub enum Command {
         #[serde(rename = "beforeSeq")]
         before_seq: Option<u64>,
     },
+    /// Return every entry on the currently selected native branch.
+    GetSessionBranch,
+    /// Append a protocol-neutral custom entry to the current branch.
+    AppendEntry {
+        #[serde(rename = "customType")]
+        custom_type: String,
+        data: Option<Value>,
+    },
     GetStats,
     GetQueue,
     QueueMessage {
@@ -71,6 +80,12 @@ pub enum Command {
     },
     GetAvailableModels,
     GetAuthStatus,
+    #[serde(rename = "oauth")]
+    OAuth {
+        provider: String,
+        action: String,
+        input: Option<Value>,
+    },
     SetApiKey {
         provider: String,
         #[serde(rename = "apiKey")]
@@ -106,6 +121,8 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "execute_command",
     "get_messages",
     "get_history",
+    "get_session_branch",
+    "append_entry",
     "get_stats",
     "get_queue",
     "queue_message",
@@ -135,12 +152,19 @@ pub fn response(id: Option<Value>, command: &str, result: Result<Option<Value>, 
         "type": "response",
         "command": command,
         "success": result.is_ok(),
+        // Keep the original remote-client response fields during the RPC
+        // protocol transition. New clients use success/data; older clients
+        // still require status/result to deserialize the response.
+        "status": if result.is_ok() { "ok" } else { "error" },
     });
     if let Some(id) = id {
         out["id"] = id;
     }
     match result {
-        Ok(Some(data)) => out["data"] = data,
+        Ok(Some(data)) => {
+            out["data"] = data.clone();
+            out["result"] = data;
+        }
         Ok(None) => {}
         Err(error) => out["error"] = json!(error),
     }
@@ -305,6 +329,39 @@ mod tests {
         assert!(!status.to_string().contains("secret-fixture"));
     }
     #[test]
+    fn prompt_payload_accepts_legacy_content_and_prompt_fields() {
+        for field in ["content", "prompt"] {
+            let request: Request = serde_json::from_value(json!({
+                "type": "prompt",
+                field: "legacy text"
+            }))
+            .unwrap();
+            assert!(
+                matches!(request.command, Command::Prompt { message } if message == "legacy text")
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_payload_keeps_provider_action_and_input() {
+        let request: Request = serde_json::from_value(json!({
+            "type": "oauth",
+            "id": 9,
+            "provider": "example",
+            "action": "begin",
+            "input": {"code": "fixture"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            request.command,
+            Command::OAuth { provider, action, input: Some(input) }
+                if provider == "example"
+                    && action == "begin"
+                    && input["code"] == "fixture"
+        ));
+    }
+
+    #[test]
     fn response_has_canonical_success_data_shape() {
         let value = response(
             Some(json!(7)),
@@ -313,6 +370,12 @@ mod tests {
         );
         assert_eq!(value["type"], "response");
         assert_eq!(value["success"], true);
+        assert_eq!(value["status"], "ok");
         assert_eq!(value["data"]["accepted"], true);
+        assert_eq!(value["result"]["accepted"], true);
+        let legacy: crate::remote::protocol::RemoteResponse =
+            serde_json::from_value(value).unwrap();
+        assert!(legacy.is_ok());
+        assert_eq!(legacy.result.unwrap()["accepted"], true);
     }
 }

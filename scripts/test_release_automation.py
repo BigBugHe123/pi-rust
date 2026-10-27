@@ -79,12 +79,20 @@ class ReleaseGateTests(unittest.TestCase):
             automation.main()
             output.assert_called_once_with(release="false")
 
-    def test_all_nine_core_crates_share_one_release_group(self):
+    def test_all_core_crates_share_one_release_group(self):
         root = Path(__file__).resolve().parent.parent
         config = tomllib.loads((root / "release-plz.toml").read_text(encoding="utf-8"))
         self.assertFalse(config["workspace"]["release"])
         packages = config["package"]
-        self.assertEqual(len(packages), 9)
+        workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+        expected = set()
+        for member in workspace["members"]:
+            if member.startswith("crates/rpi-"):
+                package = tomllib.loads((root / member / "Cargo.toml").read_text(encoding="utf-8"))["package"]
+                if package.get("publish", True):
+                    expected.add(package["name"])
+        self.assertEqual({package["name"] for package in packages}, expected)
+        self.assertEqual(len(packages), len(expected))
         self.assertTrue(all(p["release"] and p["version_group"] == "rpi" for p in packages))
         self.assertEqual(sum(p.get("changelog_update", False) for p in packages), 1)
 
@@ -115,6 +123,41 @@ class ReleaseGateTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "tested main commit"):
                 automation.main()
             api.assert_not_called()
+
+
+class ReleaseVersionTests(unittest.TestCase):
+    setUp = ReleaseGateTests.setUp
+
+    def test_minor_and_major_upgrades_reach_the_release_gate_without_rewriting(self):
+        for version in ("0.9.0", "1.0.0"):
+            for command in ("detect", "tag"):
+                with self.subTest(version=version, command=command), \
+                        patch.dict(os.environ, {"GITHUB_REPOSITORY": automation.REPOSITORY,
+                                              "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main",
+                                              "GITHUB_SHA": self.commit}), \
+                        patch.object(sys, "argv", ["script", command]), \
+                        patch.object(automation, "run", side_effect=[self.commit, "v0.8.4"]), \
+                        patch.object(automation.Path, "read_text", side_effect=[
+                            f'[workspace.package]\nversion = "{version}"\n',
+                            f'## [{version}](https://example.test/v0.8.4...v{version})\n']), \
+                        patch.object(automation.Path, "write_text") as write, \
+                        patch.object(automation, "api", side_effect=[[{"number": 1}], self.pr, {}]) as api, \
+                        patch.object(automation, "output") as output:
+                    automation.main()
+                    output.assert_called_once_with(release="true", version=version, tag=f"v{version}")
+                    write.assert_not_called()
+                    if command == "tag":
+                        self.assertIn(f"ref=refs/tags/v{version}", api.call_args.args)
+
+    def test_cross_series_downgrades_and_retagging_are_still_rejected(self):
+        for version, tags in (("0.8.9", ["v0.9.0"]), ("0.9.0", ["v1.0.0"]), ("1.0.0", ["v1.0.0"])):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                automation.check_version(version, tags, self.commit)
+
+    def test_workspace_has_no_release_series_pin(self):
+        root = Path(__file__).resolve().parent.parent
+        workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))["workspace"]
+        self.assertNotIn("series", workspace.get("metadata", {}).get("release", {}))
 
 
 class ChannelReadinessTests(unittest.TestCase):

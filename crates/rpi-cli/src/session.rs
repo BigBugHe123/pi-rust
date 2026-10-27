@@ -71,60 +71,113 @@ use rpi_extensions::{
 /// The coding tools registered by the CLI by default.
 pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
-/// The default coding system prompt. A condensed port of the TS
-/// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
+/// The default coding system prompt for the CLI's built-in tools.
+///
+/// This retains the two-argument API for library callers. Session startup and
+/// reload use [`default_system_prompt_with_tools`] with the actual active tools.
 pub fn default_system_prompt(cwd: &str, prior_reasoning_replayed: bool) -> String {
+    let tools = BUILTIN_TOOL_NAMES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    default_system_prompt_with_tools(cwd, prior_reasoning_replayed, &tools)
+}
+
+/// A coding system prompt for the selected tools. A condensed port of the TS
+/// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
+///
+/// `tools` is the active tool set after `--tools`/`--exclude-tools` and
+/// extension merging: the prompt lists only those tools and keeps only the
+/// guidelines that mention one of them, so a restricted run is never told it
+/// can edit or track todos (pi builds its list from the selected tools too).
+pub fn default_system_prompt_with_tools(
+    cwd: &str,
+    prior_reasoning_replayed: bool,
+    tools: &[String],
+) -> String {
+    let has = |name: &str| tools.iter().any(|tool| tool == name);
+    let todo_hint = if has("todo") {
+        "\n  Keep the steps of multi-step work in the todo tool and mark them done as you go."
+    } else {
+        ""
+    };
     // The working-state rule must match what actually comes back on the next
     // request. With `compat.requiresThinkingAsText` (or the native thinking
     // channels of anthropic/responses) the model *does* see its own reasoning
     // again, and claiming otherwise makes it re-derive and restate the plan
     // every turn — the re-plan symptom in `docs/llm-repetition-forensics.md`.
+    // One rule covers the plan, the todo tool and the anti-repetition line, so
+    // none of them is stated twice.
     let working_state_rule = if prior_reasoning_replayed {
-        "- Keep a SHORT working plan visible (a few bullets, or the todo tool) and update it as you go.
-  Your own reasoning is carried back to you on the next turn, so do not re-derive it or restate
-  the whole plan: continue from the last unfinished step, and when a step lands, say which one.
-  Re-listing the same plan without acting on it is a bug, not progress."
+        format!(
+            "- Your reasoning is carried back to you on the next turn: do not re-derive it or restate
+  the plan. Continue from the last unfinished step, and when a step lands, say which one.{todo_hint}
+  Re-stating the same plan without acting on it is a bug, not progress."
+        )
     } else {
-        "- Keep your working state in your VISIBLE replies, not only in reasoning. Reasoning is not
-  carried into your next turn: only the text you write and the tool output you produce come
-  back. Before each batch of tool calls, write one short line naming the task you are on and
-  what remains. When you finish a step, say which one is done. If you keep the plan only in
-  your head you will re-derive it from scratch every turn."
+        format!(
+            "- Your reasoning is not carried into your next turn; only your visible replies and tool
+  output come back. Before each batch of tool calls, write one short line naming the step you
+  are on and what remains, and say which step is done when it lands.{todo_hint}
+  Re-stating the same plan without acting on it is a bug, not progress."
+        )
     };
+
+    let tool_lines = if tools.is_empty() {
+        "(none)".to_string()
+    } else {
+        tools
+            .iter()
+            .map(|name| match builtin_tool_snippet(name) {
+                Some(snippet) => format!("- {name:<5} — {snippet}"),
+                None => format!("- {name}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // Tool-specific rules (Bash on Windows, docs before guessing) live in the
+    // tool's own line or description, not here a second time.
+    let guidelines = [
+        "- Reply in the same language as the user's latest message (the conversation's language when
+  that message is too short to tell), unless the user asks for another.",
+        "- Be concise in your responses",
+        "- Show file paths clearly when working with files",
+        "- Prefer the smallest change that solves the problem",
+        &working_state_rule,
+        "- Read only what you need. If a file or search result was already shown earlier in this
+  conversation, use it instead of fetching it again.",
+    ];
+    let guidelines = guidelines.join("\n");
 
     format!(
         "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
-- read  — Read file contents
-- bash  — Execute Bash commands using Bash/POSIX syntax, including on Windows
-- edit  — Find/replace edits to existing files
-- write — Create or overwrite files
-- docs  — Look up rpi usage, extension, package, and compatibility documentation
+{tool_lines}
 
 Guidelines:
-- Reply in the SAME language the user is writing in. Detect the language of the user's
-  latest message (and, when it is too short to be sure, the working language of the
-  conversation so far) and use it for your prose replies. Mirror it unless the user
-  explicitly asks for a different language; only fall back to English when the
-  user's language cannot be determined.
-- Be concise in your responses
-- Show file paths clearly when working with files
-- Prefer the smallest change that solves the problem
-- The bash tool runs Bash, even on Windows. Use ls, find, rg, and POSIX pipelines;
-  do not pass PowerShell cmdlets such as Get-ChildItem, Select-Object, or Select-String.
-  If a powershell tool is available, use it for PowerShell commands.
-{working_state_rule}
-- Track multi-step work with the todo tool instead of re-listing the plan in prose: add the
-  steps once, then mark them done as you go. Re-stating the same plan without acting on it is
-  a bug, not progress.
-- Read only what you need. If a file or search result was already shown earlier in this
-  conversation, use it instead of fetching it again.
-- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing
+{guidelines}
 
 Current working directory: {cwd}"
     )
+}
+
+/// One-line prompt descriptions of the tools rpi itself registers.
+fn builtin_tool_snippet(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "read" => "Read file contents",
+        "bash" => "Execute Bash commands (Bash/POSIX syntax, also on Windows)",
+        "edit" => "Find/replace edits to existing files",
+        "write" => "Create or overwrite files",
+        "docs" => "Look up rpi commands, extensions, Pi package compatibility and .rpi configuration instead of guessing",
+        "grep" => "Search file contents for a pattern",
+        "find" => "Find files by glob pattern",
+        "ls" => "List directory contents",
+        "powershell" => "Execute PowerShell commands on Windows",
+        _ => return None,
+    })
 }
 
 /// How the user asked to select a session. v1 honors `NoSession` (ephemeral
@@ -153,12 +206,11 @@ pub enum SessionSelection {
 
 /// Decide the session selection from parsed args + the resolved cwd.
 pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
-    if args.no_session {
-        return SessionSelection::Ephemeral;
-    }
-    // `--session-dir` wins; then the saved `sessionDir` (upstream's key, same
-    // format as the flag); then the built-in default. Keep this directory on
-    // restore selections too, not only on fresh sessions.
+    select_session_in_dir(args, configured_session_dir(args, cwd))
+}
+
+/// Resolve the root once at startup; runtime actions retain this selection.
+pub(crate) fn configured_session_dir(args: &Args, cwd: &Path) -> PathBuf {
     let dir = args
         .session_dir
         .clone()
@@ -168,6 +220,22 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
                 .and_then(|settings| settings.session_dir)
         })
         .unwrap_or_else(|| default_session_dir(cwd));
+    // Relative roots belong to the launch project, even if an extension later
+    // changes the process working directory.
+    if dir.is_relative() && !dir.has_root() {
+        cwd.join(dir)
+    } else {
+        dir
+    }
+}
+
+fn select_session_in_dir(args: &Args, dir: PathBuf) -> SessionSelection {
+    if args.no_session {
+        return SessionSelection::Ephemeral;
+    }
+    // `--session-dir` wins; then the saved `sessionDir` (upstream's key, same
+    // format as the flag); then the built-in default. Keep this directory on
+    // restore selections too, not only on fresh sessions.
     if args.continue_session || args.resume {
         return SessionSelection::Latest { dir };
     }
@@ -202,6 +270,7 @@ pub fn default_session_dir(cwd: &Path) -> PathBuf {
 /// host remains unbound until the harness and authenticated catalog exist.
 pub struct PreparedExtensions {
     pub extension_session: ExtensionSession,
+    session_dir: PathBuf,
     runtime: tokio::runtime::Handle,
     tool_context: rpi_extensions::ToolCallContext,
     action_host: Arc<crate::extensions_actions::HarnessActionHost>,
@@ -218,6 +287,7 @@ pub fn prepare_extensions(
     cwd: &Path,
     project_trusted: bool,
 ) -> Result<PreparedExtensions, BuildError> {
+    let session_dir = configured_session_dir(args, cwd);
     let cwd_str = cwd.to_string_lossy().to_string();
     let tool_context = rpi_extensions::ToolCallContext::new(cwd_str.clone());
     if !project_trusted && args.verbose {
@@ -254,7 +324,7 @@ pub fn prepare_extensions(
         args.unknown_flags.clone(),
         tool_context.clone(),
     );
-    let action_host = Arc::new(action_host);
+    let action_host = Arc::new(action_host.with_session_dir(session_dir.clone()));
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = action_host.clone();
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
     // `Handle` to `spawn_blocking` the sync `ProviderRequestFn`), so clone here.
@@ -302,6 +372,7 @@ pub fn prepare_extensions(
         report_deferred_renderers(&extension_session);
     }
     Ok(PreparedExtensions {
+        session_dir,
         runtime,
         tool_context,
         action_host,
@@ -369,6 +440,7 @@ pub async fn build_prepared(
     // before the tools are built, and completed with the session id below once
     // the session exists — the tool set has to exist before the harness does.
     let PreparedExtensions {
+        session_dir,
         runtime,
         tool_context,
         action_host,
@@ -405,7 +477,7 @@ pub async fn build_prepared(
     let active = filter_active_tool_names(active_tool_names(&tools, args), args);
 
     // ---- Session storage ----
-    let selection = select_session(args, cwd);
+    let selection = select_session_in_dir(args, session_dir.clone());
     let session = build_session(&selection, &cwd_str).await?;
     // Plugin tools now know which session they serve: `todo` and friends key
     // their per-session state off it. A session without an id (ephemeral) leaves
@@ -437,15 +509,19 @@ pub async fn build_prepared(
     // Whether this model sees its own prior reasoning again decides how the
     // working-state rule is worded (see `default_system_prompt`).
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&resolved.model);
+    let prompt_tools = active.clone();
     let mut context_paths = Vec::new();
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths)
-                .unwrap_or_else(|| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
-            None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }),
+            None => {
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }
         },
-        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -782,6 +858,11 @@ pub async fn build_prepared(
         ),
         stream_options: AgentHarnessStreamOptions {
             timeout: args.timeout,
+            stream_idle_timeout: args.stream_idle_timeout.or_else(|| {
+                saved_settings
+                    .stream_idle_timeout
+                    .map(std::time::Duration::from_secs)
+            }),
             ..Default::default()
         },
         // Settings-backed harness options: upstream lets users tune retry,
@@ -885,6 +966,10 @@ pub async fn build_prepared(
     // NOT held here (the TUI already owns a `&AgentHarness` / clone at the call
     // site — passing it into `reload_extension_resources` keeps this structfree
     // of a harness back-reference so it can be `Clone` into the reload callback).
+    // Retain the resolved root in the existing args snapshot so reload never
+    // reselects it from mutable settings or environment variables.
+    let mut reload_args = args.clone();
+    reload_args.session_dir = Some(session_dir);
     let reload_context = ReloadContext {
         extension_session: extension_session_cell,
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
@@ -894,7 +979,7 @@ pub async fn build_prepared(
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
         project_trusted,
-        args: args.clone(),
+        args: reload_args,
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
@@ -1047,7 +1132,8 @@ pub struct ReloadContext {
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
     /// not pick up argv changes mid-session, which is the right contract — pi's
-    /// `/reload` re-runs discovery with the same config).
+    /// `/reload` re-runs discovery with the same config). `session_dir` holds
+    /// the resolved startup root, including saved settings/environment defaults.
     pub args: Args,
     /// The resolved model + thinking level (the harness's active model stays
     /// unless `set_model` changed it; reload does not touch the model).
@@ -1075,6 +1161,16 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+}
+
+impl ReloadContext {
+    pub(crate) fn session_dir(&self) -> PathBuf {
+        // The fallback also supports contexts constructed by embedding hosts.
+        self.args
+            .session_dir
+            .clone()
+            .unwrap_or_else(|| configured_session_dir(&self.args, &self.cwd))
+    }
 }
 
 /// Dispatch a no-payload lifecycle event (e.g. `SessionStart`, `SessionShutdown`,
@@ -1286,7 +1382,7 @@ where
                 &_cell,
                 Arc::new(harness.clone()),
             );
-            Arc::new(action_host)
+            Arc::new(action_host.with_session_dir(ctx.session_dir()))
         }
     };
 
@@ -1394,7 +1490,7 @@ where
     // use. A temporary empty session would let a concurrent call bypass its gate.
     // In-flight approvals retain their old session until their callback exits;
     // its staleness flag prevents them from authorizing after this swap.
-    {
+    let old_session = {
         let mut session_guard = ctx.extension_session.lock().unwrap();
         let old_session = std::mem::replace(&mut *session_guard, extension_session.clone());
         if let Some(old_snap) = old_session.snapshot_arc() {
@@ -1403,12 +1499,13 @@ where
             // `RegistrySnapshot` exposes `active_flag()` for this.
             old_snap.active_flag().store(false, Ordering::SeqCst);
         }
-        // `old_session` drops here; in-flight adapters/callbacks keep their
-        // own library references until they return.
-    }
+        old_session
+    };
     if let Some(old_b) = old_bridge {
         old_b.invalidate();
     }
+    // Shutdown callbacks see stale host actions and run outside session locks.
+    old_session.begin_shutdown();
 
     // The session was swapped atomically above; expose its matching bridge.
     *ctx.action_bridge.lock().unwrap() = Some(Arc::clone(&fresh_bridge));
@@ -1437,7 +1534,7 @@ where
             &effective_args.skill,
             &discovered.skill_paths,
             js_paths,
-            &package_paths,
+            package_paths,
         );
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
@@ -1455,7 +1552,7 @@ where
             &effective_args.prompt_template,
             &discovered.prompt_paths,
             js_paths,
-            &package_paths,
+            package_paths,
         );
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
@@ -1473,6 +1570,15 @@ where
     let context_block = format_project_context(&context_files);
 
     let mut details: Vec<String> = Vec::new();
+    if let Some(resolved) = &refreshed {
+        warnings |= !resolved.compat_warnings.is_empty();
+        details.extend(
+            resolved
+                .compat_warnings
+                .iter()
+                .map(|warning| format!("warning: models.json: {warning}")),
+        );
+    }
     if !skill_diags.is_empty() || !prompt_diags.is_empty() || !resource_diags.is_empty() {
         warnings = true;
         // Collect formatted diagnostics for the caller to surface in its UI
@@ -1513,16 +1619,35 @@ where
     // Same working-state wording rule as `build`; a mid-session `/model` switch
     // re-composes the prompt on the next reload, which is the same staleness the
     // rest of this path already has (provider resolution is a startup concern).
+    // Re-merge extension tools (a reloaded plugin may have added/removed a
+    // tool). The built-in set is rebuilt from scratch + extension tools merged
+    // on top, mirroring `build`. Built before the
+    // prompt so the prompt lists exactly the active tools.
+    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
+    let mut tools = build_tools(&tool_ctx, &effective_args);
+    merge_extension_tools(
+        &mut tools,
+        &extension_session,
+        &effective_args,
+        &ctx.tool_context,
+    );
+    let mut active = active_tool_names(&tools, &effective_args);
+    active = filter_active_tool_names(active, &effective_args);
+    let prompt_tools = active.clone();
     let prior_reasoning_replayed = rpi_ai::model::prior_reasoning_is_replayed(&ctx.resolved_model);
     let mut context_paths = Vec::new();
     let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
         None if project_trusted => match discover_system_prompt_file(&ctx.cwd) {
-            Some(path) => read_prompt_source(&path, &mut context_paths)
-                .unwrap_or_else(|| default_system_prompt(&cwd_str, prior_reasoning_replayed)),
-            None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+            Some(path) => read_prompt_source(&path, &mut context_paths).unwrap_or_else(|| {
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }),
+            None => {
+                default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools)
+            }
         },
-        None => default_system_prompt(&cwd_str, prior_reasoning_replayed),
+        None => default_system_prompt_with_tools(&cwd_str, prior_reasoning_replayed, &prompt_tools),
     };
     let mut append_texts: Vec<String> = Vec::new();
     for extra in &effective_args.append_system_prompt {
@@ -1624,20 +1749,6 @@ where
         let _ = harness.lane("main").set_model(resolved.model.clone()).await;
     }
 
-    // Re-merge extension tools (a reloaded plugin may have added/removed a
-    // tool). The built-in set is rebuilt from scratch + extension tools merged
-    // on top, mirroring `build`.
-    let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
-    let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
-    let mut tools = build_tools(&tool_ctx, &effective_args);
-    merge_extension_tools(
-        &mut tools,
-        &extension_session,
-        &effective_args,
-        &ctx.tool_context,
-    );
-    let mut active = active_tool_names(&tools, &effective_args);
-    active = filter_active_tool_names(active, &effective_args);
     let _ = harness.set_tools(tools, Some(active)).await;
 
     let summary = format!(
@@ -2124,7 +2235,7 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             let Some(meta) = first_resumable_session(&metas) else {
                 return Err(BuildError::SessionNotFound {
                     requested: "the most recent session".to_string(),
-                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                    dir: dir.display().to_string(),
                 });
             };
             open_session(meta, cwd).await
@@ -2134,7 +2245,7 @@ async fn restore_session(selection: &SessionSelection, cwd: &str) -> Result<Sess
             .map_err(|e| match e {
                 OpenError::NotFound { requested } => BuildError::SessionNotFound {
                     requested,
-                    dir: default_session_dir(Path::new(cwd)).display().to_string(),
+                    dir: dir.display().to_string(),
                 },
                 OpenError::Other(msg) => BuildError::SessionOpen(msg),
             }),
@@ -2179,20 +2290,28 @@ async fn fork_session_at_launch(
         clock: Arc::new(SystemClock),
         ids: Arc::new(DefaultIdGenerator::new()),
     });
-    let metas = repo
-        .list_typed(&rpi_harness::session::jsonl::JsonlSessionListOptions::default())
-        .await
-        .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))?;
-    let source_meta = metas
-        .iter()
-        .find(|m| m.id == *source || m.path.contains(source) || source.contains(&m.id))
-        .ok_or_else(|| BuildError::SessionNotFound {
-            requested: format!("--fork {source}"),
-            dir: dir.display().to_string(),
-        })?;
+    // A session file given by path forks from wherever it lives (pi parity:
+    // `pi --fork <file>` takes any session file); an id or a name fragment is
+    // looked up in the session directory.
+    let source_meta = match session_metadata_at(Path::new(source)) {
+        Some(meta) => meta,
+        None => {
+            let metas = repo
+                .list_typed(&rpi_harness::session::jsonl::JsonlSessionListOptions::default())
+                .await
+                .map_err(|e| BuildError::SessionDir(format!("list sessions: {e}")))?;
+            metas
+                .into_iter()
+                .find(|m| m.id == *source || m.path.contains(source) || source.contains(&m.id))
+                .ok_or_else(|| BuildError::SessionNotFound {
+                    requested: format!("--fork {source}"),
+                    dir: dir.display().to_string(),
+                })?
+        }
+    };
     let fork_storage = repo
         .fork_typed(
-            source_meta,
+            &source_meta,
             &JsonlSessionCreateOptions {
                 id: None,
                 parent_session_id: Some(source_meta.id.clone()),
@@ -2206,6 +2325,34 @@ async fn fork_session_at_launch(
     claim_session_lock(&fork_storage.jsonl_metadata().path).map_err(BuildError::SessionOpen)?;
     let storage_arc: Arc<dyn SessionStorage> = Arc::new(fork_storage);
     Ok(Session::new(storage_arc, None))
+}
+
+/// The metadata of the JSONL session file at `path`, or `None` when `path` is
+/// not a readable session file.
+fn session_metadata_at(path: &Path) -> Option<rpi_harness::session::jsonl::JsonlSessionMetadata> {
+    use rpi_harness::session::jsonl::codec::{metadata_from_header, parse_header};
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).ok()?;
+    let modified_at = file
+        .metadata()
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    let mut first_line = String::new();
+    std::io::BufReader::new(file)
+        .read_line(&mut first_line)
+        .ok()?;
+    let header = parse_header(first_line.trim_end()).ok()?;
+    let path = std::fs::canonicalize(path).ok()?;
+    Some(metadata_from_header(
+        &header,
+        &path.to_string_lossy(),
+        modified_at,
+    ))
 }
 
 /// Errors from [`open_session_by_id`], split so the CLI can map them to
@@ -2239,7 +2386,7 @@ pub async fn list_session_metadata(
     list_session_metadata_in_dir(cwd, &dir).await
 }
 
-async fn list_session_metadata_in_dir(
+pub(crate) async fn list_session_metadata_in_dir(
     cwd: &str,
     dir: &Path,
 ) -> Result<Vec<rpi_harness::session::jsonl::JsonlSessionMetadata>, BuildError> {
@@ -2503,9 +2650,9 @@ pub fn list_session_files_sync(dir: &Path) -> Vec<PathBuf> {
 /// content (a header-only session resumes to an empty transcript). Falls back to
 /// the newest overall when every session is empty, and `None` only when the
 /// list is empty.
-fn first_resumable_session<'a>(
-    metas: &'a [rpi_harness::session::jsonl::JsonlSessionMetadata],
-) -> Option<&'a rpi_harness::session::jsonl::JsonlSessionMetadata> {
+fn first_resumable_session(
+    metas: &[rpi_harness::session::jsonl::JsonlSessionMetadata],
+) -> Option<&rpi_harness::session::jsonl::JsonlSessionMetadata> {
     metas
         .iter()
         .find(|meta| !summarize_session_file(Path::new(&meta.path)).empty)
@@ -2520,7 +2667,11 @@ pub async fn open_session_by_id(id: &str, cwd: &str) -> Result<Session, OpenErro
     open_session_by_id_in_dir(id, cwd, &dir).await
 }
 
-async fn open_session_by_id_in_dir(id: &str, cwd: &str, dir: &Path) -> Result<Session, OpenError> {
+pub(crate) async fn open_session_by_id_in_dir(
+    id: &str,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Session, OpenError> {
     let metas = list_session_metadata_in_dir(cwd, dir)
         .await
         .map_err(|e| OpenError::Other(e.to_string()))?;
@@ -2610,11 +2761,11 @@ pub(crate) async fn set_active_session(
 pub(crate) async fn fork_session_storage(
     harness: &AgentHarness,
     cwd: &str,
+    dir: &Path,
 ) -> Result<Session, String> {
     use rpi_harness::session::jsonl::{JsonlSessionRepo, JsonlSessionRepoOptions};
     use rpi_tools::FileSystem;
 
-    let dir = default_session_dir(Path::new(cwd));
     let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
     let fs: Arc<dyn FileSystem> = env.clone();
     let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
@@ -2626,7 +2777,7 @@ pub(crate) async fn fork_session_storage(
     // The fork needs the rich JSONL metadata (with the on-disk path); resolve
     // it from the session list by the current session's id.
     let id = harness.session().storage().metadata().id.clone();
-    let metas = list_session_metadata(cwd)
+    let metas = list_session_metadata_in_dir(cwd, dir)
         .await
         .map_err(|e| e.to_string())?;
     let Some(source) = metas.iter().find(|m| m.id == id) else {
@@ -2647,6 +2798,86 @@ pub(crate) async fn fork_session_storage(
         .map_err(|e| e.to_string())?;
     claim_session_lock(&fork_storage.jsonl_metadata().path)?;
     Ok(Session::new(Arc::new(fork_storage), None))
+}
+
+/// Validate a private copy before publishing it in the repo's normal cwd
+/// directory. Keep the imported identity/history and never overwrite a saved
+/// session (including when the source is already inside this repository).
+pub(crate) async fn import_session_file(
+    source: &Path,
+    cwd: &str,
+    dir: &Path,
+) -> Result<Session, String> {
+    use rpi_harness::session::jsonl::{
+        JsonlSessionCreateOptions, JsonlSessionRepo, JsonlSessionRepoOptions, JsonlSessionStorage,
+    };
+    use rpi_tools::FileSystem;
+
+    let dir = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        Path::new(cwd).join(dir)
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let staged = tempfile::NamedTempFile::new_in(&dir)
+        .map_err(|e| e.to_string())?
+        .into_temp_path();
+    std::fs::copy(source, &staged).map_err(|e| format!("copy import: {e}"))?;
+    let fs: Arc<dyn FileSystem> = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(cwd)));
+    let validated = JsonlSessionStorage::load(
+        fs.clone(),
+        &staged.to_string_lossy(),
+        Arc::new(SystemClock),
+        Arc::new(DefaultIdGenerator::new()),
+    )
+    .await
+    .map_err(|e| format!("invalid session import: {e}"))?;
+    let mut metadata = validated.jsonl_metadata().clone();
+    drop(validated);
+    if list_session_metadata_in_dir(cwd, &dir)
+        .await
+        .map_err(|e| e.to_string())?
+        .iter()
+        .any(|saved| saved.id == metadata.id)
+    {
+        return Err(format!(
+            "session {} already exists in {}",
+            metadata.id,
+            dir.display()
+        ));
+    }
+    let repo = JsonlSessionRepo::with_env_cwd(JsonlSessionRepoOptions {
+        fs,
+        sessions_root: dir.to_string_lossy().into_owned(),
+        clock: Arc::new(SystemClock),
+        ids: Arc::new(DefaultIdGenerator::new()),
+    });
+    // Let the repository validate the id and choose its canonical destination.
+    let destination = repo
+        .create_typed(&JsonlSessionCreateOptions {
+            id: Some(metadata.id.clone()),
+            parent_session_id: metadata.parent_session_id.clone(),
+            cwd: cwd.to_string(),
+            metadata: metadata.metadata.clone(),
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    let path = destination.jsonl_metadata().path.clone();
+    drop(destination);
+    if let Err(error) = claim_session_lock(&path) {
+        // Another process owns this destination; leave its file intact.
+        return Err(error);
+    }
+    if let Err(error) = staged.persist(&path) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("publish import: {error}"));
+    }
+    metadata.path = path;
+    let storage = repo
+        .open_by_jsonl_metadata(&metadata)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Session::new(Arc::new(storage), None))
 }
 
 /// Session logs this process has claimed, so re-claiming is a no-op.
@@ -2737,8 +2968,10 @@ async fn open_session(
     Ok(Session::new(storage_arc, None))
 }
 
-/// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`.
-fn ephemeral_session() -> Session {
+/// A fresh ephemeral in-memory session (no persistence). Used for `--no-session`
+/// and for `/new` inside such a run — an ephemeral launch keeps swapping in
+/// in-memory sessions, never a JSONL file.
+pub(crate) fn ephemeral_session() -> Session {
     let storage = Arc::new(InMemorySessionStorage::new(
         SessionMetadata {
             id: "ephemeral".into(),
@@ -2748,7 +2981,7 @@ fn ephemeral_session() -> Session {
         Arc::new(SystemClock),
         Arc::new(DefaultIdGenerator::new()),
     ));
-    Session::new(storage, None)
+    Session::new(storage, None).with_volatile_progress()
 }
 
 /// Create a fresh JSONL session file under `dir` and wrap it in a `Session`.
@@ -2835,6 +3068,9 @@ fn read_prompt_source(path: &Path, sources: &mut Vec<String>) -> Option<String> 
     }
     Some(text)
 }
+
+#[cfg(test)]
+mod runtime_session_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3240,9 +3476,36 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The default CLI tool set plus the `todo` tool its bundled plugins add.
+    fn default_prompt_tools() -> Vec<String> {
+        BUILTIN_TOOL_NAMES
+            .iter()
+            .copied()
+            .chain(["todo"])
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn default_prompt_lists_only_the_active_tools() {
+        let tools = ["read", "grep", "find", "ls"].map(str::to_owned);
+        let p = default_system_prompt_with_tools("/tmp/proj", true, &tools);
+        assert!(p.contains("- read  — Read file contents"));
+        assert!(p.contains("- grep  — Search file contents"));
+        for absent in ["- edit", "- write", "- bash", "- docs", "todo", "Windows"] {
+            assert!(
+                !p.contains(absent),
+                "{absent} must not appear for a read-only run: {p}"
+            );
+        }
+        assert!(p.contains("Re-stating the same plan without acting on it is a bug"));
+        let none = default_system_prompt_with_tools("/tmp/proj", false, &[]);
+        assert!(none.contains("Available tools:\n(none)"));
+    }
+
     #[test]
     fn default_prompt_mentions_cwd_and_tools() {
-        let p = default_system_prompt("/tmp/proj", false);
+        let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
         assert!(p.contains("/tmp/proj"));
         assert!(p.contains("read"));
         assert!(p.contains("bash"));
@@ -3253,20 +3516,17 @@ mod tests {
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("- powershell"));
-        assert!(p.contains("Bash/POSIX syntax, including on Windows"));
-        assert!(p.contains("do not pass PowerShell cmdlets"));
+        assert!(p.contains("Bash/POSIX syntax, also on Windows"));
     }
 
     #[test]
     fn default_prompt_instructs_language_matching() {
-        // The model must detect the user's language and answer in it, so a
-        // Chinese (or any non-English) user gets a same-language reply without
-        // having to ask every turn.
-        let p = default_system_prompt("/tmp/proj", false);
-        let lower = p.to_lowercase();
+        // A Chinese (or any non-English) user gets a same-language reply
+        // without having to ask every turn.
+        let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
         assert!(
-            lower.contains("same language") && lower.contains("detect"),
-            "the prompt must tell the model to detect and mirror the user's language: {p}"
+            p.contains("same language as the user's latest message"),
+            "the prompt must tell the model to mirror the user's language: {p}"
         );
     }
 
@@ -3279,7 +3539,7 @@ mod tests {
         // observed session paid for that 112 times in a single run, and twice
         // hallucinated the user's input ("The user is greeting me with hello",
         // with no such message). See `docs/llm-repetition-forensics.md` §八.
-        let p = default_system_prompt("/tmp/proj", false);
+        let p = default_system_prompt_with_tools("/tmp/proj", false, &default_prompt_tools());
         let lower = p.to_lowercase();
         // The rule must state the mechanism, not just "be clear".
         assert!(
@@ -3311,7 +3571,7 @@ mod tests {
         // carried into your next turn" is false, and the instruction to restate
         // the plan every turn is exactly the busy-work the re-plan analysis
         // measured. The wording must flip with the mechanism.
-        let p = default_system_prompt("/tmp/proj", true);
+        let p = default_system_prompt_with_tools("/tmp/proj", true, &default_prompt_tools());
         let lower = p.to_lowercase();
         assert!(
             lower.contains("carried back"),
@@ -3326,13 +3586,26 @@ mod tests {
             "the replayed variant must forbid re-deriving the plan: {p}"
         );
         assert!(
-            lower.contains("do not re-derive") && lower.contains("re-listing the same plan"),
+            lower.contains("do not re-derive") && lower.contains("re-stating the same plan"),
             "the anti-repetition rule must survive the flip: {p}"
         );
         assert!(
             lower.contains("already shown earlier"),
             "the re-read rule must survive the flip: {p}"
         );
+    }
+
+    #[test]
+    fn default_prompt_states_each_rule_once() {
+        // The plan rule, the todo tool and the anti-repetition line used to be
+        // spread over two guidelines that repeated each other.
+        for replayed in [false, true] {
+            let p =
+                default_system_prompt_with_tools("/tmp/proj", replayed, &default_prompt_tools());
+            for phrase in ["the same plan", "todo tool", "Windows", "guessing"] {
+                assert_eq!(p.matches(phrase).count(), 1, "{phrase:?} repeated: {p}");
+            }
+        }
     }
 
     /// Only side-effect-free tools may be replayed after a crash.
@@ -3863,6 +4136,7 @@ mod tests {
 
     #[test]
     fn select_latest_for_continue_and_resume() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args {
             continue_session: true,
             ..Args::default()
@@ -3885,6 +4159,7 @@ mod tests {
 
     #[test]
     fn select_by_id_for_session_flag() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args {
             session: Some("01a02ece".into()),
             ..Args::default()
@@ -3898,6 +4173,7 @@ mod tests {
 
     #[test]
     fn select_new_with_custom_dir() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args {
             session_dir: Some(PathBuf::from("/tmp/sess")),
             ..Args::default()
@@ -3911,6 +4187,7 @@ mod tests {
 
     #[test]
     fn select_new_default_dir() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let args = Args::default();
         let cwd = Path::new("/proj");
         match select_session(&args, cwd) {
@@ -3923,6 +4200,7 @@ mod tests {
 
     #[test]
     fn default_session_dir_only_uses_rpi() {
+        let _env = crate::config::test_support::SessionDirEnv::new(None);
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
@@ -3936,9 +4214,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cwd = tmp.path();
         let custom = tmp.path().join("custom_sessions");
-        std::env::set_var("RPI_CODING_AGENT_SESSION_DIR", custom.to_str().unwrap());
+        let _env = crate::config::test_support::SessionDirEnv::new(Some(&custom));
         assert_eq!(default_session_dir(cwd), custom);
-        std::env::remove_var("RPI_CODING_AGENT_SESSION_DIR");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

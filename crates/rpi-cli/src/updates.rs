@@ -19,6 +19,8 @@ const CACHE_FALLBACK_MAX_AGE_MS: i64 = 6 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS: u64 = 1800;
 const UPDATE_CHECK_CONCURRENCY: usize = 4;
 const CRATES_IO_API: &str = "https://crates.io/api/v1/crates/rpi-cli";
+const GITHUB_RELEASES_API: &str =
+    "https://api.github.com/repos/bigfish1913/pi-rust/releases?per_page=100";
 const STAGED_RPI_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const MAX_STAGED_RPI_OUTPUT_BYTES: usize = 4 * 1024;
 const MAX_SELF_UPDATE_STATUS_BYTES: u64 = 64 * 1024;
@@ -94,6 +96,20 @@ struct CrateInfo {
     max_version: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateChannel {
+    Stable,
+    Preview,
+}
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SelfUpdateStatus {
@@ -272,7 +288,7 @@ fn entry_cache_checked_at(
 
 fn timestamp_is_fresh(checked_at: i64, now: i64) -> bool {
     let age = now.saturating_sub(checked_at);
-    checked_at > 0 && age >= 0 && age <= CACHE_FALLBACK_MAX_AGE_MS
+    checked_at > 0 && (0..=CACHE_FALLBACK_MAX_AGE_MS).contains(&age)
 }
 
 fn resolved_checked_at(
@@ -446,6 +462,43 @@ async fn fetch_rpi_latest(client: &reqwest::Client) -> RegistryLookup {
     fetch_crates_url(client, CRATES_IO_API).await
 }
 
+fn latest_preview_version(releases: impl IntoIterator<Item = GithubRelease>) -> RegistryLookup {
+    releases
+        .into_iter()
+        .filter(|release| release.prerelease && !release.draft)
+        .filter_map(|release| {
+            let version = release.tag_name.strip_prefix('v')?.to_string();
+            let parsed = semver::Version::parse(&version).ok()?;
+            (!parsed.pre.is_empty()).then_some((parsed, version))
+        })
+        .max_by(|left, right| left.0.cmp(&right.0))
+        .map(|(_, version)| RegistryLookup::Found(version))
+        .unwrap_or(RegistryLookup::Missing)
+}
+
+async fn fetch_rpi_preview_latest(client: &reqwest::Client) -> RegistryLookup {
+    let response = match client
+        .get(GITHUB_RELEASES_API)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return RegistryLookup::TransientFailure,
+    };
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return RegistryLookup::Missing;
+    }
+    if !response.status().is_success() {
+        return RegistryLookup::TransientFailure;
+    }
+    let releases = match response.json::<Vec<GithubRelease>>().await {
+        Ok(releases) => releases,
+        Err(_) => return RegistryLookup::TransientFailure,
+    };
+    latest_preview_version(releases)
+}
+
 async fn fetch_crates_latest(client: &reqwest::Client, name: &str) -> RegistryLookup {
     fetch_crates_url(client, &format!("https://crates.io/api/v1/crates/{name}")).await
 }
@@ -513,7 +566,11 @@ pub fn print_startup_notices(report: &UpdateReport) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelfUpdateArgs {
     Help,
-    Run { force: bool, build: bool },
+    Run {
+        force: bool,
+        build: bool,
+        channel: UpdateChannel,
+    },
     Usage,
 }
 
@@ -522,22 +579,31 @@ enum SelfUpdateArgs {
 fn parse_self_update_args(args: &[String]) -> SelfUpdateArgs {
     let mut force = false;
     let mut build = false;
+    let mut channel = UpdateChannel::Stable;
     for arg in args {
         match arg.as_str() {
             "--help" | "-h" => return SelfUpdateArgs::Help,
             "--force" | "-f" => force = true,
             "--build" => build = true,
+            "preview" if channel == UpdateChannel::Stable => channel = UpdateChannel::Preview,
             _ => return SelfUpdateArgs::Usage,
         }
     }
-    SelfUpdateArgs::Run { force, build }
+    SelfUpdateArgs::Run {
+        force,
+        build,
+        channel,
+    }
 }
 
 fn print_self_update_help() {
     println!(
-        "Usage: rpi update [--force] [--offline] [--build]\n\n\
-         Update the rpi CLI using verified GitHub prebuilt releases.\n\n\
+        "Usage: rpi update [preview] [--force] [--offline] [--build]\n\n\
+         Update the rpi CLI using verified GitHub prebuilt releases.\n\
+         The optional `preview` channel installs the latest GitHub prerelease;\n\
+         it is never selected by the normal update check.\n\n\
          Options:\n  \
+         preview    use the GitHub prerelease channel instead of crates.io\n  \
          --build    explicitly compile with Cargo instead of downloading a prebuilt binary\n  \
          --force    reinstall even when this rpi is already the latest release\n  \
          --offline  do not touch the network; report the last known answer only"
@@ -599,12 +665,43 @@ fn lookup_latest_rpi_blocking() -> Option<(String, bool)> {
         .ok()?
 }
 
+async fn lookup_latest_preview() -> Option<(String, bool)> {
+    let result = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .user_agent(format!("rpi/{}", crate::VERSION))
+        .build()
+    {
+        Ok(client) => fetch_rpi_preview_latest(&client).await,
+        Err(_) => RegistryLookup::TransientFailure,
+    };
+    let verified = matches!(result, RegistryLookup::Found(_));
+    match result {
+        RegistryLookup::Found(version) => Some((version, verified)),
+        _ => None,
+    }
+}
+
+fn lookup_latest_preview_blocking() -> Option<(String, bool)> {
+    std::thread::Builder::new()
+        .name("rpi-update-preview-lookup".to_string())
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            runtime.block_on(lookup_latest_preview())
+        })
+        .ok()?
+        .join()
+        .ok()?
+}
+
 /// The newest version already staged in a `pending-*` directory.
 ///
 /// A staged update is a fully validated binary waiting for the running process
 /// to exit. Re-running `rpi update` while one is queued must not start a second
 /// compile, so the staged version joins the up-to-date comparison.
-fn staged_pending_version(update_root: &Path) -> Option<semver::Version> {
+fn staged_pending_version(update_root: &Path, channel: UpdateChannel) -> Option<semver::Version> {
     let entries = std::fs::read_dir(update_root).ok()?;
     let mut newest: Option<semver::Version> = None;
     for entry in entries.flatten() {
@@ -632,6 +729,11 @@ fn staged_pending_version(update_root: &Path) -> Option<semver::Version> {
         ) else {
             continue;
         };
+        if (channel == UpdateChannel::Stable && !version.pre.is_empty())
+            || (channel == UpdateChannel::Preview && version.pre.is_empty())
+        {
+            continue;
+        }
         if newest.as_ref().map_or(true, |newest| version > *newest) {
             newest = Some(version);
         }
@@ -668,20 +770,33 @@ fn reclaim_self_update_artifacts() {
 pub fn run_self_update(args: &[String]) -> i32 {
     let offline = crate::args::normalize_offline_mode(args);
     let args = crate::args::without_offline_flag(args);
-    let (force, build) = match parse_self_update_args(&args) {
+    let (force, build, channel) = match parse_self_update_args(&args) {
         SelfUpdateArgs::Help => {
             print_self_update_help();
             return 0;
         }
-        SelfUpdateArgs::Run { force, build } => (force, build),
+        SelfUpdateArgs::Run {
+            force,
+            build,
+            channel,
+        } => (force, build, channel),
         SelfUpdateArgs::Usage => {
-            eprintln!("error: `rpi update` accepts only `--force`, `--offline` and `--build`");
+            eprintln!(
+                "error: `rpi update` accepts only `preview`, `--force`, `--offline` and `--build`"
+            );
             return 2;
         }
     };
 
     if offline {
         reclaim_self_update_artifacts();
+        if channel == UpdateChannel::Preview {
+            println!(
+                "rpi preview update skipped: offline mode is enabled;\n\
+                 run `rpi update preview` without --offline to query GitHub."
+            );
+            return 0;
+        }
         // The cache is the only source available without a network round trip,
         // so it may be stale — say so rather than assert a version.
         match known_latest_rpi(None, cached_latest_rpi().as_deref()) {
@@ -708,25 +823,38 @@ pub fn run_self_update(args: &[String]) -> i32 {
     // is already installed — which is exactly what makes a working update look
     // broken. `--force` keeps an explicit reinstall available.
     let release = if !build || !force {
-        lookup_latest_rpi_blocking()
+        match channel {
+            UpdateChannel::Stable => lookup_latest_rpi_blocking(),
+            UpdateChannel::Preview => lookup_latest_preview_blocking(),
+        }
     } else {
         None
     };
     if !force {
         reclaim_self_update_artifacts();
-        let staged = pending_staged_version();
+        let staged = pending_staged_version(channel);
         let (latest, verified) = match release.clone() {
             Some(found) => found,
             None if staged.is_some() => {
                 println!(
-                    "could not reach crates.io to check the latest release; using the already staged update"
+                    "could not reach the latest {} release; using the already staged update",
+                    if channel == UpdateChannel::Preview {
+                        "preview"
+                    } else {
+                        "stable"
+                    }
                 );
                 (crate::VERSION.to_string(), false)
             }
             None => {
                 println!(
-                    "could not reach crates.io to check the latest release\n\
-                     Retry later, or use `rpi update --build --force` for an explicit Cargo build."
+                    "could not reach the latest {} release\n\
+                     Retry later, or use `rpi update --build --force` for an explicit Cargo build.",
+                    if channel == UpdateChannel::Preview {
+                        "preview"
+                    } else {
+                        "stable"
+                    }
                 );
                 return 1;
             }
@@ -740,7 +868,18 @@ pub fn run_self_update(args: &[String]) -> i32 {
             .filter(|staged| !is_newer(&staged.to_string(), &latest))
             .map(std::string::ToString::to_string);
         let target = staged_wins.clone().unwrap_or_else(|| latest.clone());
-        if !is_newer(crate::VERSION, &target) {
+        let needs_update = match channel {
+            UpdateChannel::Stable => is_newer(crate::VERSION, &target),
+            // Explicitly selecting preview is allowed from a stable install;
+            // a preview channel is intentionally independent of crates.io's
+            // stable precedence ordering.
+            UpdateChannel::Preview => {
+                let current = semver::Version::parse(crate::VERSION).ok();
+                current.is_some_and(|current| current.pre.is_empty())
+                    || is_newer(crate::VERSION, &target)
+            }
+        };
+        if !needs_update {
             if staged_wins.is_some() {
                 println!(
                     "rpi {target} is already staged; quit this rpi and it will be applied\n\
@@ -764,7 +903,14 @@ pub fn run_self_update(args: &[String]) -> i32 {
     }
 
     if !build && release.is_none() {
-        eprintln!("error: could not resolve the release version; retry later or select --build explicitly");
+        eprintln!(
+            "error: could not resolve the {} release version; retry later or select --build explicitly",
+            if channel == UpdateChannel::Preview {
+                "preview"
+            } else {
+                "stable"
+            }
+        );
         return 1;
     }
     let version = release.as_ref().map(|(version, _)| version.as_str());
@@ -784,10 +930,10 @@ pub fn run_self_update(args: &[String]) -> i32 {
     code
 }
 
-fn pending_staged_version() -> Option<semver::Version> {
+fn pending_staged_version(channel: UpdateChannel) -> Option<semver::Version> {
     let agent_dir = crate::config::agent_dir().ok()?;
     let update_root = agent_dir.join("self-update");
-    staged_pending_version(&update_root)
+    staged_pending_version(&update_root, channel)
 }
 
 fn cached_latest_rpi() -> Option<String> {
@@ -2759,14 +2905,16 @@ mod tests {
             super::parse_self_update_args(&args(&["--build", "--force"])),
             super::SelfUpdateArgs::Run {
                 force: true,
-                build: true
+                build: true,
+                channel: super::UpdateChannel::Stable,
             }
         );
         assert_eq!(
             super::parse_self_update_args(&args(&[])),
             super::SelfUpdateArgs::Run {
                 force: false,
-                build: false
+                build: false,
+                channel: super::UpdateChannel::Stable,
             }
         );
         for flag in ["--force", "-f"] {
@@ -2774,10 +2922,19 @@ mod tests {
                 super::parse_self_update_args(&args(&[flag])),
                 super::SelfUpdateArgs::Run {
                     force: true,
-                    build: false
+                    build: false,
+                    channel: super::UpdateChannel::Stable,
                 }
             );
         }
+        assert_eq!(
+            super::parse_self_update_args(&args(&["preview"])),
+            super::SelfUpdateArgs::Run {
+                force: false,
+                build: false,
+                channel: super::UpdateChannel::Preview,
+            }
+        );
         for flag in ["--help", "-h"] {
             assert_eq!(
                 super::parse_self_update_args(&args(&[flag])),
@@ -3332,6 +3489,36 @@ mod tests {
             validate_staged_rpi_version_output(b"rpi 1.2.3\n", b"warning", "1.2.3")
                 .unwrap_err()
                 .contains("stderr")
+        );
+    }
+
+    #[test]
+    fn preview_release_selection_ignores_stable_and_draft_releases() {
+        let releases = vec![
+            super::GithubRelease {
+                tag_name: "v0.9.4-preview.1".into(),
+                draft: false,
+                prerelease: true,
+            },
+            super::GithubRelease {
+                tag_name: "v0.9.4-preview.3".into(),
+                draft: false,
+                prerelease: true,
+            },
+            super::GithubRelease {
+                tag_name: "v0.9.4-preview.99".into(),
+                draft: true,
+                prerelease: true,
+            },
+            super::GithubRelease {
+                tag_name: "v0.9.4".into(),
+                draft: false,
+                prerelease: false,
+            },
+        ];
+        assert_eq!(
+            super::latest_preview_version(releases),
+            super::RegistryLookup::Found("0.9.4-preview.3".into())
         );
     }
 

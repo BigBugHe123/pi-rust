@@ -5,10 +5,10 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::component::Component;
+use super::component::{Component, RenderedDocument};
 use crate::ansi::{bold, strip_ansi};
 use crate::theme::{theme, theme_revision, Theme, ThemeColors};
 use crate::tool_panel::ToolPanel;
@@ -92,7 +92,7 @@ struct ToolRenderCache {
     width: usize,
     revision: u64,
     theme_revision: u64,
-    lines: Vec<String>,
+    lines: Arc<Vec<String>>,
 }
 
 impl ToolExecutionComponent {
@@ -274,14 +274,11 @@ impl ToolExecutionComponent {
             } else {
                 "Ready"
             };
-            let mut rows = vec![
-                String::new(),
-                truncate_to_width(
-                    &colors.accent.fg(&bold(&format!(" Plan · {status}"))),
-                    width,
-                    "…",
-                ),
-            ];
+            let mut rows = vec![truncate_to_width(
+                &colors.accent.fg(&bold(&format!(" Plan · {status}"))),
+                width,
+                "…",
+            )];
             if plan.trim().is_empty() {
                 let hint = if *active {
                     "Inspect the repository, then complete the plan."
@@ -318,6 +315,9 @@ impl ToolExecutionComponent {
                     ));
                 }
             }
+            // Trailing spacer (one convention for every panel: each transcript
+            // entry ends with its own blank row; nothing adds a leading one).
+            rows.push(String::new());
             return rows;
         }
         if let Some(todos) = self.todo_state.lock().unwrap().as_ref() {
@@ -326,10 +326,11 @@ impl ToolExecutionComponent {
                 .filter(|(_, status)| status == "completed")
                 .count();
             let heading = format!(" Tasks  {done}/{} completed", todos.len());
-            let mut rows = vec![
-                String::new(),
-                truncate_to_width(&colors.tool_title.fg(&bold(&heading)), width, "…"),
-            ];
+            let mut rows = vec![truncate_to_width(
+                &colors.tool_title.fg(&bold(&heading)),
+                width,
+                "…",
+            )];
             if todos.is_empty() {
                 rows.push(colors.muted.fg("   No tasks"));
             }
@@ -356,15 +357,12 @@ impl ToolExecutionComponent {
                     ));
                 }
             }
+            // Trailing spacer (one convention for every panel; see the plan
+            // arm above).
+            rows.push(String::new());
             return rows;
         }
         let mut lines = Vec::new();
-
-        // Top spacer — pi's tool-execution.ts adds a Spacer(1) child inside
-        // the component so each tool panel is visually separated from the
-        // surrounding transcript (the old rpi drain path had no gap between
-        // consecutive tool panels).
-        lines.push(String::new());
 
         let name = self.name.lock().unwrap();
         let display_title = self.display_title.lock().unwrap();
@@ -386,7 +384,12 @@ impl ToolExecutionComponent {
         // result streaming + Ctrl+O expand plumbing.
         if let Some(skill) = skill_name.as_deref() {
             let content = result.as_deref().unwrap_or("");
-            return render_skill(colors, skill, content, *expanded, width);
+            let mut lines = render_skill(colors, skill, content, *expanded, width);
+            // Trailing spacer (one convention for every panel). The skill box
+            // used to skip the top spacer entirely — its render path
+            // early-returned past the push — so it had no gap on either side.
+            lines.push(String::new());
+            return lines;
         }
 
         // Status indicator — a colored glyph (no emoji), pi style.
@@ -480,16 +483,14 @@ impl ToolExecutionComponent {
         // Expanded: the full args JSON (indented, dim) above the result. The
         // compact summary already lives in the header, so this is the
         // "show me everything" path for debugging a tool call.
-        if *expanded {
-            if !args.is_empty() && args.trim() != "{}" {
-                let args_line = format!(
-                    "{} {}",
-                    colors.muted.fg("args:"),
-                    colors.dim.fg(&pretty_args(&args))
-                );
-                for part in wrap_text_with_ansi(&args_line, content_width) {
-                    lines.push(panel.line(&part));
-                }
+        if *expanded && !args.is_empty() && args.trim() != "{}" {
+            let args_line = format!(
+                "{} {}",
+                colors.muted.fg("args:"),
+                colors.dim.fg(&pretty_args(&args))
+            );
+            for part in wrap_text_with_ansi(&args_line, content_width) {
+                lines.push(panel.line(&part));
             }
         }
 
@@ -576,12 +577,15 @@ impl ToolExecutionComponent {
         }
 
         lines.extend(std::iter::repeat(panel.blank()).take(panel.padding_y));
+        // Trailing spacer (one convention for every panel: each transcript
+        // entry ends with its own blank row; nothing adds a leading one).
+        lines.push(String::new());
         lines
     }
 }
 
-impl Component for ToolExecutionComponent {
-    fn render(&self, width: usize) -> Vec<String> {
+impl ToolExecutionComponent {
+    fn shared_lines(&self, width: usize) -> Arc<Vec<String>> {
         let status = *self.status.lock().unwrap();
         let revision = self.revision.load(Ordering::Acquire);
         let theme_revision = theme_revision();
@@ -600,7 +604,7 @@ impl Component for ToolExecutionComponent {
                 }
             }
         }
-        let lines = self.render_panel(width, &theme());
+        let lines = Arc::new(self.render_panel(width, &theme()));
         if finished {
             if let Ok(mut cache) = self.cache.lock() {
                 *cache = Some(ToolRenderCache {
@@ -614,6 +618,16 @@ impl Component for ToolExecutionComponent {
             *cache = None;
         }
         lines
+    }
+}
+
+impl Component for ToolExecutionComponent {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.shared_lines(width).as_ref().clone()
+    }
+
+    fn render_document(&self, width: usize) -> RenderedDocument {
+        RenderedDocument::from_shared(self.shared_lines(width))
     }
 
     fn invalidate(&self) {
@@ -1077,7 +1091,7 @@ mod tools {
         }
         let mut s = String::new();
         let mut esc = false;
-        while let Some(c) = chars.next() {
+        for c in chars.by_ref() {
             if esc {
                 esc = false;
                 s.push(c);
@@ -1101,7 +1115,7 @@ mod tools {
                 let mut s = String::from("\"");
                 chars.next();
                 let mut esc = false;
-                while let Some(c) = chars.next() {
+                for c in chars.by_ref() {
                     s.push(c);
                     if esc {
                         esc = false;
@@ -1140,7 +1154,7 @@ mod tools {
         let mut depth = 0isize;
         let mut in_str = false;
         let mut esc = false;
-        while let Some(c) = chars.next() {
+        for c in chars.by_ref() {
             s.push(c);
             if in_str {
                 if esc {
@@ -1178,6 +1192,71 @@ mod tools {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn finalized_documents_share_rows_and_refresh_after_changes() {
+        use super::*;
+        for failed in [false, true] {
+            let tool = ToolExecutionComponent::new("read", "{}");
+            let output = (1..=20)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            tool.set_result(&output, failed);
+            let first = tool.shared_lines(80);
+            assert!(Arc::ptr_eq(&first, &tool.shared_lines(80)));
+            let references = Arc::strong_count(&first);
+            let document = tool.render_document(80);
+            let second_document = tool.render_document(80);
+            assert_eq!(Arc::strong_count(&first), references + 2);
+            assert_eq!(document.lines(0, document.len()), first.as_ref().clone());
+            assert_eq!(second_document.len(), document.len());
+            assert_eq!(tool.render(80), first.as_ref().clone());
+
+            tool.set_expanded(true);
+            let expanded = tool.shared_lines(80);
+            assert!(!Arc::ptr_eq(&first, &expanded));
+            assert!(strip_ansi(&expanded.join("\n")).contains("line 20"));
+            assert!(!strip_ansi(&first.join("\n")).contains("line 20"));
+
+            tool.set_result("late result", failed);
+            let updated = tool.shared_lines(80);
+            assert!(!Arc::ptr_eq(&expanded, &updated));
+            assert!(strip_ansi(&updated.join("\n")).contains("late result"));
+            let narrow = tool.shared_lines(24);
+            assert!(!Arc::ptr_eq(&updated, &narrow));
+            assert!(narrow
+                .iter()
+                .all(|row| crate::utils::visible_width(row) <= 24));
+            tool.invalidate();
+            let invalidated = tool.shared_lines(24);
+            assert!(!Arc::ptr_eq(&narrow, &invalidated));
+            assert_eq!(narrow, invalidated);
+            assert!(Arc::ptr_eq(&invalidated, &tool.shared_lines(24)));
+        }
+    }
+
+    #[test]
+    fn pending_and_running_rows_remain_live_and_uncached() {
+        use super::*;
+        let tool = ToolExecutionComponent::new("read", "{}");
+        let pending = tool.shared_lines(80);
+        assert!(!Arc::ptr_eq(&pending, &tool.shared_lines(80)));
+        assert!(tool.cache.lock().unwrap().is_none());
+        tool.set_result("finished", false);
+        let finished = tool.shared_lines(80);
+        tool.set_running();
+        let running = tool.shared_lines(80);
+        assert!(!Arc::ptr_eq(&finished, &running));
+        assert!(!Arc::ptr_eq(&running, &tool.shared_lines(80)));
+        assert!(tool.cache.lock().unwrap().is_none());
+        // Move the clock origin directly rather than sleeping or relying on timing.
+        *tool.started_at.lock().unwrap() =
+            Some(Instant::now() - std::time::Duration::from_secs(65));
+        let later = tool.shared_lines(80);
+        assert!(strip_ansi(&later.join("\n")).contains("1m5s"));
+        assert!(!Arc::ptr_eq(&running, &later));
+    }
+
     #[test]
     fn plan_panel_keeps_markdown_and_hides_raw_arguments() {
         use super::*;
@@ -1247,6 +1326,69 @@ mod tests {
     use super::*;
 
     #[test]
+    fn panels_carry_a_trailing_spacer_and_no_leading_one() {
+        // Trailing-spacing convention: every transcript entry contributes one
+        // blank line AFTER itself (the host adds none), so two adjacent
+        // blocks are separated by exactly one blank regardless of which kind
+        // sits on top. A leading spacer would double up with the previous
+        // entry's trailing one; a missing trailing one leaves the next
+        // message flush against the panel.
+        let theme = Theme::default();
+        for (panel, header) in [
+            (
+                {
+                    let tool = ToolExecutionComponent::new("read", r#"{"path":"f.txt"}"#);
+                    tool.set_result("done", false);
+                    tool
+                },
+                "read",
+            ),
+            (
+                {
+                    let plan = ToolExecutionComponent::new("plan_mode_complete", "");
+                    plan.set_plan_state("step 1".into(), false);
+                    plan
+                },
+                "Plan",
+            ),
+            (
+                {
+                    let todo = ToolExecutionComponent::new("todo", "");
+                    todo.set_todo_state(vec![("task".into(), "pending".into())]);
+                    todo
+                },
+                "Tasks",
+            ),
+        ] {
+            let lines = panel.render_panel(40, &theme);
+            let plain: Vec<_> = lines.iter().map(|l| strip_ansi(l)).collect();
+            assert!(plain.iter().any(|l| l.contains(header)));
+            assert_eq!(
+                lines.last(),
+                Some(&String::new()),
+                "{header} panel must end with the trailing spacer: {plain:?}"
+            );
+            assert_ne!(
+                lines.first(),
+                Some(&String::new()),
+                "{header} panel must not open with a spacer: {plain:?}"
+            );
+        }
+        // The skill box used to discard the top spacer entirely (its render
+        // path early-returns past the spacer push), so it had no gap on
+        // either side.
+        let skill = ToolExecutionComponent::new("read", r#"{"path":"skills/foo/SKILL.md"}"#);
+        skill.set_skill_name("foo");
+        skill.set_result("instructions", false);
+        let lines = skill.render_panel(40, &theme);
+        assert_eq!(
+            lines.last(),
+            Some(&String::new()),
+            "skill box must end with the trailing spacer: {lines:?}"
+        );
+    }
+
+    #[test]
     fn generic_panels_share_themed_insets_in_every_state() {
         let theme = Theme::default();
         for status in [
@@ -1269,14 +1411,17 @@ mod tests {
             };
             let lines = tool.render_panel(40, &theme);
             let blank = bg.bg(&" ".repeat(40));
-            assert_eq!(lines[0], "", "outer spacer is not part of the panel");
-            assert_eq!(lines[1], blank);
-            assert_eq!(lines.last().unwrap(), &blank);
-            assert!(strip_ansi(&lines[2]).starts_with("  "));
+            assert_eq!(lines[0], blank);
+            assert_eq!(
+                lines.last().unwrap(),
+                &String::new(),
+                "trailing spacer must remain uncolored"
+            );
+            assert!(strip_ansi(&lines[1]).starts_with("  "));
             assert!(lines
                 .iter()
                 .any(|line| strip_ansi(line).trim_end() == "  + new"));
-            for line in &lines[1..] {
+            for line in &lines[..lines.len() - 1] {
                 let plain = strip_ansi(line);
                 assert!(line.starts_with(&bg.to_bg()));
                 assert_eq!(crate::utils::visible_width(line), 40);
@@ -1304,9 +1449,13 @@ mod tests {
         tool.set_diff(vec!["+ new".into()]);
         let lines = tool.render_panel(40, &theme);
         let blank = theme.colors.tool_success_bg.bg(&" ".repeat(40));
-        assert_eq!(lines[1..3], [blank.clone(), blank.clone()]);
-        assert_eq!(lines[lines.len() - 2..], [blank.clone(), blank]);
-        assert!(strip_ansi(&lines[3]).starts_with("    ✓ edit"));
+        assert_eq!(lines[0..2], [blank.clone(), blank.clone()]);
+        assert_eq!(
+            lines[lines.len() - 3..],
+            [blank.clone(), blank, String::new()],
+            "panel ends with padding + trailing spacer"
+        );
+        assert!(strip_ansi(&lines[2]).starts_with("    ✓ edit"));
         assert!(lines
             .iter()
             .any(|line| strip_ansi(line).trim_end() == "    │ done"));
@@ -1317,8 +1466,8 @@ mod tests {
         theme.spacing.tool_panel_padding_x = 0;
         theme.spacing.tool_panel_padding_y = 0;
         let lines = tool.render_panel(40, &theme);
-        assert!(strip_ansi(&lines[1]).starts_with("✓ edit"));
-        assert_eq!(strip_ansi(lines.last().unwrap()).trim_end(), "+ new");
+        assert!(strip_ansi(&lines[0]).starts_with("✓ edit"));
+        assert_eq!(strip_ansi(&lines[lines.len() - 2]).trim_end(), "+ new");
     }
 
     #[test]
@@ -1340,7 +1489,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(reconstructed, output);
-            for line in &lines[1..] {
+            for line in &lines[..lines.len() - 1] {
                 let plain = strip_ansi(line);
                 assert_eq!(crate::utils::visible_width(line), 12);
                 assert!(plain.starts_with("  ") && plain.ends_with("  "));
@@ -1392,7 +1541,7 @@ mod tests {
         assert!(compact.contains("+你好abc"));
         assert!(compact.contains('…'));
         assert!(compact.contains("args:"));
-        for line in &lines[1..] {
+        for line in &lines[..lines.len() - 1] {
             let plain = strip_ansi(line);
             assert_eq!(crate::utils::visible_width(line), 16);
             assert!(plain.starts_with("  ") && plain.ends_with("  "));

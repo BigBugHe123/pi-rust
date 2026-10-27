@@ -2,15 +2,49 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, preview]
   pull_request:
-    branches: [main]
+    branches: [main, preview]
   workflow_dispatch:
+    inputs:
+      prepare_release:
+        description: 'Prepare or update the stable Release PR after CI passes'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
+  msrv:
+    name: Rust 1.88 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minimum supported Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88.0"
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace targets on MSRV
+        run: cargo check --workspace --all-targets --locked
+      - name: Check all extension features on MSRV
+        run: cargo check -p rpi-extensions --all-features --tests --locked
+      - name: Check standalone ABI core on MSRV
+        run: cargo check -p rpi-plugin-sdk --no-default-features --locked
+      - name: Check provider SDK bridge on MSRV
+        run: cargo check -p rpi-plugin-sdk --features provider --locked
+      - name: Check AI core without default features on MSRV
+        run: cargo check -p rpi-ai --no-default-features --locked
+
   windows-installer:
     name: Windows installer (${{ matrix.shell }})
     runs-on: windows-latest
@@ -103,7 +137,7 @@ jobs:
       - name: Check the standalone ABI core
         run: cargo check -p rpi-plugin-sdk --no-default-features --locked
 
-      - name: Test provider bridge reconstruction
+      - name: Test provider bridge reconstruction and capacity
         run: cargo test -p rpi-extensions --features provider-performance --locked 'provider::'
 
       - name: Test prebuilt release manifests
@@ -115,7 +149,7 @@ jobs:
           python3 scripts/test_release_channels.py
 
   windows-plugin-lifecycle:
-    name: Windows plugin ABI and ownership
+    name: Windows plugin ABI and DLL lifecycle
     runs-on: windows-latest
     timeout-minutes: 20
     env:
@@ -126,15 +160,79 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Negotiate old and new ABI tables
         run: cargo test -p rpi-plugin-sdk --features provider --locked
-      - name: Check plugin tool ownership
+      - name: Check DLL shutdown and tool ownership
         run: cargo test -p rpi-extensions --lib --features rpi-ai/providers --locked
 
   release:
     name: Release automation
     if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    needs: [check, test, windows-installer]
+    needs: [msrv, check, test, windows-installer]
     permissions:
       contents: write
       pull-requests: read
     uses: ./.github/workflows/release.yml
+    with:
+      prepare: ${{ github.event_name == 'workflow_dispatch' && inputs.prepare_release == true }}
+    secrets: inherit
+
+  preview-version:
+    name: Prepare preview release
+    if: github.repository == 'bigfish1913/pi-rust' && github.ref == 'refs/heads/preview' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: [msrv, check, test, windows-installer]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out preview commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Resolve preview version and tag
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base="$(python3 - <<'PY'
+          import tomllib
+          with open("Cargo.toml", "rb") as file:
+              print(tomllib.load(file)["workspace"]["package"]["version"])
+          PY
+          )"
+          IFS=. read -r major minor patch <<EOF
+          ${base}
+          EOF
+          version="${major}.${minor}.$((patch + 1))-preview.${GITHUB_RUN_NUMBER}"
+          tag="v${version}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            existing="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" --jq '.object.sha')"
+            test "${existing}" = "${GITHUB_SHA}" || {
+              echo "preview tag ${tag} already points to ${existing}, not ${GITHUB_SHA}" >&2
+              exit 1
+            }
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f "ref=refs/tags/${tag}" -f "sha=${GITHUB_SHA}"
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+
+  preview-binaries:
+    name: Build preview binaries
+    needs: preview-version
+    uses: ./.github/workflows/release-binaries.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.preview-version.outputs.tag }}
+      version: ${{ needs.preview-version.outputs.version }}
+      preview: true
+      checkout_ref: ${{ github.sha }}
     secrets: inherit
