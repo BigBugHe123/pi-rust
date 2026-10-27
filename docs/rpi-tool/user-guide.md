@@ -493,8 +493,9 @@ rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness →
 rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 ```
 
-日常贡献无需手动修改版本号。普通改动合并 `main` 并通过 CI 后，由自动化准备
-Release PR；只有合并符合条件的 Release PR 才会发布。发布记录统一维护在根目录
+日常贡献无需手动修改版本号。普通改动合并 `main` 并通过 CI 后不会自动准备
+Release PR；维护者需要在 `Actions → CI → Run workflow` 中选择 `main` 并启用
+`prepare_release`。只有合并符合条件的 Release PR 才会发布。发布记录统一维护在根目录
 `CHANGELOG.md`，不再新建 `docs/release-vX.Y.Z.md`。完整流程与纯文档不发布的处理方式
 见仓库 `docs/maintaining/releasing.md`：
 <https://github.com/bigfish1913/pi-rust/blob/main/docs/maintaining/releasing.md>。

@@ -164,15 +164,17 @@ recovery behaviour for a crash in the middle of the affected operation.
 
 Releases are cut by a maintainer, not by contributors:
 
-1. `CHANGELOG.md` is updated and the version is bumped in the workspace
-   `Cargo.toml`.
-2. `task publish` derives the next version, bumps/tags/pushes it and runs the
-   whole channel + crates.io pipeline; `task publish:crates` publishes the workspace
-   crates in dependency order without touching git.
-3. `git tag vX.Y.Z` is pushed and a matching GitHub Release is created; CI
-   publishes automatically on pushes to `main` once the version bump lands.
+1. Ordinary PRs do not change versions. After changes accumulate on `main`, a
+   maintainer manually runs **Actions → CI → Run workflow** on `main` with
+   `prepare_release` enabled.
+2. The workflow creates or updates the Release PR. After review, merging that
+   Release PR is the only action that authorizes publication.
+3. The main-branch CI publishes the crates, creates `vX.Y.Z`, builds the
+   GitHub Release binaries, and updates the install channels.
 
-Do not bump a version or publish a crate in a PR.
+Do not bump a version or publish a crate in a PR. The local `task publish` command
+remains available for explicit manual recovery, but should not be run concurrently
+with the GitHub release workflow.
 
 ## Reporting security issues
 
