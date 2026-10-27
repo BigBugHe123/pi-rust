@@ -3492,14 +3492,7 @@ mod tests {
         let p = default_system_prompt_with_tools("/tmp/proj", true, &tools);
         assert!(p.contains("- read  — Read file contents"));
         assert!(p.contains("- grep  — Search file contents"));
-        for absent in [
-            "- edit",
-            "- write",
-            "- bash",
-            "- docs",
-            "todo",
-            "Windows",
-        ] {
+        for absent in ["- edit", "- write", "- bash", "- docs", "todo", "Windows"] {
             assert!(
                 !p.contains(absent),
                 "{absent} must not appear for a read-only run: {p}"
@@ -4332,5 +4325,3 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
-
-
