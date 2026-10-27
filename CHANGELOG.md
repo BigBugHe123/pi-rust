@@ -11,6 +11,48 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.10.0](https://github.com/bigfish1913/pi-rust/compare/v0.9.6...v0.10.0) - 2026-10-27
+
+### Added
+
+- add preview release channel
+- *(anthropic)* add per-phase build diagnostics and refactor clamping
+- *(harness)* add optional compressed frame sidecars
+- *(harness)* add opt-in frame sidecar storage
+- *(harness)* add optional frame sidecar codec
+
+### Fixed
+
+- restore RPC compatibility and remove perf artifacts
+- *(btw)* align side chat footer
+- *(btw)* animate side chat progress
+- *(session)* preserve durable commits and validate batched operations
+
+### Other
+
+- sync stable 0.9.6 into reviewed preview
+- sync latest stable 0.9.4 before preview build
+- integrate reviewed features-1025 fixes into preview
+- Merge remote-tracking branch 'origin/main' into preview
+- raise minimum supported Rust to 1.88
+- 更新文档开篇说明与来源许可章节
+- 补充 rpi-extcore 复用边界并更新 SDK 版本
+- *(harness)* batch durable recovery mutations
+- optimize long Anthropic request preparation
+- *(agent)* cache incrementally converted provider messages
+- *(agent)* preallocate provider message conversions
+- *(session)* 优化上下文构建与帧写入
+- *(harness)* await persisted retry frames before crash recovery
+- *(harness)* move JSONL append buffers without cloning
+- *(harness)* encode JSONL batches into one buffer
+- *(harness)* preallocate batched JSONL appends
+- *(harness)* remove unused frame sidecar prototype
+- *(harness)* keep sidecar codec out of core storage
+- *(harness)* deduplicate frame sidecar payloads
+- *(harness)* guard extension entries around frames
+- *(harness)* measure compressed frame sidecars
+- *(harness)* audit durable record sizes
+
 ### Changed
 
 - Raise the minimum supported Rust version to 1.88 and check Linux and Windows.
