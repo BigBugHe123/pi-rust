@@ -24,7 +24,7 @@ use rpi_harness::agent_harness::{
     AgentHarness, AgentLane, CompactionOutcome, CompactionResult, HarnessRunOutcome,
 };
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
-use rpi_harness::session::types::{EntryOrder, LaneRecord, RecordQuery};
+use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
 
 use crate::args::Args;
 use crate::rpc::protocol as rpc_protocol;
@@ -558,6 +558,8 @@ where
                 }
                 let content = msg
                     .get("message")
+                    .or_else(|| msg.get("content"))
+                    .or_else(|| msg.get("prompt"))
                     .and_then(|v| v.as_str())
                     .map(str::to_owned);
                 let lane_task = Arc::clone(&lane);
@@ -661,6 +663,8 @@ where
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
+            "get_session_branch" => rpc_get_session_branch(harness).await,
+            "append_entry" => rpc_append_entry(harness, &msg).await,
             "get_stats" => rpc_get_stats(&lane, harness).await,
             "get_queue" => rpc_get_queue(&lane, harness, &msg).await,
             "queue_message" => rpc_queue_message(&lane, &msg).await,
@@ -917,6 +921,7 @@ async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> ser
     let stats = rpc_get_stats(lane, harness).await.ok();
     serde_json::json!({
         "modelId": model.as_ref().map(|model| model.id.clone()),
+        "model": model.as_ref().map(|model| model.id.clone()),
         "provider": model.as_ref().map(|model| model.provider.clone()),
         "thinkingLevel": thinking,
         "activeTools": active_tools,
@@ -954,7 +959,7 @@ fn rpc_message_text(value: &serde_json::Value) -> String {
         .flatten()
         .filter_map(|block| block.get("text").and_then(|text| text.as_str()))
         .collect::<Vec<_>>()
-        .join("\\n")
+        .join("\n")
 }
 
 async fn rpc_get_history(
@@ -1012,6 +1017,41 @@ async fn rpc_get_history(
         "leafId": lane.get_leaf_id().await.ok().flatten(),
         "openOperations": open_operations.iter().map(|record| serde_json::to_value(record).unwrap_or(serde_json::Value::Null)).collect::<Vec<_>>(),
     }))
+}
+
+async fn rpc_get_session_branch(harness: &AgentHarness) -> Result<serde_json::Value, String> {
+    let entries = harness
+        .find_entries_on_branch(
+            &EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            },
+            &BranchBounds::default(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let entries = entries
+        .iter()
+        .map(|entry| serde_json::to_value(entry).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(serde_json::json!({"entries": entries, "count": entries.len()}))
+}
+
+async fn rpc_append_entry(
+    harness: &AgentHarness,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let custom_type = msg
+        .get("customType")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "append_entry requires a non-empty string `customType`".to_string())?;
+    let entry_id = harness
+        .session()
+        .append_custom_entry(custom_type, msg.get("data").cloned())
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({"entryId": entry_id, "customType": custom_type}))
 }
 
 async fn rpc_get_stats(
@@ -1949,6 +1989,18 @@ mod tests {
         assert_eq!(display["title"], "Sign in");
         assert!(display.get("access_token").is_none());
         assert!(display.get("refresh_token").is_none());
+    }
+
+    #[test]
+    fn rpc_message_text_joins_content_blocks_with_real_newlines() {
+        let text = rpc_message_text(&serde_json::json!({
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": "second"}
+            ]
+        }));
+        assert_eq!(text, "first\nsecond");
+        assert!(!text.contains("\\n"));
     }
 
     #[derive(Clone, Default)]

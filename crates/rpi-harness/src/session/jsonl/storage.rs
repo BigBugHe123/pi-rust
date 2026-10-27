@@ -3,12 +3,12 @@
 //!
 //! ## Write path (single `tokio::Mutex<()>` tail chain)
 //!
-//! Every mutating method is [`enqueue`]d onto a `tokio::Mutex<()>`-guarded tail
-//! (the Rust analog of the TS `Promise` chain `this.tail`). Each enqueued op
-//! stamps `seq` + `timestamp` from the live [`SessionState`], appends the JSONL
-//! line, then applies the mutation in memory — so the in-memory state is always
-//! consistent with the durable tail. Reads clone straight from the in-memory
-//! state (defensive-copy contract), never blocking on the tail.
+//! Each mutating method first reserves the shared tail, then dispatches an owner
+//! that keeps that reservation while stamping, appending the JSONL line, and
+//! applying the reducer. Dropping the caller's future cancels only its wait for
+//! the result; the owner still completes the append and reducer commit. Reads
+//! clone straight from the in-memory state (defensive-copy contract), never
+//! blocking on the tail.
 //!
 //! ## Load path + torn-tail recovery (plan §5.14)
 //!
@@ -24,10 +24,13 @@
 //! ### Duplicate-seq recovery (divergent writers)
 //!
 //! Two writers appending to one JSONL diverge their `sequence` counters, which
-//! used to make the whole session unopenable. `load` now heals the two shapes:
+//! used to make the whole session unopenable. `load` handles the following
+//! cases:
 //!
-//! - **A stale seq** (`seq <= sequence`): a duplicate/late append. The line is
-//!   dropped (its content already applied) instead of failing the load.
+//! - **An exact stale seq** (`seq <= sequence`): a mutation identical to the
+//!   already applied raw mutation is a duplicate and may be dropped.
+//! - **A divergent stale seq**: same sequence with different content is
+//!   corruption and is rejected without rewriting the source file.
 //! - **A forward gap** (`seq > sequence + 1`): the other writer's counter was
 //!   ahead. The counter is resynced up to the gap, leaving raw seqs untouched so
 //!   future appends stay consistent with the file.
@@ -47,6 +50,7 @@
 //! `append_entry` receives a [`ProvisionedEntry`] and stamps via the state +
 //! a [`Clock`], then encodes the resulting full `Entry`.
 
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -54,11 +58,11 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use rpi_tools::env::{FileContent, FileSystem};
-use rpi_tools::FileError;
 
 use crate::error::{SessionError, SessionErrorCode, SessionResult};
 use crate::session::jsonl::codec::{
-    encode_header, encode_mutation, metadata_from_header, parse_header, parse_mutation,
+    encode_header, encode_mutation, encode_mutation_into, metadata_from_header, parse_header,
+    parse_mutation,
 };
 use crate::session::jsonl::errors::{file_result, invalid_file, JsonlDecodeErrorKind};
 use crate::session::jsonl::types::{JsonlSessionMetadata, JsonlV4Header};
@@ -79,7 +83,7 @@ use crate::session::types::{
 pub struct JsonlSessionStorage {
     fs: Arc<dyn FileSystem>,
     metadata: JsonlSessionMetadata,
-    state: tokio::sync::Mutex<SessionState>,
+    state: Arc<tokio::sync::Mutex<SessionState>>,
     clock: Arc<dyn Clock>,
     /// Reserved for future auto-id generation (callers currently supply entry/
     /// record ids). Kept for parity with `InMemorySessionStorage`.
@@ -88,14 +92,56 @@ pub struct JsonlSessionStorage {
     /// Serializes appends to this session's file (the TS `tail` Promise chain).
     /// Not `&self` across await points, so each mutating op holds it for its
     /// full duration.
-    tail: Mutex<()>,
-    append: Mutex<Option<Box<dyn rpi_tools::env::AppendFile>>>,
-    /// Set when a failed append could not be cut back, so the file may end in
-    /// bytes this session cannot account for. Writes are refused until reopen.
-    uncertain: AtomicBool,
+    tail: Arc<Mutex<()>>,
+    append: Arc<Mutex<Option<Box<dyn rpi_tools::env::AppendFile>>>>,
+    needs_reconcile: Arc<std::sync::atomic::AtomicBool>,
+    /// Set when a failed append cannot be proven/truncated safely.
+    uncertain: Arc<AtomicBool>,
+}
+
+impl Clone for JsonlSessionStorage {
+    fn clone(&self) -> Self {
+        Self {
+            fs: self.fs.clone(),
+            metadata: self.metadata.clone(),
+            state: self.state.clone(),
+            clock: self.clock.clone(),
+            ids: self.ids.clone(),
+            tail: self.tail.clone(),
+            append: self.append.clone(),
+            needs_reconcile: self.needs_reconcile.clone(),
+            uncertain: self.uncertain.clone(),
+        }
+    }
 }
 
 impl JsonlSessionStorage {
+    /// Detached owner: cancellation of a caller cannot skip append + reducer commit.
+    async fn run_owned<T, F, Fut>(&self, op: F) -> SessionResult<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(JsonlSessionStorage) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = SessionResult<T>> + Send + 'static,
+    {
+        let reservation = self.tail.clone().lock_owned().await;
+        let worker = self.clone();
+        tokio::spawn(async move {
+            let _reservation = reservation;
+            if worker.uncertain.load(Ordering::Acquire) {
+                return Err(SessionError::storage(format!(
+                    "Session {} has an unsettled append; reopen it before writing",
+                    worker.metadata.path
+                )));
+            }
+            if let Err(error) = worker.reconcile_if_needed().await {
+                return Err(error);
+            }
+            op(worker).await
+        })
+        .await
+        .map_err(|e| SessionError::storage(format!("JSONL mutation task failed: {e}")))?
+    }
+
     /// Build a storage over an already-initialized file (header written).
     /// Mirrors TS `new JsonlSessionStorage(fs, metadata)`.
     pub fn new(
@@ -107,12 +153,13 @@ impl JsonlSessionStorage {
         Self {
             fs,
             metadata,
-            state: tokio::sync::Mutex::new(SessionState::new()),
+            state: Arc::new(tokio::sync::Mutex::new(SessionState::new())),
             clock,
             ids,
-            tail: Mutex::new(()),
-            append: Mutex::new(None),
-            uncertain: AtomicBool::new(false),
+            tail: Arc::new(Mutex::new(())),
+            append: Arc::new(Mutex::new(None)),
+            needs_reconcile: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            uncertain: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -170,21 +217,35 @@ impl JsonlSessionStorage {
         // be republished without the dropped duplicates (see after the loop).
         let mut kept_lines: Vec<&str> = Vec::new();
         let mut dropped_duplicates = false;
+        let mut seen_lines: HashMap<u64, &str> = HashMap::new();
         for (idx, line) in physical_lines.iter().enumerate().skip(1) {
             let line_no = (idx + 1) as u32;
             match parse_mutation(line) {
                 Ok(mutation) => {
                     let mut state = storage.state.lock().await;
-                    // Self-heal a duplicated/late append. Two writers on one
-                    // JSONL (e.g. a session resumed while still open in another
-                    // process) diverge their `sequence` counters, so a mutation
-                    // lands with an already-consumed seq. Its content is a
-                    // duplicate of what already applied, so drop it rather than
-                    // refuse the whole session.
+                    // A stale sequence is safe to drop only when the raw
+                    // mutation is exactly identical to the one already applied.
+                    // A different mutation with the same sequence is corruption;
+                    // reject it before any repair or source rewrite.
                     if mutation.seq() <= state.sequence() {
-                        dropped_duplicates = true;
+                        // A duplicate is safe to ignore only when the complete
+                        // mutation is byte/shape-equivalent to the one already
+                        // reduced.  Same-seq divergent data is corruption: do
+                        // not silently delete it or rewrite the source file.
+                        let exact_duplicate = seen_lines
+                            .get(&mutation.seq())
+                            .and_then(|previous| parse_mutation(previous).ok())
+                            .as_ref()
+                            == Some(&mutation);
+                        if exact_duplicate {
+                            dropped_duplicates = true;
+                            drop(state);
+                            continue;
+                        }
+                        let detail =
+                            format!("conflicting mutations share sequence {}", mutation.seq());
                         drop(state);
-                        continue;
+                        return Err(invalid_file(path, line_no, &detail));
                     }
                     // A divergent writer's counter can leave a forward gap (its
                     // seqs were consumed elsewhere). Accept the gap by moving
@@ -193,6 +254,7 @@ impl JsonlSessionStorage {
                     if mutation.seq() > state.next_sequence() {
                         state.resync_sequence(mutation.seq() - 1);
                     }
+                    let original_seq = mutation.seq();
                     let mutation = chain_onto_lane_leaf(mutation, &state);
                     if let Err(e) = state.apply_mutation(mutation) {
                         if e.code == SessionErrorCode::InvalidEntry {
@@ -202,6 +264,7 @@ impl JsonlSessionStorage {
                         drop(state);
                         return Err(e);
                     }
+                    seen_lines.insert(original_seq, *line);
                     kept_lines.push(*line);
                 }
                 Err(err) => {
@@ -326,7 +389,7 @@ impl JsonlSessionStorage {
 
     /// Wait for all in-flight appends to settle. Mirrors TS `drain`.
     pub async fn drain(&self) {
-        let _g = self.tail.lock().await;
+        let _reservation = self.tail.lock().await;
     }
 
     /// The rich JSONL metadata (the trait exposes only the base subset).
@@ -334,29 +397,33 @@ impl JsonlSessionStorage {
         self.metadata.clone()
     }
 
-    /// Enqueue a mutating operation onto the tail chain. Mirrors TS `enqueue`.
-    #[allow(dead_code)]
-    async fn enqueue<T>(
-        &self,
-        op: impl std::future::Future<Output = SessionResult<T>>,
-    ) -> SessionResult<T> {
-        let _g = self.tail.lock().await;
-        op.await
-    }
-
-    /// Append a mutation line to the file (no in-memory apply). Mirrors TS
-    /// `appendMutation`.
-    ///
-    /// A reported failure can leave part of the line on disk, so the tail is cut
-    /// back before the caller may retry. See [`Self::settle_failed_append`].
-    async fn append_mutation_line(&self, mutation: &SessionMutation) -> SessionResult<()> {
-        if self.uncertain.load(Ordering::SeqCst) {
+    async fn reconcile_if_needed(&self) -> SessionResult<()> {
+        if self.uncertain.load(Ordering::Acquire) {
             return Err(SessionError::storage(format!(
                 "Session {} has an unsettled append; reopen it before writing",
                 self.metadata.path
             )));
         }
-        let line = encode_mutation(mutation);
+        if !self.needs_reconcile.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let recovered = Self::load(
+            self.fs.clone(),
+            &self.metadata.path,
+            self.clock.clone(),
+            self.ids.clone(),
+        )
+        .await?;
+        let recovered_state = recovered.state.lock().await.clone();
+        *self.state.lock().await = recovered_state;
+        self.needs_reconcile.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    async fn append_encoded_bytes(&self, lines: Vec<u8>) -> SessionResult<()> {
+        if lines.is_empty() {
+            return Ok(());
+        }
         let mut append = self.append.lock().await;
         if append.is_none() {
             *append = file_result(
@@ -364,78 +431,233 @@ impl JsonlSessionStorage {
                 &format!("Failed to open session {}", self.metadata.path),
             )?;
         }
-        if let Some(writer) = append.as_mut() {
-            // The tail lock still orders every append, and the writer flushes
-            // before acknowledgement. A failed handle is discarded for retry.
-            let result = writer.append(line.as_bytes()).await;
-            if let Err(error) = result {
+        let result = if let Some(writer) = append.as_mut() {
+            let result = writer.append(&lines).await;
+            if result.is_err() {
                 *append = None;
-                drop(append);
-                return self.settle_failed_append(&line, error).await;
             }
-            return Ok(());
+            result
+        } else {
+            self.fs
+                .append_file(&self.metadata.path, FileContent::Bytes(lines.clone()), None)
+                .await
+        };
+        if let Err(error) = result {
+            // The reducer has not seen this batch. Remove the whole batch,
+            // including any complete lines before a torn final line.
+            drop(append);
+            if self.cut_back_failed_append(&lines).await.is_err() {
+                self.uncertain.store(true, Ordering::SeqCst);
+                self.needs_reconcile.store(true, Ordering::Release);
+            }
+            return file_result(
+                Err(error),
+                &format!("Failed to append session {}", self.metadata.path),
+            );
         }
-        drop(append);
-        match self
+        Ok(())
+    }
+
+    /// Cut the failed batch back only when its bytes are provably the file tail.
+    async fn cut_back_failed_append(&self, batch: &[u8]) -> Result<(), ()> {
+        let bytes = self
             .fs
-            .append_file(&self.metadata.path, FileContent::Text(line.clone()), None)
+            .read_binary_file(&self.metadata.path, None)
             .await
-        {
-            Ok(()) => Ok(()),
-            Err(error) => self.settle_failed_append(&line, error).await,
-        }
-    }
-
-    /// Report a failed append, first making the file safe for the next one.
-    ///
-    /// The append did not commit, so its state is not applied and the caller
-    /// may retry with the same sequence number. The bytes it left behind must
-    /// not be built on, so the tail is cut back to where `line` began. If the
-    /// tail cannot be proven to be this line's own bytes, or the cut fails, the
-    /// session becomes uncertain and refuses writes until it is reopened, which
-    /// repairs the tail through [`Self::load`].
-    async fn settle_failed_append(&self, line: &str, error: FileError) -> SessionResult<()> {
-        let failure = file_result::<()>(
-            Err(error),
-            &format!("Failed to append session {}", self.metadata.path),
-        );
-        if self.cut_back_failed_append(line).await.is_err() {
-            self.uncertain.store(true, Ordering::SeqCst);
-        }
-        failure
-    }
-
-    /// Truncate the file to where the failed `line` began. Fails when the
-    /// trailing bytes cannot be proven to be this line's own.
-    async fn cut_back_failed_append(&self, line: &str) -> Result<(), ()> {
-        let path = &self.metadata.path;
-        let bytes = self.fs.read_binary_file(path, None).await.map_err(|_| ())?;
-        let start = failed_append_start(&bytes, line.as_bytes()).ok_or(())?;
+            .map_err(|_| ())?;
+        let start = failed_append_start(&bytes, batch).ok_or(())?;
         if start == bytes.len() {
             return Ok(());
         }
         self.fs
-            .truncate_file(path, start as u64, None)
+            .truncate_file(&self.metadata.path, start as u64, None)
             .await
             .map_err(|_| ())
     }
+
+    /// Append a frame-only batch without cloning the complete session state.
+    /// Frame records do not change lanes or open-operation state, so their
+    /// sequence and id validation can use a small local batch index.
+    async fn append_frame_record_batch(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        let state = self.state.lock().await;
+        let mut next_seq = state.next_sequence();
+        let mut ids = HashSet::with_capacity(records.len());
+        let mut mutations = Vec::with_capacity(records.len());
+        let mut encoded_lines = Vec::with_capacity(records.len() * 256);
+
+        for record in records {
+            let lane = record.lane().to_string();
+            state.require_lane(&lane)?;
+            if !ids.insert(record.id().to_string()) {
+                return Err(SessionError::storage(format!(
+                    "Record id already used in batch: {}",
+                    record.id()
+                )));
+            }
+            state.validate_unused_id(record.id())?;
+            let timestamp = self.clock.now_ms();
+            let stamped = stamp_record(record, next_seq, lane, timestamp);
+            next_seq += 1;
+            let mutation = SessionMutation::Record { record: stamped };
+            mutations.push(mutation);
+        }
+        drop(state);
+
+        for mutation in &mutations {
+            encode_mutation_into(mutation, &mut encoded_lines);
+        }
+        self.append_encoded_bytes(encoded_lines).await?;
+        let mut state = self.state.lock().await;
+        let mut stamped_records = Vec::with_capacity(mutations.len());
+        for mutation in mutations {
+            match state.apply_mutation(mutation)? {
+                ApplyOutcome::Record(stamped) => stamped_records.push(stamped),
+                _ => {
+                    return Err(SessionError::storage(
+                        "append_frame_record_batch did not persist a record",
+                    ));
+                }
+            }
+        }
+        Ok(stamped_records)
+    }
+
+    /// Append one non-frame record without cloning the complete session state.
+    ///
+    /// Record validation is completed while the session tail is held. The
+    /// state is only advanced after the durable append succeeds, so a failed
+    /// write leaves the in-memory state unchanged while avoiding the O(history)
+    /// candidate-state clone on the normal single-record path.
+    async fn append_single_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+        let lane = record.lane().to_string();
+        let state = self.state.lock().await;
+        state.require_lane(&lane)?;
+        state.validate_unused_id(record.id())?;
+        if matches!(record, LaneRecord::OperationStarted(_)) {
+            if let Some(current) = state.find_open_operations(&lane, Some(1))?.first() {
+                return Err(SessionError::storage(format!(
+                    "Lane {} already has an open operation {}",
+                    lane, current.base.id
+                )));
+            }
+        }
+        let seq = state.next_sequence();
+        let timestamp = self.clock.now_ms();
+        let stamped = stamp_record(record, seq, lane, timestamp);
+        let mutation = SessionMutation::Record { record: stamped };
+        let mut encoded = Vec::with_capacity(256);
+        encode_mutation_into(&mutation, &mut encoded);
+        drop(state);
+
+        self.append_encoded_bytes(encoded).await?;
+        let mut state = self.state.lock().await;
+        match state.apply_mutation(mutation)? {
+            ApplyOutcome::Record(stamped) => Ok(stamped),
+            _ => Err(SessionError::storage("append_record did not persist")),
+        }
+    }
+
+    /// Append a batch of lane records atomically from the reducer's point of
+    /// view. The candidate state is advanced before the file write, but the
+    /// live state is replaced only after the whole encoded batch is visible.
+    async fn append_record_batch_owned(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        if records
+            .iter()
+            .all(|record| matches!(record, LaneRecord::AssistantFrame(_)))
+        {
+            return self.append_frame_record_batch(records).await;
+        }
+        if records.len() == 1 {
+            return Ok(vec![
+                self.append_single_record(records.into_iter().next().expect("non-empty records"))
+                    .await?,
+            ]);
+        }
+        let state = self.state.lock().await;
+        let mut candidate = state.clone();
+        let mut encoded_lines = Vec::with_capacity(records.len() * 256);
+        let mut stamped_records = Vec::with_capacity(records.len());
+
+        for record in records {
+            let lane = record.lane().to_string();
+            candidate.require_lane(&lane)?;
+            candidate.validate_unused_id(record.id())?;
+            if matches!(record, LaneRecord::OperationStarted(_)) {
+                if let Some(current) = candidate.find_open_operations(&lane, Some(1))?.first() {
+                    return Err(SessionError::storage(format!(
+                        "Lane {} already has an open operation {}",
+                        lane, current.base.id
+                    )));
+                }
+            }
+            let seq = candidate.next_sequence();
+            let timestamp = self.clock.now_ms();
+            let stamped = stamp_record(record, seq, lane, timestamp);
+            let mutation = SessionMutation::Record { record: stamped };
+            encode_mutation_into(&mutation, &mut encoded_lines);
+            match candidate.apply_mutation(mutation)? {
+                ApplyOutcome::Record(stamped) => stamped_records.push(stamped),
+                _ => {
+                    return Err(SessionError::storage(
+                        "append_record_batch did not persist a record",
+                    ));
+                }
+            }
+        }
+        drop(state);
+
+        self.append_encoded_bytes(encoded_lines).await?;
+        let mut state = self.state.lock().await;
+        *state = candidate;
+        Ok(stamped_records)
+    }
+
+    /// Append one mutation line to the file (no in-memory apply).
+    async fn append_mutation_line(&self, mutation: &SessionMutation) -> SessionResult<()> {
+        let mut encoded = Vec::with_capacity(256);
+        encode_mutation_into(mutation, &mut encoded);
+        self.append_encoded_bytes(encoded).await
+    }
 }
 
-/// Where a failed append of `line` began in `bytes`, or `None` when the bytes
-/// after the last newline cannot be proven to be a fragment of `line`.
-///
-/// Every acknowledged line ends in a newline, so the bytes after the last one
-/// are never acknowledged content. A complete copy of `line` at the end is also
-/// this append's own, because its state was never applied.
-fn failed_append_start(bytes: &[u8], line: &[u8]) -> Option<usize> {
-    if bytes.ends_with(line) {
-        return Some(bytes.len() - line.len());
+/// Return the start of a failed batch only when its complete or partial bytes
+/// are an exact suffix beginning at a physical line boundary.
+fn failed_append_start(bytes: &[u8], batch: &[u8]) -> Option<usize> {
+    if bytes.ends_with(batch) {
+        return Some(bytes.len() - batch.len());
     }
-    let start = bytes
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    line.starts_with(&bytes[start..]).then_some(start)
+
+    // Search the longest matching suffix first. A failed multi-line write may
+    // have committed one or more complete lines before tearing the next line;
+    // choosing the shortest suffix would leave those committed-but-unreduced
+    // lines in the journal.
+    let window_start = bytes.len().saturating_sub(batch.len());
+    let mut boundaries = vec![0];
+    boundaries.extend(
+        bytes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, b)| (*b == b'\n').then_some(i + 1)),
+    );
+    boundaries
+        .into_iter()
+        .filter(|&start| start >= window_start && start < bytes.len())
+        .filter(|&start| batch.starts_with(&bytes[start..]))
+        .min()
+        .or_else(|| {
+            // No bytes from this batch are present. A complete prior line is
+            // the only safe proof that there is no foreign unterminated tail.
+            (bytes.is_empty() || bytes.last() == Some(&b'\n')).then_some(bytes.len())
+        })
 }
 
 /// Normalize an entry's parent onto the lane's current leaf before applying.
@@ -488,96 +710,55 @@ impl SessionStorage for JsonlSessionStorage {
 
     async fn create_lane(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
         let lane = lane.to_string();
-        let at = at.map(|s| s.to_string());
-        let _g = self.tail.lock().await;
-        let state = self.state.lock().await;
-        state.validate_new_lane(&lane)?;
-        state.validate_target(at.as_deref())?;
-        let seq = state.next_sequence();
-        let mutation = SessionMutation::Lane {
-            seq,
-            lane: lane.clone(),
-            leaf_id: at,
-        };
-        drop(state);
-        self.append_mutation_line(&mutation).await?;
-        let mut state = self.state.lock().await;
-        state.apply_mutation(mutation)?;
-        Ok(())
+        let at = at.map(str::to_string);
+        self.run_owned(move |s| async move { s.create_lane_owned(&lane, at.as_deref()).await })
+            .await
     }
-
     async fn move_lane(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
         let lane = lane.to_string();
-        let to = to.map(|s| s.to_string());
-        let _g = self.tail.lock().await;
-        let state = self.state.lock().await;
-        state.require_lane(&lane)?;
-        state.validate_target(to.as_deref())?;
-        let seq = state.next_sequence();
-        let mutation = SessionMutation::Lane {
-            seq,
-            lane,
-            leaf_id: to,
-        };
-        drop(state);
-        self.append_mutation_line(&mutation).await?;
-        let mut state = self.state.lock().await;
-        state.apply_mutation(mutation)?;
-        Ok(())
+        let to = to.map(str::to_string);
+        self.run_owned(move |s| async move { s.move_lane_owned(&lane, to.as_deref()).await })
+            .await
     }
-
     async fn append_entry(&self, entry: ProvisionedEntry, lane: &str) -> SessionResult<Entry> {
-        let _g = self.tail.lock().await;
-        let state = self.state.lock().await;
-        let parent_id = state.require_lane(lane)?;
-        state.validate_unused_id(&entry.id)?;
-        let seq = state.next_sequence();
-        let timestamp = self.clock.now_ms();
-        let full = provisioned_into_entry(entry, seq, parent_id, timestamp);
-        let mutation = SessionMutation::Entry {
-            seq,
-            timestamp,
-            lane: Some(lane.to_string()),
-            entry: full,
-        };
-        drop(state);
-        self.append_mutation_line(&mutation).await?;
-        let mut state = self.state.lock().await;
-        match state.apply_mutation(mutation)? {
-            ApplyOutcome::Entry(stamped) => Ok(stamped),
-            _ => Err(SessionError::storage("append_entry did not persist")),
-        }
+        let lane = lane.to_string();
+        self.run_owned(move |s| async move { s.append_entry_owned(entry, &lane).await })
+            .await
     }
-
+    async fn append_record_and_entry(
+        &self,
+        record: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<(LaneRecord, Entry)> {
+        let lane = lane.to_string();
+        self.run_owned(move |s| async move {
+            s.append_record_and_entry_owned(record, entry, &lane).await
+        })
+        .await
+    }
+    async fn append_record_entry_and_record(
+        &self,
+        before: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+        after: LaneRecord,
+    ) -> SessionResult<(LaneRecord, Entry, LaneRecord)> {
+        let lane = lane.to_string();
+        self.run_owned(move |s| async move {
+            s.append_record_entry_and_record_owned(before, entry, &lane, after)
+                .await
+        })
+        .await
+    }
     async fn append_record(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
-        let lane = record.lane().to_string();
-        let is_operation_started = matches!(record, LaneRecord::OperationStarted(_));
-        let _g = self.tail.lock().await;
-        let state = self.state.lock().await;
-        state.require_lane(&lane)?;
-        state.validate_unused_id(record.id())?;
-        if is_operation_started {
-            let open = state.find_open_operations(&lane, Some(1))?;
-            if let Some(current) = open.first() {
-                return Err(SessionError::storage(format!(
-                    "Lane {} already has an open operation {}",
-                    lane, current.base.id
-                )));
-            }
-        }
-        let seq = state.next_sequence();
-        let timestamp = self.clock.now_ms();
-        let stamped = stamp_record(record, seq, lane.clone(), timestamp);
-        let mutation = SessionMutation::Record { record: stamped };
-        drop(state);
-        self.append_mutation_line(&mutation).await?;
-        let mut state = self.state.lock().await;
-        match state.apply_mutation(mutation)? {
-            ApplyOutcome::Record(stamped) => Ok(stamped),
-            _ => Err(SessionError::storage("append_record did not persist")),
-        }
+        self.run_owned(move |s| async move { s.append_record_owned(record).await })
+            .await
     }
-
+    async fn append_records(&self, records: Vec<LaneRecord>) -> SessionResult<Vec<LaneRecord>> {
+        self.run_owned(move |s| async move { s.append_records_owned(records).await })
+            .await
+    }
     async fn get_entry(&self, id: &str) -> SessionResult<Option<Entry>> {
         let state = self.state.lock().await;
         Ok(state.get_entry(id).cloned())
@@ -596,6 +777,15 @@ impl SessionStorage for JsonlSessionStorage {
     ) -> SessionResult<Vec<Entry>> {
         let state = self.state.lock().await;
         state.find_entries_on_branch(query, bounds, start)
+    }
+
+    async fn context_on_branch(
+        &self,
+        bounds: &BranchBounds,
+        start: &str,
+    ) -> SessionResult<crate::session::context::SessionContext> {
+        let state = self.state.lock().await;
+        state.context_on_branch(bounds, start)
     }
 
     async fn find_records(&self, query: &RecordQuery) -> SessionResult<Vec<LaneRecord>> {
@@ -623,7 +813,250 @@ impl SessionStorage for JsonlSessionStorage {
     }
 
     async fn set_name(&self, name: Option<&str>) -> SessionResult<()> {
-        let _g = self.tail.lock().await;
+        let name = name.map(str::to_string);
+        self.run_owned(move |s| async move { s.set_name_owned(name.as_deref()).await })
+            .await
+    }
+    async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
+        let state = self.state.lock().await;
+        Ok(state.get_label(id).map(|s| s.to_string()))
+    }
+
+    async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
+        let id = id.to_string();
+        let label = label.map(str::to_string);
+        self.run_owned(move |s| async move { s.set_label_owned(&id, label.as_deref()).await })
+            .await
+    }
+
+    async fn get_stats(&self) -> SessionResult<SessionStats> {
+        let state = self.state.lock().await;
+        Ok(state.get_stats().clone())
+    }
+}
+
+impl JsonlSessionStorage {
+    async fn create_lane_owned(&self, lane: &str, at: Option<&str>) -> SessionResult<()> {
+        let lane = lane.to_string();
+        let at = at.map(|s| s.to_string());
+        let state = self.state.lock().await;
+        state.validate_new_lane(&lane)?;
+        state.validate_target(at.as_deref())?;
+        let seq = state.next_sequence();
+        let mutation = SessionMutation::Lane {
+            seq,
+            lane: lane.clone(),
+            leaf_id: at,
+        };
+        drop(state);
+        self.append_mutation_line(&mutation).await?;
+        let mut state = self.state.lock().await;
+        state.apply_mutation(mutation)?;
+        Ok(())
+    }
+
+    async fn move_lane_owned(&self, lane: &str, to: Option<&str>) -> SessionResult<()> {
+        let lane = lane.to_string();
+        let to = to.map(|s| s.to_string());
+        let state = self.state.lock().await;
+        state.require_lane(&lane)?;
+        state.validate_target(to.as_deref())?;
+        let seq = state.next_sequence();
+        let mutation = SessionMutation::Lane {
+            seq,
+            lane,
+            leaf_id: to,
+        };
+        drop(state);
+        self.append_mutation_line(&mutation).await?;
+        let mut state = self.state.lock().await;
+        state.apply_mutation(mutation)?;
+        Ok(())
+    }
+
+    async fn append_entry_owned(
+        &self,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<Entry> {
+        let state = self.state.lock().await;
+        let parent_id = state.require_lane(lane)?;
+        state.validate_unused_id(&entry.id)?;
+        let seq = state.next_sequence();
+        let timestamp = self.clock.now_ms();
+        let full = provisioned_into_entry(entry, seq, parent_id, timestamp);
+        let mutation = SessionMutation::Entry {
+            seq,
+            timestamp,
+            lane: Some(lane.to_string()),
+            entry: full,
+        };
+        drop(state);
+        self.append_mutation_line(&mutation).await?;
+        let mut state = self.state.lock().await;
+        match state.apply_mutation(mutation)? {
+            ApplyOutcome::Entry(stamped) => Ok(stamped),
+            _ => Err(SessionError::storage("append_entry did not persist")),
+        }
+    }
+
+    async fn append_record_and_entry_owned(
+        &self,
+        record: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+    ) -> SessionResult<(LaneRecord, Entry)> {
+        let state = self.state.lock().await;
+        let record_lane = record.lane().to_string();
+        state.require_lane(&record_lane)?;
+        state.validate_unused_id(record.id())?;
+        if matches!(record, LaneRecord::OperationStarted(_)) {
+            if let Some(current) = state.find_open_operations(&record_lane, Some(1))?.first() {
+                return Err(SessionError::storage(format!(
+                    "Lane {} already has an open operation {}",
+                    record_lane, current.base.id
+                )));
+            }
+        }
+        let parent_id = state.require_lane(lane)?;
+        state.validate_unused_id(&entry.id)?;
+        if entry.id == record.id() {
+            return Err(SessionError::already_exists(format!(
+                "Session id already exists: {}",
+                entry.id
+            )));
+        }
+        let record_seq = state.next_sequence();
+        let stamped_record = stamp_record(record, record_seq, record_lane, self.clock.now_ms());
+        let record_mutation = SessionMutation::Record {
+            record: stamped_record,
+        };
+        let entry_timestamp = self.clock.now_ms();
+        let entry_mutation = SessionMutation::Entry {
+            seq: record_seq + 1,
+            timestamp: entry_timestamp,
+            lane: Some(lane.to_string()),
+            entry: provisioned_into_entry(entry, record_seq + 1, parent_id, entry_timestamp),
+        };
+        let mut encoded = Vec::with_capacity(512);
+        encode_mutation_into(&record_mutation, &mut encoded);
+        encode_mutation_into(&entry_mutation, &mut encoded);
+        drop(state);
+        self.append_encoded_bytes(encoded).await?;
+        let mut state = self.state.lock().await;
+        let committed_record = match state.apply_mutation(record_mutation)? {
+            ApplyOutcome::Record(stamped) => stamped,
+            _ => return Err(SessionError::storage("append_record did not persist")),
+        };
+        let committed_entry = match state.apply_mutation(entry_mutation)? {
+            ApplyOutcome::Entry(stamped) => stamped,
+            _ => return Err(SessionError::storage("append_entry did not persist")),
+        };
+        Ok((committed_record, committed_entry))
+    }
+
+    async fn append_record_entry_and_record_owned(
+        &self,
+        before: LaneRecord,
+        entry: ProvisionedEntry,
+        lane: &str,
+        after: LaneRecord,
+    ) -> SessionResult<(LaneRecord, Entry, LaneRecord)> {
+        let state = self.state.lock().await;
+        let before_lane = before.lane().to_string();
+        let after_lane = after.lane().to_string();
+        state.require_lane(&before_lane)?;
+        state.require_lane(lane)?;
+        state.require_lane(&after_lane)?;
+        state.validate_unused_id(before.id())?;
+        state.validate_unused_id(&entry.id)?;
+        state.validate_unused_id(after.id())?;
+        if before.id() == entry.id || before.id() == after.id() || entry.id == after.id() {
+            return Err(SessionError::already_exists(
+                "Session mutation ids must be distinct",
+            ));
+        }
+        // Check only the touched lanes through borrowed state predicates. This
+        // avoids cloning operation payloads for common non-start triples while
+        // still modeling the before record before validating an after-start.
+        let before_starts = matches!(before, LaneRecord::OperationStarted(_));
+        if before_starts && state.has_open_operation_except(&before_lane, None) {
+            return Err(SessionError::storage(format!(
+                "Lane {} already has an open operation",
+                before_lane
+            )));
+        }
+        if matches!(after, LaneRecord::OperationStarted(_)) {
+            let before_frees_matching = match &before {
+                LaneRecord::OperationFinished(finished) if before_lane == after_lane => {
+                    Some(finished.run_id.as_str())
+                }
+                _ => None,
+            };
+            let effective_open = if before_starts && before_lane == after_lane {
+                true
+            } else {
+                state.has_open_operation_except(&after_lane, before_frees_matching)
+            };
+            if effective_open {
+                return Err(SessionError::storage(format!(
+                    "Lane {} already has an open operation",
+                    after_lane
+                )));
+            }
+        }
+        let parent_id = state.require_lane(lane)?;
+        let first_seq = state.next_sequence();
+        let before_mutation = SessionMutation::Record {
+            record: stamp_record(before, first_seq, before_lane, self.clock.now_ms()),
+        };
+        let entry_timestamp = self.clock.now_ms();
+        let entry_mutation = SessionMutation::Entry {
+            seq: first_seq + 1,
+            timestamp: entry_timestamp,
+            lane: Some(lane.to_string()),
+            entry: provisioned_into_entry(entry, first_seq + 1, parent_id, entry_timestamp),
+        };
+        let after_mutation = SessionMutation::Record {
+            record: stamp_record(after, first_seq + 2, after_lane, self.clock.now_ms()),
+        };
+        let mut encoded = Vec::with_capacity(768);
+        encode_mutation_into(&before_mutation, &mut encoded);
+        encode_mutation_into(&entry_mutation, &mut encoded);
+        encode_mutation_into(&after_mutation, &mut encoded);
+        drop(state);
+
+        self.append_encoded_bytes(encoded).await?;
+        let mut state = self.state.lock().await;
+        let committed_before = match state.apply_mutation(before_mutation)? {
+            ApplyOutcome::Record(stamped) => stamped,
+            _ => return Err(SessionError::storage("before record did not persist")),
+        };
+        let committed_entry = match state.apply_mutation(entry_mutation)? {
+            ApplyOutcome::Entry(stamped) => stamped,
+            _ => return Err(SessionError::storage("entry did not persist")),
+        };
+        let committed_after = match state.apply_mutation(after_mutation)? {
+            ApplyOutcome::Record(stamped) => stamped,
+            _ => return Err(SessionError::storage("after record did not persist")),
+        };
+        Ok((committed_before, committed_entry, committed_after))
+    }
+
+    async fn append_record_owned(&self, record: LaneRecord) -> SessionResult<LaneRecord> {
+        self.append_record_batch_owned(vec![record])
+            .await?
+            .pop()
+            .ok_or_else(|| SessionError::storage("append_record returned no record"))
+    }
+
+    async fn append_records_owned(
+        &self,
+        records: Vec<LaneRecord>,
+    ) -> SessionResult<Vec<LaneRecord>> {
+        self.append_record_batch_owned(records).await
+    }
+    async fn set_name_owned(&self, name: Option<&str>) -> SessionResult<()> {
         let state = self.state.lock().await;
         let seq = state.next_sequence();
         let mutation = SessionMutation::FactName {
@@ -636,14 +1069,10 @@ impl SessionStorage for JsonlSessionStorage {
         state.apply_mutation(mutation)?;
         Ok(())
     }
+}
 
-    async fn get_label(&self, id: &str) -> SessionResult<Option<String>> {
-        let state = self.state.lock().await;
-        Ok(state.get_label(id).map(|s| s.to_string()))
-    }
-
-    async fn set_label(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
-        let _g = self.tail.lock().await;
+impl JsonlSessionStorage {
+    async fn set_label_owned(&self, id: &str, label: Option<&str>) -> SessionResult<()> {
         let state = self.state.lock().await;
         state.validate_target(Some(id))?;
         let seq = state.next_sequence();
@@ -658,11 +1087,6 @@ impl SessionStorage for JsonlSessionStorage {
         state.apply_mutation(mutation)?;
         Ok(())
     }
-
-    async fn get_stats(&self) -> SessionResult<SessionStats> {
-        let state = self.state.lock().await;
-        Ok(state.get_stats().clone())
-    }
 }
 
 /// Whether a raw JSONL line is an append of transient assistant-frame progress.
@@ -676,26 +1100,6 @@ fn is_assistant_frame_append(line: &str) -> bool {
     value.get("kind").and_then(serde_json::Value::as_str) == Some("record")
         && value.get("type").and_then(serde_json::Value::as_str) == Some("assistant_frame")
         && value.get("op").and_then(serde_json::Value::as_str) == Some("append")
-}
-
-// The `enqueue` closure approach above fights the borrow checker (closures
-// can't capture `&self` across an await of a method on `self`). The trait impl
-// therefore inlines the stamp→persist→apply sequence directly per method,
-// holding the `tail` lock across the whole op (the same serialization the TS
-// `tail` Promise chain provides). `enqueue` + `self_append_and_apply` are kept
-// only as documentation of the intent and are unused.
-#[allow(dead_code)]
-async fn self_append_and_apply(
-    _storage: &JsonlSessionStorage,
-    _m: &SessionMutation,
-) -> SessionResult<()> {
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn self_fs_placeholder() -> Arc<dyn FileSystem> {
-    // unreachable placeholder for the never-called enqueue path.
-    unreachable!("enqueue path is not used; trait impls inline the op")
 }
 
 /// Build a complete sibling temporary file, then atomically rename it over the
@@ -745,8 +1149,57 @@ mod tests {
     use super::*;
     use crate::session::memory::{CounterIdGenerator, FakeClock};
     use crate::session::types::{
-        OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind, RecordBase,
+        EntryOrder, OperationIntent, OperationStartedRecord, ProvisionedEntry, ProvisionedKind,
+        RecordBase,
     };
+
+    #[tokio::test]
+    async fn context_projection_matches_jsonl_branch_query() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            "/context.jsonl",
+            header(),
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        for (id, text) in [("e1", "old"), ("e2", "visible"), ("e3", "latest")] {
+            storage
+                .append_entry(
+                    ProvisionedEntry {
+                        id: id.into(),
+                        kind: ProvisionedKind::Message {
+                            message: rpi_ai::UserMessage::new(text, 0).into(),
+                            terminate: None,
+                        },
+                    },
+                    "main",
+                )
+                .await
+                .unwrap();
+        }
+        let bounds = BranchBounds {
+            stop_at_type: Some("message".into()),
+            ..Default::default()
+        };
+        let actual = storage.context_on_branch(&bounds, "e3").await.unwrap();
+        let path = storage
+            .find_entries_on_branch(
+                &EntryQuery {
+                    order: Some(EntryOrder::OldestFirst),
+                    ..Default::default()
+                },
+                &bounds,
+                "e3",
+            )
+            .await
+            .unwrap();
+        let expected = crate::session::context::build_session_context(&path, &Default::default());
+        assert_eq!(actual.messages, expected.messages);
+    }
 
     #[tokio::test]
     async fn append_returns_the_owned_payload_but_keeps_storage_defensive() {
@@ -841,6 +1294,48 @@ mod tests {
             };
             assert_eq!(frame.frame, Some(serde_json::Value::String(expected)));
         }
+    }
+
+    #[tokio::test]
+    async fn append_records_batches_frame_records_with_contiguous_sequences() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let storage = JsonlSessionStorage::create(
+            fs,
+            "/batch.jsonl",
+            header(),
+            Arc::new(FakeClock::new()),
+            Arc::new(CounterIdGenerator::new()),
+        )
+        .await
+        .unwrap();
+        let frame = |id: &str| {
+            LaneRecord::AssistantFrame(crate::session::types::AssistantFrameRecord {
+                base: RecordBase {
+                    id: id.into(),
+                    seq: 0,
+                    lane: "main".into(),
+                    timestamp: 0,
+                },
+                run_id: "run".into(),
+                stream_index: 0,
+                op: crate::session::types::AssistantFrameOp::Append,
+                frame: Some(serde_json::json!({"id": id})),
+            })
+        };
+        let returned = storage
+            .append_records(vec![frame("frame-1"), frame("frame-2")])
+            .await
+            .unwrap();
+        assert_eq!(
+            returned.iter().map(LaneRecord::seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        let stored = storage.find_records(&RecordQuery::default()).await.unwrap();
+        assert_eq!(stored.len(), 2);
+        let mut ids = stored.iter().map(|record| record.id()).collect::<Vec<_>>();
+        ids.sort_unstable();
+        assert_eq!(ids, ["frame-1", "frame-2"]);
     }
 
     fn user_msg(text: &str) -> rpi_agent::message::AgentMessage {
@@ -1529,5 +2024,175 @@ mod tests {
         });
         let err = storage.append_record(second).await.unwrap_err();
         assert!(err.to_string().contains("already has an open operation"));
+    }
+
+    struct ReviewWriteThenPause {
+        fs: Arc<dyn FileSystem>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        pause_once: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl rpi_tools::env::AppendFile for ReviewWriteThenPause {
+        async fn append(&mut self, bytes: &[u8]) -> Result<(), rpi_tools::FileError> {
+            self.fs
+                .append_file("/review.jsonl", FileContent::Bytes(bytes.to_vec()), None)
+                .await?;
+            if self.pause_once {
+                self.pause_once = false;
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    fn review_entry(id: &str) -> ProvisionedEntry {
+        ProvisionedEntry {
+            id: id.into(),
+            kind: ProvisionedKind::Message {
+                message: user_msg(id),
+                terminate: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn review_cancelled_append_must_not_erase_the_next_acknowledged_entry() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+        let storage = Arc::new(
+            JsonlSessionStorage::create(
+                fs.clone(),
+                "/review.jsonl",
+                header(),
+                clock.clone(),
+                ids.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *storage.append.lock().await = Some(Box::new(ReviewWriteThenPause {
+            fs: fs.clone(),
+            entered: entered.clone(),
+            release: release.clone(),
+            pause_once: true,
+        }));
+        let task = tokio::spawn({
+            let storage = storage.clone();
+            async move {
+                storage
+                    .append_entry(review_entry("cancelled"), "main")
+                    .await
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), entered.notified())
+            .await
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        let acknowledged = storage
+            .append_entry(review_entry("acknowledged"), "main")
+            .await
+            .unwrap();
+        assert!(storage.get_entry("acknowledged").await.unwrap().is_some());
+        let before = fs.read_text_file("/review.jsonl", None).await.unwrap();
+        let reloaded = JsonlSessionStorage::load(fs.clone(), "/review.jsonl", clock, ids)
+            .await
+            .unwrap();
+        let found = reloaded.get_entry("acknowledged").await.unwrap().is_some();
+        eprintln!("review cancelled-append: acknowledged_seq={}, durable_lines_before_reload={}, acknowledged_survives={}, physical_file_after_reload={}", acknowledged.seq(), before.lines().count(), found, fs.read_text_file("/review.jsonl", None).await.unwrap().lines().count());
+        assert!(
+            found,
+            "a successful append disappeared on reload after an earlier append future was aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_distinct_entries_with_a_sequence_collision_must_not_be_silently_deleted() {
+        let fs: Arc<dyn FileSystem> =
+            Arc::new(rpi_tools::InMemoryExecutionEnv::with_cwd("/".into()));
+        let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+        let first = JsonlSessionStorage::create(
+            fs.clone(),
+            "/review.jsonl",
+            header(),
+            clock.clone(),
+            ids.clone(),
+        )
+        .await
+        .unwrap();
+        let second =
+            JsonlSessionStorage::load(fs.clone(), "/review.jsonl", clock.clone(), ids.clone())
+                .await
+                .unwrap();
+        let a = first
+            .append_entry(review_entry("writer-one"), "main")
+            .await
+            .unwrap();
+        let b = second
+            .append_entry(review_entry("writer-two"), "main")
+            .await
+            .unwrap();
+        let before = fs.read_text_file("/review.jsonl", None).await.unwrap();
+        let error = match JsonlSessionStorage::load(fs.clone(), "/review.jsonl", clock, ids).await {
+            Ok(_) => panic!("divergent same-seq mutation must be rejected"),
+            Err(error) => error,
+        };
+        let after = fs.read_text_file("/review.jsonl", None).await.unwrap();
+        eprintln!(
+            "review divergent-writers: seqs=({}, {}), error={}, source_unchanged={}",
+            a.seq(),
+            b.seq(),
+            error,
+            before == after
+        );
+        assert!(error.to_string().contains("conflicting mutations"));
+        assert_eq!(
+            before, after,
+            "conflict detection must not rewrite the source file"
+        );
+    }
+
+    #[test]
+    fn review_native_cancelled_append_must_keep_later_acknowledged_data() {
+        // Occupy the sole blocking worker to cancel precisely after native I/O
+        // is scheduled. This exercises the real OsAppendFile, not a fake writer.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let directory = tempfile::tempdir().unwrap();
+            let fs: Arc<dyn FileSystem> = Arc::new(rpi_tools::OsExecutionEnv::with_cwd(directory.path().to_path_buf()));
+            let clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+            let ids: Arc<dyn IdGenerator> = Arc::new(CounterIdGenerator::new());
+            let storage = JsonlSessionStorage::create(fs.clone(), "native.jsonl", header(), clock.clone(), ids.clone()).await.unwrap();
+            storage.append_entry(review_entry("native-seed"), "main").await.unwrap();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || { entered_tx.send(()).unwrap(); release_rx.recv().unwrap(); });
+            entered_rx.await.unwrap();
+            let mut interrupted = Box::pin(storage.append_entry(review_entry("native-cancelled"), "main"));
+            assert!(futures::poll!(interrupted.as_mut()).is_pending());
+            drop(interrupted);
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            let acknowledged = storage.append_entry(review_entry("native-acknowledged"), "main").await.unwrap();
+            assert!(storage.get_entry("native-acknowledged").await.unwrap().is_some());
+            let before = fs.read_text_file("native.jsonl", None).await.unwrap();
+            let reloaded = JsonlSessionStorage::load(fs.clone(), "native.jsonl", clock, ids).await.unwrap();
+            let found = reloaded.get_entry("native-acknowledged").await.unwrap().is_some();
+            eprintln!("review native OS cancellation: acknowledged_seq={}, lines_before_reload={}, prior_cancelled_write_visible={}, acknowledged_survives_reload={}, lines_after_reload={}", acknowledged.seq(), before.lines().count(), before.contains("native-cancelled"), found, fs.read_text_file("native.jsonl", None).await.unwrap().lines().count());
+            assert!(found, "the real native append writer persisted the cancelled write but its missing reducer commit caused a later successful entry to be dropped on reload");
+        });
     }
 }

@@ -29,13 +29,9 @@
 | 对外介绍与文章草稿 | [推广素材](promotion/README.md) |
 | CLI `docs` 工具的模型可读输入 | [内置文档源](rpi-tool/README.md) |
 
-## 来源与致谢
+## 来源与许可
 
-rpi 起步于对 Mario Zechner 的 [Pi TypeScript SDK](https://github.com/earendil-works/pi)
-的 Rust 重新实现，并在此基础上发展自己的运行时和原生扩展 ABI。项目来源、版权和
-许可说明见根目录 [README](../README.md#acknowledgements)、[NOTICE](../NOTICE)
-和 [LICENSE](../LICENSE)。Rust 原生实现不意味着未借鉴上游设计，也不意味着可以直接
-加载 Pi 的 TypeScript/npm 扩展。
+项目许可与第三方来源说明见根目录 [NOTICE](../NOTICE) 和 [LICENSE](../LICENSE)。
 
 ## 维护约定
 

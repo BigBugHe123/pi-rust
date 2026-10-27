@@ -11,6 +11,18 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+### Changed
+
+- Raise the minimum supported Rust version to 1.88 and check Linux and Windows.
+- Reduce repeated request preparation, context projection and stream-frame copies.
+
+### Fixed
+
+- Keep JSONL durable appends and reducer commits consistent after cancellation.
+- Reject conflicting JSONL sequence numbers without deleting source records.
+- Preserve SQLite concurrent writes and restore state after persistence failure.
+- Validate operation starts across batched record/message writes.
+
 ## [0.9.6](https://github.com/bigfish1913/pi-rust/compare/v0.9.5...v0.9.6) - 2026-10-27
 
 ### Fixed

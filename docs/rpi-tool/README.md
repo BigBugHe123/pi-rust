@@ -4,7 +4,7 @@
 [![downloads](https://img.shields.io/crates/d/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![docs.rs](https://docs.rs/rpi-cli/badge.svg)](https://docs.rs/rpi-cli)
 [![license](https://img.shields.io/crates/l/rpi-cli.svg)](#license)
-[![MSRV](https://img.shields.io/badge/MSRV-1.78-blue.svg)](#install)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](#install)
 [![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml)
 [![GitHub stars](https://img.shields.io/github/stars/bigfish1913/pi-rust?style=flat)](https://github.com/bigfish1913/pi-rust/stargazers)
 [![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/bigfish1913/pi-rust/main/scripts/in
 Verifies the published SHA-256 checksum and installs to `/usr/local/bin` or
 `~/.local/bin`. Preview first with `--dry-run`.
 
-**From crates.io** (requires Rust 1.78+):
+**From crates.io** (requires Rust 1.88+):
 
 ```bash
 cargo install rpi-cli
@@ -112,6 +112,24 @@ Sessions persist as JSONL and survive a crash mid-run; `rpi` resumes from the
 last committed frame rather than replaying the turn. Custom Anthropic or
 OpenAI-compatible gateways are declared in `~/.rpi/agent/models.json` and
 selected with `--model <provider>/<model>`.
+
+### Runtime diagnostics
+
+To investigate slow model preparation, context construction, tool execution, or
+persistent assistant-frame writes, temporarily enable stderr diagnostics:
+
+```bash
+RPI_AGENT_DIAGNOSTICS=1 RPI_FRAME_DIAGNOSTICS=1 \
+  rpi -p "reproduce the issue" 2>rpi-diagnostics.log
+```
+
+`RPI_AGENT_DIAGNOSTICS` reports context, request, tool, and session append
+latencies. `RPI_FRAME_DIAGNOSTICS` reports durable frame batching, flush barriers,
+and writer failures. Diagnostics are disabled when the variables are unset or
+set to `0`; they do not change the JSONL format. See
+[`docs/debugging/rust-debugging.md`](docs/debugging/rust-debugging.md) for the
+field reference. The built-in read-only `docs` tool can retrieve it with
+`{"topic":"debugging","query":"RPI_FRAME_DIAGNOSTICS"}`.
 
 ### Request timeouts and model compatibility
 
@@ -314,6 +332,14 @@ rpi dev                                 # build + watch + live reload
 The host loads project `.rpi/extensions`, then global
 `~/.rpi/agent/extensions`, then any `--extensions-dir`.
 
+For a new Rust plugin, start with [`docs/extensions/authoring.md`](docs/extensions/authoring.md)
+and `examples/plugin-stub`. Use `rpi-plugin-sdk` for the `cdylib` ABI. If the plugin
+project also needs reusable session, workspace, native RPC or durable-runtime logic
+for a Web/ACP adapter, add [`rpi-extcore`](https://crates.io/crates/rpi-extcore)
+(`rpi-extcore = "0.1"`). It is a normal Rust library, not the `cdylib` entry point,
+and it does not replace `rpi-plugin-sdk`; a simple tool plugin should not add it
+unnecessarily.
+
 Ready-to-install extensions live in the companion
 [`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository, with
 an [online catalog](https://rpi.bigfisharc.cn/packages.html).
@@ -380,7 +406,7 @@ machine. See [`docs/remote/user-guide.md`](docs/remote/user-guide.md).
 | --- | --- |
 | Current release | **[0.9.6](https://github.com/bigfish1913/pi-rust/releases)** (nine crates, published together) |
 | Stability | `rpi-ai`, `rpi-agent`, `rpi-tools`, `rpi-harness`, `rpi-plugin-sdk` are the intended stable surface |
-| MSRV | 1.78 |
+| MSRV | 1.88 |
 | Platforms | Linux, macOS, Windows (CI runs the suite on Linux) |
 | Binary release targets | Linux (x86_64/aarch64), macOS (Intel/Apple silicon), Windows (x86_64) |
 

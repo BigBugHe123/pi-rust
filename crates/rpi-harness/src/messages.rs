@@ -435,6 +435,20 @@ pub fn convert_to_llm(messages: Vec<AgentMessage>) -> Vec<Message> {
         .collect()
 }
 
+/// Convert a suffix after the initial history has already gone through repair.
+/// New loop-produced messages are appended in valid provider order, so no
+/// cross-boundary orphan repair is needed here.
+pub fn convert_to_llm_incremental(messages: &[AgentMessage]) -> Vec<Message> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            AgentMessage::User(user) => Some(Message::User(user.clone())),
+            AgentMessage::Assistant(assistant) => Some(Message::Assistant(assistant.clone())),
+            AgentMessage::ToolResult(tool_result) => Some(Message::ToolResult(tool_result.clone())),
+            AgentMessage::Custom(custom) => convert_custom_to_llm(custom.clone()),
+        })
+        .collect()
+}
 fn convert_custom_to_llm(c: CustomMessage) -> Option<Message> {
     let timestamp = c.timestamp;
     match c.role.as_str() {
@@ -755,6 +769,19 @@ mod tests {
         assert!(matches!(out[0], Message::User(_)));
     }
 
+    #[test]
+    fn incremental_conversion_matches_full_conversion_for_valid_suffixes() {
+        let messages = vec![
+            AgentMessage::User(UserMessage::new("hi", 1)),
+            create_compaction_summary_message("summary", 2, 3),
+            assistant_with_calls(&[("call_a", "goal")]),
+            tool_result("call_a", "goal"),
+        ];
+        assert_eq!(
+            convert_to_llm(messages.clone()),
+            convert_to_llm_incremental(&messages)
+        );
+    }
     #[test]
     fn convert_to_llm_drops_unregistered_custom_role() {
         let c = CustomMessage::new("weird".to_string(), Vec::new(), serde_json::Value::Null, 1);
