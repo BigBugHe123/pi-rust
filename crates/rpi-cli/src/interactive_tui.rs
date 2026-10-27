@@ -2818,20 +2818,13 @@ pub async fn interactive_tui(
                     || key.code == KeyCode::Char('\n')
                     || key.code == KeyCode::Char('\r'))
             {
-                match enter_completion_action(&state_for_key, &editor_for_key) {
-                    Some(EnterCompletionAction::ApplyOnly) => {
-                        if accept_enter_completion(&state_for_key, &editor_for_key) {
-                            refresh_autocomplete(&state_for_key, &editor_for_key);
-                            tui_for_key.request_render_reusing_scroll_content();
-                            continue;
-                        }
-                    }
-                    Some(EnterCompletionAction::ApplyAndSubmit) => {
-                        // Rewrite the editor and let the Enter fall through
-                        // to the editor's submit below.
-                        accept_enter_completion(&state_for_key, &editor_for_key);
-                    }
-                    _ => {}
+                // One resolution, one replacement: `route_enter_completion`
+                // applies the same snapshot it decided on and reports whether
+                // this Enter is consumed by an `@`-path completion.
+                if route_enter_completion(&state_for_key, &editor_for_key) {
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
                 }
             }
 

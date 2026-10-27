@@ -4457,17 +4457,12 @@ fn review_pr106_windows_queued_prefix_enter_must_submit_the_completed_command() 
     // classification/flush FIRST, then the completion hook, then the editor.
     assert!(!windows_enter_in_paste(&run, false, None, now));
     run.flush(&editor, now);
-    match enter_completion_action(&state, &editor) {
-        Some(EnterCompletionAction::ApplyOnly) => {
-            if accept_enter_completion(&state, &editor) {
-                panic!("a slash command must not consume Enter as a path completion");
-            }
-        }
-        Some(EnterCompletionAction::ApplyAndSubmit) => {
-            accept_enter_completion(&state, &editor);
-        }
-        _ => {}
-    }
+    // The production routing entry point: one resolution, the same snapshot
+    // applied, `true` only for an `@`-path completion.
+    assert!(
+        !route_enter_completion(&state, &editor),
+        "a slash command must not consume Enter as a path completion"
+    );
     editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         *submitted.lock().unwrap(),
@@ -4509,11 +4504,9 @@ fn rereview_pr106_enter_in_middle_of_complete_command_must_preserve_the_command(
     editor.set_text("/clear");
     // Move the caret back two columns, without changing any text.
     editor.set_cursor(0, 4); // /cle|ar
-    assert_eq!(
-        enter_completion_action(&state, &editor),
-        Some(EnterCompletionAction::ApplyAndSubmit)
-    );
-    assert!(accept_enter_completion(&state, &editor));
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
     editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
         *submitted.lock().unwrap(),
@@ -4543,8 +4536,9 @@ fn rereview_pr106_enter_inside_an_unknown_token_keeps_the_typed_text() {
         Some(EnterCompletionAction::Submit),
         "a token that does not complete as a whole must be submitted as typed"
     );
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
     assert!(
-        !accept_enter_completion(&state, &editor),
+        !completion.apply(&state, &editor),
         "nothing may be applied when the whole token does not complete"
     );
     assert_eq!(editor.get_text(), "/clearXYZ");
@@ -4560,11 +4554,9 @@ fn rereview_pr106_enter_inside_a_token_completes_the_whole_token() {
     let editor = state.editor.clone();
     editor.set_text("/clear");
     editor.set_cursor(0, 4); // /cle|ar
-    assert_eq!(
-        enter_completion_action(&state, &editor),
-        Some(EnterCompletionAction::ApplyAndSubmit)
-    );
-    assert!(accept_enter_completion(&state, &editor));
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
     assert_eq!(
         editor.get_text(),
         "/clear",
@@ -4581,14 +4573,180 @@ fn rereview_pr106_enter_inside_a_command_token_keeps_the_following_word() {
     let editor = state.editor.clone();
     editor.set_text("/clear now");
     editor.set_cursor(0, 4); // /cle|ar now
-    assert_eq!(
-        enter_completion_action(&state, &editor),
-        Some(EnterCompletionAction::ApplyAndSubmit)
-    );
-    assert!(accept_enter_completion(&state, &editor));
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
     assert_eq!(
         editor.get_text(),
         "/clear now",
         "only the command token is replaced; the next word is untouched"
+    );
+}
+
+// ==== Reviewer probes for PR #106, round 3 (the two-lookup flow they model
+// is gone: the decision and the replacement are one snapshot, applied by
+// `route_enter_completion` — so the probes take the snapshot and apply it,
+// which is exactly what the key loop does). ====
+
+/// `@<root>/nested/repo` + Enter must complete the basename and KEEP the
+/// directory: the path provider spans the whole path prefix but returns a
+/// basename, so replacing its span would point the reference at a different
+/// file (`@report.txt`).
+#[test]
+fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let completed = nested.join("report.txt");
+    std::fs::write(&completed, "review fixture").unwrap();
+    assert!(!temporary.path().join("report.txt").exists());
+    let prefix = format!("@{}", nested.join("repo").display());
+    let expected = format!("@{} ", completed.display());
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        expected,
+        "Enter must complete the basename without discarding the directory from the file reference"
+    );
+}
+
+/// A path candidate that disappears between the decision and the apply must
+/// not turn the decided `ApplyOnly` into a submit of the unfinished prompt:
+/// the snapshot is applied as decided, and an `@`-path decision consumes the
+/// Enter independently of the apply result.
+#[test]
+fn final_review_pr106_disappearing_file_candidate_must_not_turn_enter_into_submit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("notes.txt");
+    std::fs::write(&path, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    editor.set_text("@not");
+    editor.set_cursor(0, 4);
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    // The decision is taken ONCE; the key loop keeps this snapshot.
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    // Model a real directory change after the decision, before the apply. No
+    // provider stub is used.
+    std::fs::remove_file(&path).unwrap();
+    // The production routing applies the SAME snapshot and consumes the Enter
+    // for an `@`-path completion; the key never reaches the editor.
+    let consumed = {
+        completion.apply(&state, &editor);
+        completion.consumes_enter()
+    };
+    if !consumed {
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "a disappearing path candidate must not cause ApplyOnly to submit the unfinished prompt"
+    );
+    assert_eq!(
+        editor.get_text(),
+        "@notes.txt ",
+        "the decided candidate is applied from the snapshot, not re-resolved"
+    );
+}
+
+/// Self-review probe: the key loop's actual entry point (`route_enter_completion`)
+/// resolves once, completes the basename, and consumes the Enter so the prompt
+/// is not submitted.
+#[test]
+fn final_review_pr106_path_completion_route_consumes_the_enter() {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(temporary.path().join("notes.txt"), "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    editor.set_text("@not");
+    editor.set_cursor(0, 4);
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    assert!(
+        route_enter_completion(&state, &editor),
+        "an @-path completion consumes the Enter"
+    );
+    assert_eq!(editor.get_text(), "@notes.txt ");
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "a path completion must never submit the prompt"
+    );
+}
+
+/// Self-review probe: the path segment rule matches the command-token rule —
+/// the whole segment around the caret is replaced (no duplicated suffix), and
+/// a segment that does not complete keeps the typed text instead of dropping
+/// it.
+#[test]
+fn final_review_pr106_path_segment_covers_the_text_after_the_caret() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let completed = nested.join("report.txt");
+    std::fs::write(&completed, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    // Caret inside the basename: `.../nested/repo|rt.txt`.
+    let prefix = format!("@{}", nested.join("repo").display());
+    let text = format!("{prefix}rt.txt");
+    editor.set_text(&text);
+    set_editor_cursor_offset(&editor, &text, prefix.len());
+    assert!(
+        route_enter_completion(&state, &editor),
+        "a path completion consumes the Enter"
+    );
+    assert_eq!(
+        editor.get_text(),
+        format!("@{} ", completed.display()),
+        "the whole basename segment is completed, not just the part before the caret"
+    );
+
+    // A segment that does not complete as a whole keeps the typed text: the
+    // completion must not silently drop `zz` after the caret.
+    let unknown = format!("{prefix}zz.txt");
+    editor.set_text(&unknown);
+    set_editor_cursor_offset(&editor, &unknown, prefix.len());
+    assert!(
+        !route_enter_completion(&state, &editor),
+        "a segment that does not complete falls through to the normal submit"
+    );
+    assert_eq!(
+        editor.get_text(),
+        unknown,
+        "nothing may be rewritten when the whole segment does not complete"
     );
 }

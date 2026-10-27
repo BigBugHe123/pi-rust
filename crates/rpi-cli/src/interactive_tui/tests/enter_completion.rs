@@ -115,13 +115,15 @@ fn enter_key_variants_resolve_completion_before_editor_submit() {
         editor.set_text("/hel");
         editor.set_cursor(0, 4);
 
-        let action = enter_completion_action(&state, &editor).expect("a decision");
+        // Resolve ONCE — the decision and the replacement the key loop uses
+        // come from the same snapshot.
+        let completion = resolve_enter_completion(&state, &editor).expect("a decision");
         assert!(
-            matches!(action, EnterCompletionAction::ApplyAndSubmit),
+            matches!(completion.action, EnterCompletionAction::ApplyAndSubmit),
             "{key:?}: sole completion must apply and submit"
         );
         assert!(
-            accept_enter_completion(&state, &editor),
+            completion.apply(&state, &editor),
             "{key:?}: completion must be applied"
         );
         assert_eq!(editor.get_text(), "/help", "{key:?}");
@@ -145,7 +147,8 @@ fn accept_enter_completion_completes_text_and_closes_popup() {
         "popup must be showing before Enter"
     );
 
-    let applied = accept_enter_completion(&state, &editor);
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    let applied = completion.apply(&state, &editor);
     assert!(applied, "the sole completion must be applied");
     assert_eq!(editor.get_text(), "/clear");
     assert_eq!(
@@ -229,12 +232,12 @@ fn already_complete_command_is_idempotent_under_enter_hook() {
     let editor = state.editor.clone();
     editor.set_text("/clear");
     editor.set_cursor(0, 6);
-    let action = enter_completion_action(&state, &editor).expect("a decision");
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
     assert!(
-        matches!(action, EnterCompletionAction::ApplyAndSubmit),
+        matches!(completion.action, EnterCompletionAction::ApplyAndSubmit),
         "exact command still resolves through the hook"
     );
-    assert!(accept_enter_completion(&state, &editor));
+    assert!(completion.apply(&state, &editor));
     assert_eq!(
         editor.get_text(),
         "/clear",
@@ -263,11 +266,9 @@ fn stale_highlight_is_clamped_when_candidates_narrow() {
     editor.set_text("/clea");
     editor.set_cursor(0, 5);
     *state.autocomplete_selection.lock().unwrap() = 1; // stale
-    assert!(matches!(
-        enter_completion_action(&state, &editor),
-        Some(EnterCompletionAction::ApplyAndSubmit)
-    ));
-    assert!(accept_enter_completion(&state, &editor));
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
     assert_eq!(editor.get_text(), "/clear");
 }
 

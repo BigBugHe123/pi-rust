@@ -231,19 +231,47 @@ fn apply_suggestion(
 /// `cursor` is a byte offset into `text`; it is snapped to a char boundary
 /// first so the slice is always sound.
 fn command_token_end(text: &str, cursor: usize) -> usize {
-    let cursor = cursor.min(text.len());
-    let cursor = if text.is_char_boundary(cursor) {
-        cursor
-    } else {
-        text.char_indices()
-            .take_while(|(byte, _)| *byte < cursor)
-            .last()
-            .map(|(byte, _)| byte)
-            .unwrap_or(0)
-    };
+    let cursor = snap_to_char_boundary(text, cursor);
     let rest = &text[cursor..];
     let offset = rest.find(char::is_whitespace);
     cursor + offset.unwrap_or(rest.len())
+}
+
+/// Greatest char-boundary byte index in `text` that is `<= cursor`.
+fn snap_to_char_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    if text.is_char_boundary(cursor) {
+        return cursor;
+    }
+    text.char_indices()
+        .take_while(|(byte, _)| *byte < cursor)
+        .last()
+        .map(|(byte, _)| byte)
+        .unwrap_or(0)
+}
+
+/// The byte range of the path segment (the basename) the caret sits in.
+///
+/// `token_start` is the byte just after the `@`; the range starts after the
+/// last `/` (or `\`) between there and the caret and ends at the next path
+/// separator or whitespace after it. Replacing the whole path prefix instead
+/// would drop the parent directories — the path provider returns a basename
+/// (`report.txt`), so `@/abs/nested/repo` would collapse to `@report.txt`,
+/// a reference to a different file.
+fn path_segment_bounds(text: &str, token_start: usize, cursor: usize) -> (usize, usize) {
+    let cursor = snap_to_char_boundary(text, cursor);
+    let token_start = token_start.min(cursor);
+    let before_caret = &text[token_start..cursor];
+    let start = before_caret
+        .rfind(['/', '\\'])
+        .map(|offset| token_start + offset + 1)
+        .unwrap_or(token_start);
+    let after_caret = &text[cursor..];
+    let end = after_caret
+        .find(|c: char| c == '/' || c == '\\' || c.is_whitespace())
+        .map(|offset| cursor + offset)
+        .unwrap_or(text.len());
+    (start, end)
 }
 
 /// What a bare Enter does while a completion popup is open. Mirrors the TS
@@ -272,11 +300,36 @@ pub(super) enum EnterCompletionAction {
 /// completion for the WHOLE token the caret is in: the replaced span covers
 /// the entire token, and only a candidate that completes that whole token is
 /// applied — a token that completes to nothing keeps the text as typed.
-struct EnterCompletion {
+///
+/// The decision and the replacement travel together in this snapshot: the
+/// key loop resolves ONCE and applies the candidate it decided on, so a
+/// candidate that disappears between the decision and the apply (a file
+/// deleted by another process, a directory change) can never turn the
+/// decided `ApplyOnly` into an editor submit of the unfinished prompt.
+pub(super) struct EnterCompletion {
     /// What the Enter key does.
-    action: EnterCompletionAction,
+    pub(super) action: EnterCompletionAction,
     /// The candidate to insert and the byte span it replaces.
-    candidate: Option<(AutocompleteItem, usize, usize)>,
+    pub(super) candidate: Option<(AutocompleteItem, usize, usize)>,
+}
+
+impl EnterCompletion {
+    /// Write the resolved replacement into the editor. Returns `true` when a
+    /// candidate was applied; a `Submit` decision carries none.
+    pub(super) fn apply(&self, state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
+        let Some((item, start, end)) = self.candidate.as_ref() else {
+            return false;
+        };
+        apply_suggestion(state, editor, *start, *end, item)
+    }
+
+    /// Whether the key loop consumes this Enter instead of forwarding it to
+    /// the editor's submit. An `@`-path completion never sends the prompt —
+    /// and the answer is independent of whether the replacement could be
+    /// applied, so a vanished candidate cannot fall through into a submit.
+    pub(super) fn consumes_enter(&self) -> bool {
+        self.action == EnterCompletionAction::ApplyOnly
+    }
 }
 
 /// Resolve the completion an Enter key applies in the current popup.
@@ -290,7 +343,7 @@ struct EnterCompletion {
 /// list holds exactly one item, or the user has explicitly moved the
 /// highlight. A fresh ambiguous popup (several candidates, index 0) resolves
 /// to `Submit` — Enter sends what was typed, never a silently guessed row.
-fn resolve_enter_completion(
+pub(super) fn resolve_enter_completion(
     state: &Arc<TuiState>,
     editor: &Arc<Editor>,
 ) -> Option<EnterCompletion> {
@@ -327,74 +380,79 @@ fn resolve_enter_completion(
             candidate: None,
         });
     }
-    if popup.is_path {
-        // A path popup completes the path prefix before the caret (the path
-        // provider owns the path grammar), so it keeps the provider's span.
-        return Some(EnterCompletion {
-            action: EnterCompletionAction::ApplyOnly,
-            candidate: Some((
-                top.clone(),
-                popup.start.min(text.len()),
-                popup.end.min(text.len()),
-            )),
-        });
-    }
-    // The replacement must cover the WHOLE command token the caret sits in:
-    // the text after the caret that belongs to the same token is part of it,
-    // not a separate word. `/cle|ar` is the token `/clear`, so the replaced
-    // span is the whole token and the token's own suffix is replaced instead
-    // of being left behind next to the completed prefix (which turned the
-    // valid command `/clear` into the unknown text `/clearar`).
-    let token_end = command_token_end(&text, cursor).min(text.len());
-    let applies = if explicit_selection {
-        // The user picked this row deliberately — their choice wins, even
-        // when the whole token does not complete to it.
-        true
+    // A candidate only rewrites text when it completes the whole unit the
+    // caret sits in — the entire command token, or the entire path segment.
+    // Otherwise the text stays exactly as typed: no silent rewrite to a
+    // different command, and no silent drop of what the user typed after the
+    // caret. An explicit ↑/↓ selection wins over that inference.
+    let (replacement_start, replacement_end, completes_whole) = if popup.is_path {
+        // The path provider returns a BASENAME (`report.txt`) but spans the
+        // whole path prefix; replacing that span would drop the directory and
+        // point the reference at a different file. Replace only the basename
+        // segment, keeping the parent directories the user typed.
+        let (segment_start, segment_end) = path_segment_bounds(&text, start, cursor);
+        let whole = state
+            .autocomplete
+            .get_suggestions(&text, segment_end)
+            .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
+        (segment_start, segment_end, whole)
     } else {
-        // A sole candidate must complete the WHOLE token: a candidate that
-        // only matches the prefix before the caret is not a completion of the
-        // token, so the typed text is kept as is instead of being rewritten.
-        state
+        // The replacement must cover the WHOLE command token the caret sits
+        // in: the text after the caret that belongs to the same token is part
+        // of it, not a separate word. `/cle|ar` is the token `/clear`, so the
+        // token's own suffix is replaced instead of being left behind next to
+        // the completed prefix (which turned the valid command `/clear` into
+        // the unknown text `/clearar`).
+        let token_end = command_token_end(&text, cursor).min(text.len());
+        let whole = state
             .autocomplete
             .get_suggestions(&text, token_end)
-            .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text))
+            .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
+        (start, token_end, whole)
     };
-    if !applies {
+    if !completes_whole && !explicit_selection {
         return Some(EnterCompletion {
             action: EnterCompletionAction::Submit,
             candidate: None,
         });
     }
     Some(EnterCompletion {
-        action: EnterCompletionAction::ApplyAndSubmit,
-        candidate: Some((top.clone(), popup.start.min(text.len()), token_end)),
+        action: if popup.is_path {
+            EnterCompletionAction::ApplyOnly
+        } else {
+            EnterCompletionAction::ApplyAndSubmit
+        },
+        candidate: Some((top.clone(), replacement_start, replacement_end)),
     })
 }
 
-/// Decide what a bare Enter does in the current completion context.
+/// Route a bare Enter through the completion popup: resolve the decision ONCE,
+/// apply the candidate that decision carries, and report whether the key is
+/// consumed (`true` — an `@`-path completion) or must fall through to the
+/// editor's submit (`false`).
 ///
-/// Returns `None` when no completion popup applies (plain text, a `/` token
-/// that is not at the start of the input, or no suggestions) — the key falls
-/// through to the editor unchanged, preserving the upstream behavior that an
-/// unknown `/skill:name` reaches the model untouched.
+/// Resolving once is load-bearing: the action and the replacement come from
+/// the same snapshot, so the key loop can never apply a different candidate
+/// than the one it decided on, and an `ApplyOnly` decision stays consumed even
+/// if its replacement could not be written.
+pub(super) fn route_enter_completion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
+    let Some(completion) = resolve_enter_completion(state, editor) else {
+        return false;
+    };
+    completion.apply(state, editor);
+    completion.consumes_enter()
+}
+
+/// Test-only projection of the decision (the action half of the snapshot).
+/// Production never resolves the action separately from the candidate — it
+/// goes through `route_enter_completion`, which applies the snapshot it just
+/// decided on.
+#[cfg(test)]
 pub(super) fn enter_completion_action(
     state: &Arc<TuiState>,
     editor: &Arc<Editor>,
 ) -> Option<EnterCompletionAction> {
     resolve_enter_completion(state, editor).map(|completion| completion.action)
-}
-
-/// Apply the completion an Enter decision selected. Returns `true` when the
-/// editor text was rewritten (the caller lets the Enter fall through to
-/// submit for `ApplyAndSubmit`, or consumes it for `ApplyOnly`).
-pub(super) fn accept_enter_completion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
-    let Some(completion) = resolve_enter_completion(state, editor) else {
-        return false;
-    };
-    let Some((top, start, end)) = completion.candidate else {
-        return false;
-    };
-    apply_suggestion(state, editor, start, end, &top)
 }
 
 /// Move the autocomplete highlight up (`direction < 0`) or down (`direction > 0`)
