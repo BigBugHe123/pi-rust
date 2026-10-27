@@ -541,7 +541,7 @@ impl Agent {
             before_tool_call: None,
             after_tool_call: None,
             tool_execution: self.inner.tool_execution,
-            initial_request: Default::default(),
+            tool_choice: None,
             thinking_level: state.thinking_level,
             api_key: None,
             timeout: None,
@@ -557,13 +557,13 @@ impl Agent {
     async fn run_prompt(&self, messages: Vec<AgentMessage>) -> Result<(), crate::AgentError> {
         let signal = self.abort_token();
         let context = self.context_snapshot();
-        let config = self.build_config(signal);
+        let mut config = self.build_config(signal);
         let emit: Arc<dyn AgentEmitter> = Arc::new(StatefulEmitter {
             state: Arc::clone(&self.inner.state),
             broadcast: BroadcastEmitter::from_sender(self.inner.event_tx.clone()),
         });
         let stream_fn = Arc::clone(&self.inner.stream_fn);
-        run_agent_loop(messages, context, config, emit, stream_fn).await?;
+        run_agent_loop(messages, context, &mut config, emit, stream_fn).await?;
         Ok(())
     }
 
@@ -580,13 +580,13 @@ impl Agent {
                 "Cannot continue from message role: assistant".into(),
             ));
         }
-        let config = self.build_config(signal);
+        let mut config = self.build_config(signal);
         let emit: Arc<dyn AgentEmitter> = Arc::new(StatefulEmitter {
             state: Arc::clone(&self.inner.state),
             broadcast: BroadcastEmitter::from_sender(self.inner.event_tx.clone()),
         });
         let stream_fn = Arc::clone(&self.inner.stream_fn);
-        run_agent_loop_continue(context, config, emit, stream_fn).await?;
+        run_agent_loop_continue(context, &mut config, emit, stream_fn).await?;
         Ok(())
     }
 }

@@ -215,7 +215,7 @@ pub fn loop_config_with_converter(
         before_tool_call: None,
         after_tool_call: None,
         tool_execution: rpi_agent::ToolExecutionMode::Parallel,
-        initial_request: Default::default(),
+        tool_choice: None,
         thinking_level: rpi_ai::types::ThinkingLevel::Off,
         api_key: None,
         timeout: None,
@@ -245,12 +245,12 @@ pub fn tool_result_text(trm: &rpi_ai::types::ToolResultMessage) -> String {
 pub async fn run_and_collect(
     prompts: Vec<rpi_agent::AgentMessage>,
     context: rpi_agent::AgentContext,
-    config: rpi_agent::AgentLoopConfig,
+    mut config: rpi_agent::AgentLoopConfig,
     stream_fn: StreamFn,
 ) -> (Vec<rpi_agent::AgentEvent>, Vec<rpi_agent::AgentMessage>) {
     let (collector, events) = rpi_agent::CollectorEmitter::new();
     let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
-    let new_messages = rpi_agent::run_agent_loop(prompts, context, config, emit, stream_fn)
+    let new_messages = rpi_agent::run_agent_loop(prompts, context, &mut config, emit, stream_fn)
         .await
         .expect("run_agent_loop failed");
     let events = events.lock().expect("events lock").clone();

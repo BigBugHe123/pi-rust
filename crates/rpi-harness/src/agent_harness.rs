@@ -4184,7 +4184,7 @@ impl AgentHarness {
             before_tool_call: snap.before_tool_call.clone(),
             after_tool_call: snap.after_tool_call.clone(),
             tool_execution: snap.tool_execution.to_agent_mode(),
-            initial_request: rpi_agent::InitialRequestOptions::new(prompt_options.tool_choice),
+            tool_choice: prompt_options.tool_choice,
             thinking_level: snap.thinking_level,
             api_key: None,
             timeout: snap.stream_options.timeout,
@@ -4258,6 +4258,8 @@ impl AgentHarness {
             Arc::clone(&settle_state),
             self.clone(),
         ));
+        // Borrow the invocation config across attempts: the agent loop owns
+        // selector consumption, and retries must not clone consumed options.
         let result = loop {
             // An attempt owns its history. A retry reloads the durable branch
             // below, so retaining a deep copy of these messages is unnecessary.
@@ -4271,7 +4273,7 @@ impl AgentHarness {
             let attempt_result = if from_assistant {
                 run_agent_loop_from_assistant(
                     attempt_context,
-                    config.clone(),
+                    &mut config,
                     Arc::clone(&emitter),
                     Arc::clone(&stream_fn),
                 )
@@ -4280,7 +4282,7 @@ impl AgentHarness {
                 run_agent_loop(
                     Vec::new(),
                     attempt_context,
-                    config.clone(),
+                    &mut config,
                     Arc::clone(&emitter),
                     Arc::clone(&stream_fn),
                 )

@@ -77,10 +77,12 @@ impl LoopOutcome {
 ///
 /// Emits `agent_start`, `turn_start`, then `message_start`/`message_end` for
 /// each prompt, then drives [`run_loop`]. Returns the messages produced.
+/// The loop consumes `config.tool_choice` after its first non-error response.
+/// Reuse the same invocation config for retries so consumed options stay cleared.
 pub async fn run_agent_loop(
     prompts: Vec<AgentMessage>,
     context: AgentContext,
-    config: AgentLoopConfig,
+    config: &mut AgentLoopConfig,
     emit: Arc<dyn AgentEmitter>,
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
@@ -112,7 +114,7 @@ pub async fn run_agent_loop(
     run_loop(
         &mut current_context,
         &mut new_messages,
-        &config,
+        config,
         &emit,
         &stream_fn,
         None,
@@ -124,9 +126,10 @@ pub async fn run_agent_loop(
 /// Continue an agent loop from the existing context (no new prompt). Mirrors
 /// TS `runAgentLoopContinue`. Errors if the context is empty or its last
 /// message is an assistant message (the provider would reject that).
+/// Consumes invocation options as described by [`run_agent_loop`].
 pub async fn run_agent_loop_continue(
     context: AgentContext,
-    config: AgentLoopConfig,
+    config: &mut AgentLoopConfig,
     emit: Arc<dyn AgentEmitter>,
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
@@ -150,7 +153,7 @@ pub async fn run_agent_loop_continue(
     run_loop(
         &mut current_context,
         &mut new_messages,
-        &config,
+        config,
         &emit,
         &stream_fn,
         None,
@@ -170,9 +173,10 @@ pub async fn run_agent_loop_continue(
 ///
 /// Errors when the last message is not an assistant message: there would be
 /// nothing to resume, and silently calling the provider instead would be wrong.
+/// Consumes invocation options as described by [`run_agent_loop`].
 pub async fn run_agent_loop_from_assistant(
     context: AgentContext,
-    config: AgentLoopConfig,
+    config: &mut AgentLoopConfig,
     emit: Arc<dyn AgentEmitter>,
     stream_fn: StreamFn,
 ) -> Result<NewMessages, AgentError> {
@@ -192,7 +196,7 @@ pub async fn run_agent_loop_from_assistant(
     run_loop(
         &mut current_context,
         &mut new_messages,
-        &config,
+        config,
         &emit,
         &stream_fn,
         Some(*assistant),
@@ -223,7 +227,7 @@ struct ExecutedToolBatch {
 async fn run_loop(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
-    config: &AgentLoopConfig,
+    config: &mut AgentLoopConfig,
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
     // `pending_assistant`: an assistant message already sitting at the end of
@@ -597,7 +601,7 @@ impl ProviderMessageCache {
 /// `streamAssistantResponse`.
 async fn stream_assistant_response(
     context: &mut AgentContext,
-    config: &AgentLoopConfig,
+    config: &mut AgentLoopConfig,
     provider_cache: &mut ProviderMessageCache,
     emit: &Arc<dyn AgentEmitter>,
     stream_fn: &StreamFn,
@@ -743,7 +747,9 @@ async fn stream_assistant_response(
                         "assistant-message event stream ended without a terminal event".into(),
                     )
                 })?;
-                config.initial_request.response_received(&final_message);
+                if final_message.stop_reason != StopReason::Error {
+                    config.tool_choice = None;
+                }
                 let am = AgentMessage::Assistant(Box::new(final_message.clone()));
                 if added_partial {
                     if let Some(last) = context.messages.last_mut() {
@@ -779,7 +785,9 @@ async fn stream_assistant_response(
     let final_message = response.result().await.map_err(|_| {
         AgentError::Provider("assistant-message event stream ended without a terminal event".into())
     })?;
-    config.initial_request.response_received(&final_message);
+    if final_message.stop_reason != StopReason::Error {
+        config.tool_choice = None;
+    }
     let am = AgentMessage::Assistant(Box::new(final_message.clone()));
     if added_partial {
         if let Some(last) = context.messages.last_mut() {

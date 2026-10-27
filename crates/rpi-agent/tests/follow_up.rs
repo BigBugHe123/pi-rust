@@ -103,7 +103,7 @@ async fn follow_up_queue_drives_an_extra_turn_after_stop() {
     let new_messages = rpi_agent::run_agent_loop(
         vec![user_message("Initial")],
         AgentContext::default(),
-        config,
+        &mut config,
         emit,
         stream_fn,
     )
@@ -167,7 +167,7 @@ async fn one_at_a_time_steering_drains_one_message_per_turn() {
     let new_messages = rpi_agent::run_agent_loop(
         vec![user_message("Initial")],
         AgentContext::default(),
-        config,
+        &mut config,
         emit,
         stream_fn,
     )

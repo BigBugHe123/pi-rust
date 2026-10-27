@@ -101,7 +101,7 @@ async fn abort_during_stream_produces_agent_end() {
         rpi_agent::run_agent_loop(
             vec![common::user_message("hello")],
             AgentContext::default(),
-            config,
+            &mut config,
             emit,
             stream_fn,
         )
@@ -226,7 +226,7 @@ async fn abort_during_tool_unblocks_and_settles() {
         rpi_agent::run_agent_loop(
             vec![common::user_message("run the tool")],
             context,
-            config,
+            &mut config,
             emit,
             stream_fn,
         )

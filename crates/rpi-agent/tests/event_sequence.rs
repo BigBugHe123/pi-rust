@@ -434,16 +434,59 @@ async fn tool_choice_lifetime_does_not_depend_on_event_observers() {
     });
     let choice = rpi_ai::types::ToolChoice::Mode(rpi_ai::types::ToolChoiceMode::Required);
     let mut config = base_config();
-    config.initial_request = rpi_agent::InitialRequestOptions::new(Some(choice.clone()));
+    config.tool_choice = Some(choice.clone());
     rpi_agent::run_agent_loop(
         vec![user_message("echo hello")],
         context_with_tools(vec![Arc::new(tool)]),
-        config,
+        &mut config,
         Arc::new(DiscardEvents),
         stream,
     )
     .await
     .unwrap();
     assert_eq!(*observed.lock().unwrap(), vec![Some(choice), None]);
+    assert_eq!(*executed.lock().unwrap(), ["hello"]);
+}
+
+/// Failed first requests retain the selector; a failure after a tool response
+/// must not restore it when the backend retries with the same invocation config.
+#[tokio::test]
+async fn tool_choice_consumption_survives_retries() {
+    let (tool, executed) = EchoTool::new();
+    let script = mock_stream_fn(vec![
+        assistant_text("temporary failure", StopReason::Error),
+        assistant_tool_calls(
+            vec![("call-1", "echo", serde_json::json!({"value":"hello"}))],
+            StopReason::ToolUse,
+        ),
+        assistant_text("failure after tool results", StopReason::Error),
+        assistant_text("done", StopReason::Stop),
+    ]);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&observed);
+    let stream = rpi_agent::stream_fn(move |model, context, options| {
+        captured.lock().unwrap().push(options.tool_choice.clone());
+        script(model, context, options)
+    });
+    let choice = rpi_ai::types::ToolChoice::Mode(rpi_ai::types::ToolChoiceMode::Required);
+    let mut config = base_config();
+    config.tool_choice = Some(choice.clone());
+    let context = context_with_tools(vec![Arc::new(tool)]);
+    for _ in 0..3 {
+        let (collector, _) = rpi_agent::CollectorEmitter::new();
+        rpi_agent::run_agent_loop(
+            vec![user_message("echo hello")],
+            context.clone(),
+            &mut config,
+            Arc::new(collector),
+            Arc::clone(&stream),
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![Some(choice.clone()), Some(choice), None, None]
+    );
     assert_eq!(*executed.lock().unwrap(), ["hello"]);
 }

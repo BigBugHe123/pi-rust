@@ -306,12 +306,14 @@ async fn ignores_settled_parallel_update_while_another_tool_runs() {
     // loop on a task and collect events into a shared buffer.
     let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
     let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
-    let cfg = base_config();
+    let mut cfg = base_config();
     let prompts = vec![user_message("run tools")];
     let ctx = context;
     let sf = stream_fn;
     let run_handle =
-        tokio::spawn(async move { rpi_agent::run_agent_loop(prompts, ctx, cfg, emit, sf).await });
+        tokio::spawn(
+            async move { rpi_agent::run_agent_loop(prompts, ctx, &mut cfg, emit, sf).await },
+        );
 
     // Wait for slow_tool to start (notified inside its execute).
     slow_started.notified().await;
