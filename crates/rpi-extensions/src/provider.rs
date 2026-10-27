@@ -437,6 +437,7 @@ fn options_json(opts: &SimpleStreamOptions) -> serde_json::Value {
         "reasoning": opts.reasoning.map(|r| format!("{r:?}")),
         "maxTokens": opts.max_tokens,
         "temperature": opts.temperature,
+        "toolChoice": opts.tool_choice,
         "thinkingBudgets": opts.thinking_budgets,
     })
 }
@@ -1407,6 +1408,33 @@ fn chunk_string(chunk: &serde_json::Value, field: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_choice_is_preserved_in_plugin_request_envelopes() {
+        let model = Model::new(
+            "m",
+            "M",
+            rpi_ai::Api::OpenaiCompletions,
+            "plugin",
+            "https://example.invalid",
+        );
+        let context = Context::new(vec![]);
+        for value in [
+            serde_json::json!("required"),
+            serde_json::json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"read"}}]}}),
+            serde_json::json!({"type":"mcp","server_label":"docs","name":"search"}),
+        ] {
+            let options = SimpleStreamOptions {
+                tool_choice: Some(serde_json::from_value(value.clone()).unwrap()),
+                ..Default::default()
+            };
+            let envelope: serde_json::Value =
+                serde_json::from_str(&request_envelope_json(&model, &context, &options)).unwrap();
+            assert_eq!(envelope["options"]["toolChoice"], value);
+            assert_eq!(options_json(&options)["toolChoice"], value);
+        }
+        assert!(options_json(&SimpleStreamOptions::default())["toolChoice"].is_null());
+    }
+
     use super::*;
     use crate::registry::ExtensionRegistry;
 

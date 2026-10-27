@@ -743,6 +743,7 @@ async fn stream_assistant_response(
                         "assistant-message event stream ended without a terminal event".into(),
                     )
                 })?;
+                config.initial_request.response_received(&final_message);
                 let am = AgentMessage::Assistant(Box::new(final_message.clone()));
                 if added_partial {
                     if let Some(last) = context.messages.last_mut() {
@@ -778,6 +779,7 @@ async fn stream_assistant_response(
     let final_message = response.result().await.map_err(|_| {
         AgentError::Provider("assistant-message event stream ended without a terminal event".into())
     })?;
+    config.initial_request.response_received(&final_message);
     let am = AgentMessage::Assistant(Box::new(final_message.clone()));
     if added_partial {
         if let Some(last) = context.messages.last_mut() {

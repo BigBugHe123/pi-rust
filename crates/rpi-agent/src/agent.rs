@@ -541,6 +541,7 @@ impl Agent {
             before_tool_call: None,
             after_tool_call: None,
             tool_execution: self.inner.tool_execution,
+            initial_request: Default::default(),
             thinking_level: state.thinking_level,
             api_key: None,
             timeout: None,

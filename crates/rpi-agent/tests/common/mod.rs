@@ -215,6 +215,7 @@ pub fn loop_config_with_converter(
         before_tool_call: None,
         after_tool_call: None,
         tool_execution: rpi_agent::ToolExecutionMode::Parallel,
+        initial_request: Default::default(),
         thinking_level: rpi_ai::types::ThinkingLevel::Off,
         api_key: None,
         timeout: None,

@@ -196,6 +196,8 @@ pub struct AnthropicRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<AnthropicThinking>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<Value>,
@@ -401,7 +403,7 @@ struct CanonicalTextRequest<'a> {
 impl Serialize for CanonicalTextRequest<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let request = self.request;
-        let mut state = serializer.serialize_struct("AnthropicRequest", 10)?;
+        let mut state = serializer.serialize_struct("AnthropicRequest", 11)?;
         state.serialize_field("model", &request.model)?;
         state.serialize_field(
             "messages",
@@ -420,6 +422,9 @@ impl Serialize for CanonicalTextRequest<'_> {
         }
         if let Some(value) = &request.tools {
             state.serialize_field("tools", value)?;
+        }
+        if let Some(value) = &request.tool_choice {
+            state.serialize_field("tool_choice", value)?;
         }
         if let Some(value) = &request.thinking {
             state.serialize_field("thinking", value)?;
@@ -1781,7 +1786,7 @@ pub fn build_params(
     ctx: &crate::types::Context,
     is_oauth: bool,
     opts: &SimpleStreamOptions,
-) -> BuiltParams {
+) -> Result<BuiltParams, String> {
     build_params_internal(model, ctx, is_oauth, opts, false)
 }
 
@@ -1794,7 +1799,7 @@ pub(crate) fn build_params_prepared(
     is_oauth: bool,
     opts: &SimpleStreamOptions,
     allow_preencoded_canonical_text: bool,
-) -> BuiltParams {
+) -> Result<BuiltParams, String> {
     build_params_internal(model, ctx, is_oauth, opts, allow_preencoded_canonical_text)
 }
 
@@ -1804,9 +1809,12 @@ fn build_params_internal(
     is_oauth: bool,
     opts: &SimpleStreamOptions,
     allow_preencoded_canonical_text: bool,
-) -> BuiltParams {
+) -> Result<BuiltParams, String> {
     let diagnostics_enabled = build_params_diagnostics_enabled();
     let total_started = diagnostics_enabled.then(Instant::now);
+    if let Some(choice) = &opts.tool_choice {
+        choice.validate_for_api(&crate::types::Api::AnthropicMessages)?;
+    }
     let compat = get_anthropic_compat(model);
     let cache_control_opt = get_cache_control(model, opts.cache_retention);
     let cache_ref = cache_control_opt.cache_control.as_ref();
@@ -1820,9 +1828,27 @@ fn build_params_internal(
     let normalize_ns = elapsed_ns(phase_started);
 
     let phase_started = diagnostics_enabled.then(Instant::now);
+    // Keep transcript tool results intact; only narrow this request's advertised tools.
+    let selected_tools;
+    let portable_choice = opts
+        .tool_choice
+        .as_ref()
+        .and_then(crate::types::ToolChoice::portable);
+    let request_tools =
+        if let Some(crate::types::ToolChoice::AllowedTools(group)) = &portable_choice {
+            selected_tools = ctx
+                .tools
+                .iter()
+                .filter(|tool| group.tools.iter().any(|allowed| allowed.name == tool.name))
+                .cloned()
+                .collect::<Vec<_>>();
+            &selected_tools
+        } else {
+            &ctx.tools
+        };
     let placement = split_deferred_tools(
         &transformed,
-        &ctx.tools,
+        request_tools,
         compat.tool_references(),
         &|name: &str| name.to_string(),
     );
@@ -2001,7 +2027,7 @@ fn build_params_internal(
         .map(|uid| AnthropicMetadata { user_id: uid });
     // Beta headers.
     let use_fine_grained_tool_streaming_beta =
-        !ctx.tools.is_empty() && !compat.eager_tool_input_streaming();
+        !request_tools.is_empty() && !compat.eager_tool_input_streaming();
     let needs_interleaved_beta = thinking_enabled && !compat.adaptive_thinking();
     let beta_header =
         build_beta_header(use_fine_grained_tool_streaming_beta, needs_interleaved_beta);
@@ -2014,6 +2040,11 @@ fn build_params_internal(
         system,
         temperature,
         tools,
+        tool_choice: opts
+            .tool_choice
+            .as_ref()
+            .map(crate::types::ToolChoice::anthropic_value)
+            .transpose()?,
         thinking,
         output_config,
         metadata,
@@ -2034,7 +2065,7 @@ fn build_params_internal(
     });
     let preencoded_json_ns = elapsed_ns(preencoded_started);
 
-    BuiltParams {
+    Ok(BuiltParams {
         request,
         cache_control: cache_control_opt,
         beta_header,
@@ -2049,7 +2080,7 @@ fn build_params_internal(
             preencoded_json_ns,
             total_ns: elapsed_ns(total_started),
         },
-    }
+    })
 }
 
 fn build_beta_header(fine_grained: bool, interleaved: bool) -> Option<String> {
@@ -2465,6 +2496,143 @@ mod tests {
     }
 
     #[test]
+    fn tool_choice_native_supported_values_convert_and_unsupported_values_fail() {
+        let model = model_with_compat(AnthropicMessagesCompat::default());
+        let ctx = crate::types::Context {
+            tools: vec![
+                sample_tool("read"),
+                sample_tool("bash"),
+                sample_tool("write"),
+            ],
+            ..Default::default()
+        };
+        for (native, expected) in [
+            (
+                json!({"type":"function","name":"read"}),
+                json!({"type":"tool","name":"read"}),
+            ),
+            (
+                json!({"type":"function","function":{"name":"read"}}),
+                json!({"type":"tool","name":"read"}),
+            ),
+            (
+                json!({"type":"auto","disable_parallel_tool_use":true}),
+                json!({"type":"auto","disable_parallel_tool_use":true}),
+            ),
+            (
+                json!({"type":"any","disable_parallel_tool_use":true}),
+                json!({"type":"any","disable_parallel_tool_use":true}),
+            ),
+            (
+                json!({"type":"tool","name":"read","disable_parallel_tool_use":true}),
+                json!({"type":"tool","name":"read","disable_parallel_tool_use":true}),
+            ),
+        ] {
+            let opts = SimpleStreamOptions {
+                tool_choice: Some(serde_json::from_value(native).unwrap()),
+                ..Default::default()
+            };
+            assert_eq!(
+                build_params(&model, &ctx, false, &opts)
+                    .unwrap()
+                    .request
+                    .tool_choice,
+                Some(expected)
+            );
+        }
+        for native in [
+            json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"read"}]}),
+            json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"read"}}]}}),
+        ] {
+            let opts = SimpleStreamOptions {
+                tool_choice: Some(serde_json::from_value(native).unwrap()),
+                ..Default::default()
+            };
+            let request = build_params(&model, &ctx, false, &opts).unwrap().request;
+            assert_eq!(
+                request
+                    .tools
+                    .unwrap()
+                    .into_iter()
+                    .map(|tool| tool.name)
+                    .collect::<Vec<_>>(),
+                ["read"]
+            );
+        }
+        for native in [
+            json!({"type":"web_search"}),
+            json!({"type":"custom","name":"read"}),
+            json!({"type":"mcp","server_label":"docs"}),
+            json!({"type":"function","namespace":"workspace","name":"read"}),
+            json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"web_search"}]}),
+        ] {
+            let opts = SimpleStreamOptions {
+                tool_choice: Some(serde_json::from_value(native).unwrap()),
+                ..Default::default()
+            };
+            assert!(build_params(&model, &ctx, false, &opts).is_err());
+        }
+    }
+
+    #[test]
+    fn tool_choice_group_limits_advertised_tools() {
+        let model = model_with_compat(AnthropicMessagesCompat::default());
+        let ctx = crate::types::Context {
+            tools: vec![
+                sample_tool("read"),
+                sample_tool("bash"),
+                sample_tool("write"),
+            ],
+            ..Default::default()
+        };
+        for (mode, wire_mode) in [("auto", "auto"), ("required", "any")] {
+            let opts = SimpleStreamOptions { tool_choice:Some(serde_json::from_value(json!({"type":"allowed_tools","mode":mode,"tools":[{"name":"read"},{"name":"bash"}]})).unwrap()), ..Default::default() };
+            let request = build_params(&model, &ctx, false, &opts).unwrap().request;
+            assert_eq!(request.tool_choice, Some(json!({"type":wire_mode})));
+            let names: Vec<_> = request
+                .tools
+                .unwrap()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+            // Anthropic's existing deferred-tool placement orders tools by name.
+            assert_eq!(names, ["bash", "read"]);
+            assert_eq!(ctx.tools.len(), 3);
+        }
+    }
+
+    #[test]
+    fn tool_choice_reaches_request() {
+        use crate::types::{ToolChoice, ToolChoiceMode};
+        let model = model_with_compat(AnthropicMessagesCompat::default());
+        let ctx = crate::types::Context::default();
+        let mut opts = SimpleStreamOptions::default();
+        assert!(build_params(&model, &ctx, false, &opts)
+            .unwrap()
+            .request
+            .tool_choice
+            .is_none());
+        opts.tool_choice = Some(ToolChoice::Mode(ToolChoiceMode::Required));
+        assert_eq!(
+            build_params(&model, &ctx, false, &opts)
+                .unwrap()
+                .request
+                .tool_choice,
+            Some(json!({"type":"any"}))
+        );
+        opts.tool_choice = Some(ToolChoice::Tool {
+            name: "read".into(),
+        });
+        assert_eq!(
+            build_params(&model, &ctx, false, &opts)
+                .unwrap()
+                .request
+                .tool_choice,
+            Some(json!({"type":"tool","name":"read"}))
+        );
+    }
+
+    #[test]
     fn build_params_temperature_omitted_under_thinking() {
         let mut compat = AnthropicMessagesCompat::default();
         compat.supports_temperature = Some(true);
@@ -2478,7 +2646,7 @@ mod tests {
         let mut opts = SimpleStreamOptions::default();
         opts.reasoning = Some(ThinkingLevel::Medium);
         opts.temperature = Some(0.7);
-        let built = build_params(&model, &ctx, false, &opts);
+        let built = build_params(&model, &ctx, false, &opts).unwrap();
         assert!(built.request.temperature.is_none());
         assert!(built.request.thinking.is_some());
     }
@@ -2496,7 +2664,7 @@ mod tests {
         };
         let mut opts = SimpleStreamOptions::default();
         opts.reasoning = Some(ThinkingLevel::High);
-        let built = build_params(&model, &ctx, false, &opts);
+        let built = build_params(&model, &ctx, false, &opts).unwrap();
         assert!(matches!(
             built.request.thinking,
             Some(AnthropicThinking::Adaptive { .. })
@@ -2519,7 +2687,7 @@ mod tests {
         };
         let mut opts = SimpleStreamOptions::default();
         opts.reasoning = Some(ThinkingLevel::High);
-        let built = build_params(&model, &ctx, false, &opts);
+        let built = build_params(&model, &ctx, false, &opts).unwrap();
         match built.request.thinking {
             Some(AnthropicThinking::Enabled { budget_tokens, .. }) => {
                 assert!(budget_tokens > 0);
@@ -2648,8 +2816,11 @@ mod tests {
             "test-user".into(),
         )]));
 
-        let legacy = build_params(&model, &ctx, false, &opts);
-        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        opts.tool_choice = Some(crate::types::ToolChoice::Mode(
+            crate::types::ToolChoiceMode::Required,
+        ));
+        let legacy = build_params(&model, &ctx, false, &opts).unwrap();
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true).unwrap();
         let legacy_bytes = serde_json::to_vec(&legacy.request).unwrap();
         let prepared_bytes = prepared.preencoded_body.as_ref().unwrap();
 
@@ -2662,7 +2833,8 @@ mod tests {
         ctx.messages.push(UserMessage::new("tail", 0).into());
         assert_ne!(
             prepared_bytes,
-            &serde_json::to_vec(&build_params(&model, &ctx, false, &opts).request).unwrap()
+            &serde_json::to_vec(&build_params(&model, &ctx, false, &opts).unwrap().request)
+                .unwrap()
         );
     }
 
@@ -2674,8 +2846,8 @@ mod tests {
         let ctx = crate::types::Context::new(vec![UserMessage::new("final", 0).into()]);
         let opts = SimpleStreamOptions::default();
 
-        let legacy = build_params(&model, &ctx, false, &opts);
-        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        let legacy = build_params(&model, &ctx, false, &opts).unwrap();
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true).unwrap();
         assert_eq!(
             prepared.preencoded_body.as_ref().unwrap(),
             &serde_json::to_vec(&legacy.request).unwrap()
@@ -2693,8 +2865,8 @@ mod tests {
         opts.reasoning = Some(ThinkingLevel::High);
         opts.max_tokens = Some(4096);
 
-        let legacy = build_params(&model, &ctx, false, &opts);
-        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        let legacy = build_params(&model, &ctx, false, &opts).unwrap();
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true).unwrap();
         assert_eq!(
             prepared.preencoded_body.as_ref().unwrap(),
             &serde_json::to_vec(&legacy.request).unwrap()
@@ -2706,7 +2878,8 @@ mod tests {
         let model = model_with_compat(AnthropicMessagesCompat::default());
         let ctx = crate::types::Context::new(vec![UserMessage::new("prompt", 0).into()]);
         let prepared =
-            build_params_prepared(&model, &ctx, false, &SimpleStreamOptions::default(), true);
+            build_params_prepared(&model, &ctx, false, &SimpleStreamOptions::default(), true)
+                .unwrap();
         assert!(prepared.preencoded_body.is_none());
         assert_eq!(prepared.request.messages.len(), 1);
     }
@@ -2719,7 +2892,7 @@ mod tests {
         let ctx = crate::types::Context::new(vec![UserMessage::new("prompt", 0).into()]);
         let mut opts = SimpleStreamOptions::default();
         opts.temperature = Some(f64::NAN);
-        let prepared = build_params_prepared(&model, &ctx, false, &opts, true);
+        let prepared = build_params_prepared(&model, &ctx, false, &opts, true).unwrap();
         assert!(prepared.preencoded_body.is_none());
         assert_eq!(prepared.request.messages.len(), 1);
     }
@@ -2733,9 +2906,10 @@ mod tests {
             AssistantMessage::empty(model.api.clone(), &model.provider, &model.id, 0);
         assistant.content = vec![Content::thinking("reasoning")];
         let ctx = crate::types::Context::new(vec![Message::Assistant(Box::new(assistant))]);
-        let legacy = build_params(&model, &ctx, false, &SimpleStreamOptions::default());
+        let legacy = build_params(&model, &ctx, false, &SimpleStreamOptions::default()).unwrap();
         let prepared =
-            build_params_prepared(&model, &ctx, false, &SimpleStreamOptions::default(), true);
+            build_params_prepared(&model, &ctx, false, &SimpleStreamOptions::default(), true)
+                .unwrap();
 
         assert!(prepared.preencoded_body.is_none());
         assert_eq!(
@@ -2762,7 +2936,7 @@ mod tests {
             }))],
             tools: vec![sample_tool("loader")],
         };
-        let built = build_params(&model, &ctx, false, &SimpleStreamOptions::default());
+        let built = build_params(&model, &ctx, false, &SimpleStreamOptions::default()).unwrap();
         assert_eq!(built.request.tools.as_ref().unwrap()[0].name, "loader");
         assert_eq!(built.request.tools.as_ref().unwrap()[0].defer_loading, None);
         assert!(matches!(

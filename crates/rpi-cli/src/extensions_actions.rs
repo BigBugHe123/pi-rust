@@ -254,8 +254,29 @@ pub(crate) fn run_outcome_json(outcome: HarnessRunOutcome) -> serde_json::Value 
     }
 }
 
-/// Accept the SDK's flat action args and Pi-style nested options. Reject mixed
-/// forms instead of silently choosing one set of scheduling instructions.
+/// Read parameters belonging only to the invocation that starts a request.
+fn invocation_options(
+    args: &serde_json::Value,
+) -> Result<rpi_harness::types::PromptOptions, String> {
+    let flat = args.get("toolChoice");
+    let nested = match args.get("options") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(options)) => options.get("toolChoice"),
+        Some(_) => return Err("invocation options must be an object".into()),
+    };
+    if flat.is_some() && nested.is_some() {
+        return Err("put toolChoice either in options or at the top level, not both".into());
+    }
+    let tool_choice = flat
+        .or(nested)
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid toolChoice: {error}"))?
+        .flatten();
+    Ok(rpi_harness::types::PromptOptions { tool_choice })
+}
+
+/// Accept flat or nested scheduling options without persisting request parameters.
 fn send_message_options(args: &serde_json::Value) -> Result<SendMessageOptions, String> {
     let flat = args.get("triggerTurn").is_some() || args.get("deliverAs").is_some();
     let value = if let Some(options) = args.get("options").filter(|value| !value.is_null()) {
@@ -277,6 +298,10 @@ fn send_message_options(args: &serde_json::Value) -> Result<SendMessageOptions, 
         }
         serde_json::Value::Object(fields)
     };
+    let mut value = value;
+    if let Some(fields) = value.as_object_mut() {
+        fields.remove("toolChoice");
+    }
     serde_json::from_value(value).map_err(|error| format!("invalid send_message options: {error}"))
 }
 
@@ -436,10 +461,11 @@ impl RuntimeActionHost for HarnessActionHost {
 
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         let options = send_message_options(&args)?;
+        let prompt_options = invocation_options(&args)?;
         let message = send_message_input(&args)?;
         let lane = self.harness()?.lane("main");
         let result = lane
-            .send_message(message, options)
+            .send_message_with_options(message, options, prompt_options)
             .await
             .map_err(|e| e.to_string())?;
         Ok(send_message_result(result))
@@ -450,9 +476,10 @@ impl RuntimeActionHost for HarnessActionHost {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
         let text = arg_str(&args, "text")?;
+        let options = invocation_options(&args)?;
         let lane = self.harness()?.lane("main");
         let result = lane
-            .prompt_text(&text, Vec::new())
+            .prompt_text_with_options(&text, Vec::new(), options)
             .await
             .map_err(|e| e.to_string())?;
         Ok(run_outcome_json(result.outcome))
@@ -754,5 +781,89 @@ mod send_message_tests {
             }),
             serde_json::json!({"status":"queued", "entryId":"reserved", "deliverAs":"nextTurn"})
         );
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use super::*;
+    use rpi_ai::types::ToolChoice;
+    struct Capture(std::sync::Mutex<Vec<Option<ToolChoice>>>);
+    impl rpi_ai::ProviderHooks for Capture {
+        fn before_request(
+            &self,
+            _: &rpi_ai::Model,
+            _: &rpi_ai::types::Context,
+            options: &rpi_ai::SimpleStreamOptions,
+        ) -> Option<rpi_ai::SimpleStreamOptionsPatch> {
+            self.0.lock().unwrap().push(options.tool_choice.clone());
+            None
+        }
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn plugin_tool_choice_is_passed_on_invocation_only() {
+        let provider = rpi_ai::providers::faux::FauxProvider::new(
+            rpi_ai::providers::faux::FauxScript::new()
+                .with_text("selected")
+                .with_text("normal")
+                .with_text("send message"),
+        );
+        let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+        let mut model = provider.default_model().clone();
+        model.api = rpi_ai::types::Api::OpenaiResponses;
+        let harness = Arc::new(
+            AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+                model,
+                models: vec![provider],
+                provider_hooks: Some(capture.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap(),
+        );
+        let (host, cell) = HarnessActionHost::new_empty(
+            vec![],
+            PathBuf::from("."),
+            Handle::current(),
+            BTreeMap::new(),
+            rpi_extensions::ToolCallContext::new("."),
+        );
+        HarnessActionHost::set_harness(&cell, harness.clone());
+        let native = serde_json::json!({"type":"mcp","server_label":"docs","name":"search"});
+        let selected: ToolChoice = serde_json::from_value(native.clone()).unwrap();
+        host.send_user_message(serde_json::json!({"text":"selected", "toolChoice":native}))
+            .await
+            .unwrap();
+        host.send_user_message(serde_json::json!({"text":"normal"}))
+            .await
+            .unwrap();
+        host.send_message(serde_json::json!({"text":"send message", "options":{"triggerTurn":true,"toolChoice":"required"}})).await.unwrap();
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            vec![
+                Some(selected),
+                None,
+                Some(serde_json::from_value(serde_json::json!("required")).unwrap())
+            ]
+        );
+        assert!(host
+            .send_message(serde_json::json!({"text":"append", "toolChoice":"required"}))
+            .await
+            .is_err());
+        assert!(host
+            .send_user_message(serde_json::json!({"text":"bad", "toolChoice":"invalid"}))
+            .await
+            .is_err());
+        assert!(invocation_options(
+            &serde_json::json!({"toolChoice":"auto","options":{"toolChoice":"none"}})
+        )
+        .is_err());
+        for options in [
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!("required"),
+        ] {
+            assert!(invocation_options(&serde_json::json!({"options":options})).is_err());
+        }
     }
 }

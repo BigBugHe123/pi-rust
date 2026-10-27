@@ -22,6 +22,8 @@ pub enum Command {
     Prompt {
         #[serde(alias = "content", alias = "prompt")]
         message: String,
+        #[serde(default, rename = "toolChoice")]
+        tool_choice: Option<rpi_ai::types::ToolChoice>,
     },
     Abort,
     GetState,
@@ -307,7 +309,7 @@ mod tests {
             }))
             .unwrap();
             assert!(
-                matches!(request.command, Command::Prompt { message } if message == "legacy text")
+                matches!(request.command, Command::Prompt { message, .. } if message == "legacy text")
             );
         }
     }

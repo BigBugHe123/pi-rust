@@ -83,8 +83,9 @@ struct Request {
     options: serde_json::Value,
 }
 
-fn options(value: &serde_json::Value) -> SimpleStreamOptions {
+fn options(value: &serde_json::Value) -> Result<SimpleStreamOptions, serde_json::Error> {
     let mut options = SimpleStreamOptions::default();
+    options.tool_choice = serde_json::from_value(value["toolChoice"].clone())?;
     options.api_key = value["apiKey"].as_str().map(str::to_string);
     options.timeout = value["timeoutMs"].as_u64().map(Duration::from_millis);
     options.stream_idle_timeout = value["streamIdleTimeoutMs"]
@@ -106,7 +107,7 @@ fn options(value: &serde_json::Value) -> SimpleStreamOptions {
         Some("Long") => rpi_ai::CacheRetention::Long,
         _ => rpi_ai::CacheRetention::Short,
     };
-    options
+    Ok(options)
 }
 
 /// Compare every field without constructing a candidate message or JSON tree.
@@ -312,7 +313,9 @@ pub unsafe fn drive(
         let Ok(request) = serde_json::from_str::<Request>(unsafe { request.as_str() }) else {
             return 2;
         };
-        let options = options(&request.options);
+        let Ok(options) = options(&request.options) else {
+            return 2;
+        };
         let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -523,12 +526,61 @@ mod tests {
         assert_eq!(message.stop_reason, StopReason::Aborted);
     }
     #[test]
+    fn tool_choice_survives_sdk_provider_options_parsing() {
+        for value in [
+            serde_json::json!("auto"),
+            serde_json::json!("none"),
+            serde_json::json!("required"),
+            serde_json::json!({"name":"read"}),
+            serde_json::json!({"type":"allowed_tools","mode":"auto","tools":[{"name":"read"},{"name":"bash"}]}),
+            serde_json::json!({"type":"allowed_tools","allowed_tools":{"mode":"required","tools":[{"type":"function","function":{"name":"read"}}]}}),
+            serde_json::json!({"type":"function","namespace":"workspace","name":"read"}),
+            serde_json::json!({"type":"mcp","server_label":"docs","name":"search"}),
+        ] {
+            let parsed = options(&serde_json::json!({"toolChoice":value})).unwrap();
+            assert_eq!(
+                serde_json::to_value(parsed.tool_choice.unwrap()).unwrap(),
+                value
+            );
+        }
+        assert!(options(&serde_json::json!({}))
+            .unwrap()
+            .tool_choice
+            .is_none());
+        assert!(options(&serde_json::json!({"toolChoice":null}))
+            .unwrap()
+            .tool_choice
+            .is_none());
+        assert!(options(&serde_json::json!({"toolChoice":"invalid"})).is_err());
+    }
+
+    #[test]
+    fn tool_choice_invalid_payload_rejects_abi_request() {
+        let mut value: serde_json::Value = serde_json::from_str(&request()).unwrap();
+        value["options"]["toolChoice"] = serde_json::json!(42);
+        let encoded = value.to_string();
+        let mut out = StbString::empty();
+        let code = unsafe {
+            drive(
+                factory,
+                StbStringRef::from_str(&encoded),
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(code, 2);
+    }
+
+    #[test]
     fn options_preserve_provider_controls() {
         let options = options(
             &serde_json::json!({"apiKey":"key","timeoutMs":42,"streamIdleTimeoutMs":11,
             "maxRetries":3,"maxRetryDelayMs":17,"reasoning":"Xhigh","maxTokens":80,
             "headers":{"x-custom":"value"},"cacheRetention":"Long","sessionId":"s"}),
-        );
+        )
+        .unwrap();
         assert_eq!(options.api_key.as_deref(), Some("key"));
         assert_eq!(options.timeout, Some(Duration::from_millis(42)));
         assert_eq!(options.stream_idle_timeout, Some(Duration::from_millis(11)));

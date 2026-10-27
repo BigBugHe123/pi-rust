@@ -1885,6 +1885,10 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
             }
         }
     }
+    if let Some(choice) = &opts.tool_choice {
+        body["tool_choice"] =
+            choice.openai_value(true, |name| grammar_tool_properties.contains_key(name));
+    }
     body
 }
 
@@ -2482,6 +2486,99 @@ mod tests {
         TextContentType, ToolResultMessage, ToolResultRole,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn tool_choice_native_objects_reach_request_unchanged() {
+        for value in [
+            json!({"type":"function","name":"read"}),
+            json!({"type":"function","name":"read","namespace":"workspace"}),
+            json!({"type":"custom","name":"run_grammar"}),
+            json!({"type":"mcp","server_label":"docs","name":"search"}),
+            json!({"type":"web_search"}),
+            json!({"type":"web_search_preview"}),
+            json!({"type":"file_search"}),
+            json!({"type":"code_interpreter"}),
+            json!({"type":"computer"}),
+            json!({"type":"computer_use_preview"}),
+            json!({"type":"image_generation"}),
+            json!({"type":"apply_patch"}),
+            json!({"type":"shell"}),
+            json!({"type":"tool_search"}),
+            json!({"type":"allowed_tools","mode":"auto","tools":[{"type":"function","name":"read","namespace":"workspace"},{"type":"custom","name":"run_grammar"},{"type":"mcp","server_label":"docs"},{"type":"web_search"}]}),
+        ] {
+            let choice: crate::types::ToolChoice = serde_json::from_value(value.clone()).unwrap();
+            assert!(choice.validate_for_api(&model().api).is_ok());
+            assert_eq!(serde_json::to_value(&choice).unwrap(), value);
+            let opts = SimpleStreamOptions {
+                tool_choice: Some(choice),
+                ..Default::default()
+            };
+            let request = build_request(&model(), &Context::default(), &opts);
+            assert_eq!(request["tool_choice"], value);
+        }
+    }
+
+    #[test]
+    fn tool_choice_group_preserves_tools_and_encodes_subset() {
+        let ctx = Context {
+            tools: ["read", "bash", "write"]
+                .into_iter()
+                .map(|name| Tool {
+                    name: name.into(),
+                    description: String::new(),
+                    parameters: crate::types::Schema::empty_object(),
+                    constrained_sampling: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        for mode in ["auto", "required"] {
+            let opts = SimpleStreamOptions { tool_choice:Some(serde_json::from_value(json!({"type":"allowed_tools","mode":mode,"tools":[{"name":"read"},{"name":"bash"}]})).unwrap()), ..Default::default() };
+            let request = build_request(&model(), &ctx, &opts);
+            assert_eq!(request["tools"].as_array().unwrap().len(), 3);
+            assert_eq!(
+                request["tool_choice"],
+                json!({"type":"allowed_tools","mode":mode,"tools":[{"type":"function","name":"read"},{"type":"function","name":"bash"}]})
+            );
+            assert_eq!(ctx.tools.len(), 3);
+        }
+    }
+
+    #[test]
+    fn tool_choice_group_identifies_custom_grammar_tools() {
+        let ctx = Context {
+            tools: vec![grammar_tool()],
+            ..Default::default()
+        };
+        let opts = SimpleStreamOptions { tool_choice:Some(serde_json::from_value(json!({"type":"allowed_tools","mode":"required","tools":[{"name":"run_grammar"}]})).unwrap()), ..Default::default() };
+        let request = build_request(&grammar_model(), &ctx, &opts);
+        assert_eq!(
+            request["tool_choice"]["tools"][0],
+            json!({"type":"custom","name":"run_grammar"})
+        );
+    }
+
+    #[test]
+    fn tool_choice_reaches_request() {
+        use crate::types::{ToolChoice, ToolChoiceMode};
+        let ctx = Context::default();
+        let mut opts = SimpleStreamOptions::default();
+        assert!(build_request(&model(), &ctx, &opts)
+            .get("tool_choice")
+            .is_none());
+        opts.tool_choice = Some(ToolChoice::Mode(ToolChoiceMode::Required));
+        assert_eq!(
+            build_request(&model(), &ctx, &opts)["tool_choice"],
+            "required"
+        );
+        opts.tool_choice = Some(ToolChoice::Tool {
+            name: "read".into(),
+        });
+        assert_eq!(
+            build_request(&model(), &ctx, &opts)["tool_choice"],
+            serde_json::json!({"type":"function","name":"read"})
+        );
+    }
 
     fn model() -> Model {
         Model::new(

@@ -80,8 +80,8 @@ use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
 use crate::types::{
     AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
-    DrivingMode, HarnessTool, HarnessToolExecution, MessageDelivery, PromptTemplate, RetryPolicy,
-    SendMessageOptions, Skill,
+    DrivingMode, HarnessTool, HarnessToolExecution, MessageDelivery, PromptOptions, PromptTemplate,
+    RetryPolicy, SendMessageOptions, Skill,
 };
 use crate::watcher::{watch_listener, HarnessWatcher};
 
@@ -348,6 +348,12 @@ pub trait AgentLane: Send + Sync {
         text: &str,
         images: Vec<rpi_ai::types::ImageContent>,
     ) -> HarnessResult<RunResult>;
+    async fn prompt_text_with_options(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+        options: PromptOptions,
+    ) -> HarnessResult<RunResult>;
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult>;
     /// Send using Pi's `triggerTurn`/`deliverAs` semantics. Active-run deliveries
     /// enqueue immediately rather than waiting for the executing tool to finish.
@@ -355,6 +361,12 @@ pub trait AgentLane: Send + Sync {
         &self,
         message: AgentMessage,
         options: SendMessageOptions,
+    ) -> HarnessResult<SendMessageResult>;
+    async fn send_message_with_options(
+        &self,
+        message: AgentMessage,
+        delivery: SendMessageOptions,
+        options: PromptOptions,
     ) -> HarnessResult<SendMessageResult>;
     async fn prompt_messages(&self, messages: Vec<AgentMessage>) -> HarnessResult<RunResult>;
     async fn skill(
@@ -1045,9 +1057,15 @@ impl AgentHarness {
         .await;
         // An empty prompt is exactly a continuation: the loop's next action is the
         // provider call the interrupted run never reached.
-        self.run_core_with_admission(Vec::new(), false, admission, Some(pending))
-            .await
-            .map(Some)
+        self.run_core_with_admission(
+            Vec::new(),
+            false,
+            admission,
+            Some(pending),
+            PromptOptions::default(),
+        )
+        .await
+        .map(Some)
     }
 
     /// Record the user-visible "why is a run starting by itself" notice.
@@ -1222,6 +1240,17 @@ impl AgentHarness {
         message: AgentMessage,
         options: SendMessageOptions,
     ) -> HarnessResult<SendMessageResult> {
+        self.send_message_with_options(message, options, PromptOptions::default())
+            .await
+    }
+
+    pub async fn send_message_with_options(
+        &self,
+        message: AgentMessage,
+        options: SendMessageOptions,
+        prompt_options: PromptOptions,
+    ) -> HarnessResult<SendMessageResult> {
+        self.validate_prompt_options(&prompt_options)?;
         let message = normalize_user_images(message).await?;
         let gate = self.message_writes.lock().await;
         let active = {
@@ -1234,6 +1263,15 @@ impl AgentHarness {
                 .as_ref()
                 .is_some_and(|run| run.lane == self.lane)
         };
+        if prompt_options.tool_choice.is_some()
+            && (active
+                || options.trigger_turn != Some(true)
+                || options.deliver_as == MessageDelivery::NextTurn)
+        {
+            return Err(HarnessError::Agent {
+                message: "toolChoice requires an invocation that starts a new run".into(),
+            });
+        }
         let queue = match options.deliver_as {
             MessageDelivery::NextTurn => Some(QueueKind::NextRun),
             MessageDelivery::FollowUp if active && options.trigger_turn != Some(false) => {
@@ -1257,7 +1295,7 @@ impl AgentHarness {
             let admission = self.acquire_run_locked(OperationKind::Run)?;
             drop(gate);
             return self
-                .run_core_with_admission(vec![message], false, admission, None)
+                .run_core_with_admission(vec![message], false, admission, None, prompt_options)
                 .await
                 .map(SendMessageResult::Run);
         }
@@ -2985,6 +3023,25 @@ impl AgentHarness {
                                 patch.apply(&mut opts);
                             }
                         }
+                        if let Some(choice) = &opts.tool_choice {
+                            if let Err(error) = choice.validate_for_api(&model.api) {
+                                let (mut producer, stream) =
+                                    rpi_ai::event_stream::create_assistant_message_event_stream();
+                                let _ =
+                                    producer.push(rpi_ai::types::AssistantMessageEvent::Error {
+                                        reason: rpi_ai::types::ErrorReason::Error,
+                                        error: AssistantMessage::terminal(
+                                            model.api.clone(),
+                                            &model.provider,
+                                            &model.id,
+                                            StopReason::Error,
+                                            error,
+                                            0,
+                                        ),
+                                    });
+                                return stream;
+                            }
+                        }
                         tokio::task::block_in_place(|| {
                             Handle::current()
                                 .block_on(async move { p.stream_simple(&model, &ctx, &opts).await })
@@ -3599,11 +3656,34 @@ impl AgentHarness {
 
     /// The core run loop shared by all prompt overloads + skill + template.
     async fn run_core(&self, prompts: Vec<AgentMessage>) -> HarnessResult<RunResult> {
+        self.run_core_with_options(prompts, PromptOptions::default())
+            .await
+    }
+
+    fn validate_prompt_options(&self, options: &PromptOptions) -> HarnessResult<()> {
+        if let Some(choice) = &options.tool_choice {
+            let inner = self.inner.lock().unwrap();
+            choice
+                .validate_for_api(&inner.model.api)
+                .and_then(|_| choice.validate(&inner.active_tool_names))
+                .map_err(|message| HarnessError::Agent { message })?;
+        }
+        Ok(())
+    }
+
+    async fn run_core_with_options(
+        &self,
+        prompts: Vec<AgentMessage>,
+        options: PromptOptions,
+    ) -> HarnessResult<RunResult> {
+        self.validate_prompt_options(&options)?;
         let mut normalized = Vec::with_capacity(prompts.len());
         for prompt in prompts {
             normalized.push(normalize_user_images(prompt).await?);
         }
-        self.run_core_with_entry(normalized, false).await
+        let admission = self.acquire_run(OperationKind::Run).await?;
+        self.run_core_with_admission(normalized, false, admission, None, options)
+            .await
     }
 
     /// Continue a run from the assistant message at the branch tip.
@@ -3621,8 +3701,14 @@ impl AgentHarness {
         from_assistant: bool,
     ) -> HarnessResult<RunResult> {
         let admission = self.acquire_run(OperationKind::Run).await?;
-        self.run_core_with_admission(prompts, from_assistant, admission, None)
-            .await
+        self.run_core_with_admission(
+            prompts,
+            from_assistant,
+            admission,
+            None,
+            PromptOptions::default(),
+        )
+        .await
     }
 
     async fn run_core_with_admission(
@@ -3631,9 +3717,11 @@ impl AgentHarness {
         from_assistant: bool,
         admission: (String, CancellationToken, Arc<tokio::sync::Notify>),
         resume: Option<PendingResume>,
+        prompt_options: PromptOptions,
     ) -> HarnessResult<RunResult> {
         let scope = self.inner.lock().unwrap().execution_scope.clone();
-        let run = self.run_admitted_inner(prompts, from_assistant, admission, resume);
+        let run =
+            self.run_admitted_inner(prompts, from_assistant, admission, resume, prompt_options);
         match scope {
             Some(scope) => scope.run(run).await,
             None => run.await,
@@ -3646,6 +3734,7 @@ impl AgentHarness {
         from_assistant: bool,
         admission: (String, CancellationToken, Arc<tokio::sync::Notify>),
         resume: Option<PendingResume>,
+        prompt_options: PromptOptions,
     ) -> HarnessResult<RunResult> {
         let (run_id, signal, _idle) = admission;
         let _run_lease = ActiveRunLease {
@@ -4095,6 +4184,7 @@ impl AgentHarness {
             before_tool_call: snap.before_tool_call.clone(),
             after_tool_call: snap.after_tool_call.clone(),
             tool_execution: snap.tool_execution.to_agent_mode(),
+            initial_request: rpi_agent::InitialRequestOptions::new(prompt_options.tool_choice),
             thinking_level: snap.thinking_level,
             api_key: None,
             timeout: snap.stream_options.timeout,
@@ -4700,10 +4790,29 @@ impl AgentLane for AgentHarness {
             .map_err(session_to_harness_err)
     }
 
+    async fn send_message_with_options(
+        &self,
+        message: AgentMessage,
+        delivery: SendMessageOptions,
+        options: PromptOptions,
+    ) -> HarnessResult<SendMessageResult> {
+        AgentHarness::send_message_with_options(self, message, delivery, options).await
+    }
+
     async fn prompt_text(
         &self,
         text: &str,
         images: Vec<rpi_ai::types::ImageContent>,
+    ) -> HarnessResult<RunResult> {
+        self.prompt_text_with_options(text, images, PromptOptions::default())
+            .await
+    }
+
+    async fn prompt_text_with_options(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+        options: PromptOptions,
     ) -> HarnessResult<RunResult> {
         let content = if images.is_empty() {
             UserContent::Text(text.to_string())
@@ -4716,7 +4825,7 @@ impl AgentLane for AgentHarness {
             UserContent::Blocks(blocks)
         };
         let message = AgentMessage::User(UserMessage::new(content, now_ms()));
-        self.run_core(vec![message]).await
+        self.run_core_with_options(vec![message], options).await
     }
 
     async fn prompt_message(&self, message: AgentMessage) -> HarnessResult<RunResult> {
@@ -5310,6 +5419,28 @@ impl AgentLane for LaneHandle {
             .map_err(session_to_harness_err)
     }
 
+    async fn send_message_with_options(
+        &self,
+        message: AgentMessage,
+        delivery: SendMessageOptions,
+        options: PromptOptions,
+    ) -> HarnessResult<SendMessageResult> {
+        self.runner()
+            .send_message_with_options(message, delivery, options)
+            .await
+    }
+
+    async fn prompt_text_with_options(
+        &self,
+        text: &str,
+        images: Vec<rpi_ai::types::ImageContent>,
+        options: PromptOptions,
+    ) -> HarnessResult<RunResult> {
+        self.runner()
+            .prompt_text_with_options(text, images, options)
+            .await
+    }
+
     async fn prompt_text(
         &self,
         text: &str,
@@ -5801,6 +5932,115 @@ mod session_switch_tests {
             entry_transforms: Vec::new(),
             provider_hooks: None,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_choice_only_applies_to_first_response_and_its_retry() {
+        use rpi_ai::providers::faux::{FauxProvider, FauxScript, FauxStep};
+        use rpi_ai::types::{Api, ToolChoice, ToolChoiceMode};
+        struct Capture(Mutex<Vec<Option<ToolChoice>>>);
+        impl rpi_ai::ProviderHooks for Capture {
+            fn before_request(
+                &self,
+                _: &Model,
+                ctx: &rpi_ai::types::Context,
+                options: &rpi_ai::SimpleStreamOptions,
+            ) -> Option<rpi_ai::SimpleStreamOptionsPatch> {
+                let mut calls = self.0.lock().unwrap();
+                if calls.len() == 2 {
+                    assert!(ctx
+                        .messages
+                        .iter()
+                        .any(|message| matches!(message, rpi_ai::types::Message::ToolResult(_))));
+                }
+                calls.push(options.tool_choice.clone());
+                None
+            }
+        }
+        let script = FauxScript::new().with_tokens_per_second(0.0);
+        script.set_responses(vec![
+            FauxStep::message(AssistantMessage::terminal(
+                Api::Faux,
+                "faux",
+                "faux-1",
+                StopReason::Error,
+                "429 Too Many Requests",
+                0,
+            )),
+            FauxStep::tool_call(
+                "write",
+                serde_json::json!({"path":"result.txt","content":"done"}),
+            ),
+            FauxStep::text("finished"),
+            FauxStep::text("ordinary conversation"),
+        ]);
+        let provider = FauxProvider::new(script);
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        let env = Arc::new(rpi_tools::InMemoryExecutionEnv::new());
+        let mut options = opts();
+        options.model = provider.default_model().clone();
+        options.models = vec![provider];
+        options.active_tool_names = vec!["write".into()];
+        options.tools = vec![HarnessTool::new(rpi_tools::create_write_tool(
+            &rpi_tools::ExecutionToolContext::new(env.clone(), Some(env)),
+        ))];
+        options.provider_hooks = Some(capture.clone());
+        options.compaction.enabled = false;
+        options.retry.enabled = true;
+        options.retry.base_delay_ms = 0;
+        let harness = AgentHarness::create(options).await.unwrap();
+        let choice = ToolChoice::Mode(ToolChoiceMode::Required);
+        let result = harness
+            .prompt_text_with_options(
+                "write a result",
+                vec![],
+                PromptOptions {
+                    tool_choice: Some(choice.clone()),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.outcome,
+            HarnessRunOutcome::Completed { .. }
+        ));
+        let result = harness.prompt_text("hello", vec![]).await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            HarnessRunOutcome::Completed { .. }
+        ));
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            vec![Some(choice.clone()), Some(choice), None, None]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_choice_invalid_invocation_does_not_change_the_next_call() {
+        let provider = rpi_ai::providers::faux::FauxProvider::new(
+            rpi_ai::providers::faux::FauxScript::new().with_text("normal"),
+        );
+        let mut options = opts();
+        options.model = provider.default_model().clone();
+        options.models = vec![provider];
+        let harness = AgentHarness::create(options).await.unwrap();
+        assert!(harness
+            .prompt_text_with_options(
+                "bad",
+                vec![],
+                PromptOptions {
+                    tool_choice: Some(
+                        serde_json::from_value(serde_json::json!({"name":"missing"})).unwrap()
+                    )
+                }
+            )
+            .await
+            .is_err());
+        let result = harness.prompt_text("normal", vec![]).await.unwrap();
+        assert!(matches!(
+            result.outcome,
+            HarnessRunOutcome::Completed { .. }
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

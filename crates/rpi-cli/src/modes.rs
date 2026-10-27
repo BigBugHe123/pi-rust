@@ -524,6 +524,17 @@ where
             "prompt" | "resume_pending" | "compact" => {
                 let resume = kind == "resume_pending";
                 let compact = kind == "compact";
+                let prompt_options = match rpc_invocation_options(&msg, kind == "prompt") {
+                    Ok(options) => options,
+                    Err(error) => {
+                        write_line(
+                            &stdout,
+                            &rpc_protocol::response(Some(id), &kind, Err(error)),
+                        )
+                        .await;
+                        continue;
+                    }
+                };
                 if run_active.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     write_line(
                         &stdout,
@@ -600,7 +611,8 @@ where
                     } else if resume {
                         rpc_resume_cancellable(&lane_task, cancel_task).await
                     } else {
-                        rpc_prompt_cancellable(&lane_task, &content, cancel_task).await
+                        rpc_prompt_cancellable(&lane_task, &content, prompt_options, cancel_task)
+                            .await
                     };
                     if let Some(flush) = flush_events {
                         let (done, drained) = tokio::sync::oneshot::channel();
@@ -737,9 +749,10 @@ async fn drain_rpc_events(
 async fn rpc_prompt_cancellable(
     lane: &Arc<dyn AgentLane>,
     content: &str,
+    options: rpi_harness::types::PromptOptions,
     cancel: tokio_util::sync::CancellationToken,
 ) -> Result<serde_json::Value, String> {
-    let prompt = rpc_prompt_text(lane, content);
+    let prompt = rpc_prompt_text(lane, content, options);
     tokio::pin!(prompt);
     tokio::select! {
         biased;
@@ -881,12 +894,29 @@ fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>
     }
 }
 
+fn rpc_invocation_options(
+    msg: &serde_json::Value,
+    is_prompt: bool,
+) -> Result<rpi_harness::types::PromptOptions, String> {
+    if !is_prompt && msg.get("toolChoice").is_some() {
+        return Err("toolChoice is only accepted on prompt".into());
+    }
+    let tool_choice: Option<rpi_ai::types::ToolChoice> = serde_json::from_value(
+        msg.get("toolChoice")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|error| format!("invalid toolChoice: {error}"))?;
+    Ok(rpi_harness::types::PromptOptions { tool_choice })
+}
+
 async fn rpc_prompt_text(
     lane: &Arc<dyn AgentLane>,
     content: &str,
+    options: rpi_harness::types::PromptOptions,
 ) -> Result<serde_json::Value, String> {
     let result = lane
-        .prompt_text(content, Vec::new())
+        .prompt_text_with_options(content, Vec::new(), options)
         .await
         .map_err(|e| e.to_string())?;
     let (outcome, final_text, error) = rpc_outcome_str(&result.outcome);
@@ -2114,6 +2144,75 @@ mod tests {
             message["type"] == "agent_settled" && message["outcome"] == "completed"
         }));
         assert!(!ui.is_attached());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rpc_tool_choice_is_passed_on_prompt_only() {
+        use tokio::io::AsyncWriteExt;
+        struct Capture(Mutex<Vec<Option<rpi_ai::types::ToolChoice>>>);
+        impl rpi_ai::ProviderHooks for Capture {
+            fn before_request(
+                &self,
+                _: &rpi_ai::Model,
+                _: &rpi_ai::types::Context,
+                options: &rpi_ai::SimpleStreamOptions,
+            ) -> Option<rpi_ai::SimpleStreamOptionsPatch> {
+                self.0.lock().unwrap().push(options.tool_choice.clone());
+                None
+            }
+        }
+        let provider = rpi_ai::providers::faux::FauxProvider::new(
+            rpi_ai::providers::faux::FauxScript::new()
+                .with_text("selected")
+                .with_text("normal"),
+        );
+        let capture = Arc::new(Capture(Mutex::new(Vec::new())));
+        let mut model = provider.default_model().clone();
+        model.api = rpi_ai::types::Api::OpenaiResponses;
+        let harness = AgentHarness::create(rpi_harness::types::AgentHarnessOptions {
+            model,
+            models: vec![provider],
+            provider_hooks: Some(capture.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let (mut client, output, task) =
+            start_test_rpc(harness, rpi_extensions::UiDialogMailbox::new());
+        client.write_all(b"{\"type\":\"prompt\",\"id\":1,\"message\":\"selected\",\"toolChoice\":{\"type\":\"mcp\",\"server_label\":\"docs\",\"name\":\"search\"}}\n").await.unwrap();
+        output
+            .wait_for(|message| message["type"] == "agent_settled")
+            .await;
+        client
+            .write_all(b"{\"type\":\"prompt\",\"id\":2,\"message\":\"normal\"}\n")
+            .await
+            .unwrap();
+        client.shutdown().await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        for id in [1, 2] {
+            assert!(output
+                .messages()
+                .iter()
+                .any(|message| message["id"] == id && message["success"] == true));
+        }
+        assert_eq!(
+            *capture.0.lock().unwrap(),
+            vec![
+                Some(
+                    serde_json::from_value(
+                        serde_json::json!({"type":"mcp","server_label":"docs","name":"search"})
+                    )
+                    .unwrap()
+                ),
+                None
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

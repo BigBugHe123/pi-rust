@@ -143,6 +143,15 @@ to a fallible `ContextFactory` and propagate the result with `?`.
 `export_provider!` exports a single-provider plugin from a Rust factory. For
 multiple providers, keep one `export_plugin!` entrypoint and use
 `provider::register` and `provider::drive` for each provider instead.
+
+The host request envelope carries per-request selection in `options.toolChoice`.
+The SDK reconstructs `SimpleStreamOptions::tool_choice` without dropping native
+selector fields and rejects malformed values. Provider wrappers should clone or
+forward the complete options to the protocol implementation; they do not need
+vendor-specific tool-selection defaults or their own selection state. Existing
+plugin binaries must be rebuilt against a released SDK/AI version containing this
+support; updating the host alone cannot update a plugin's compiled-in parser.
+
 The bridge forwards streaming events, honors host cancellation and owns a
 per-request runtime, so no worker survives plugin unloading.
 

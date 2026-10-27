@@ -1231,3 +1231,89 @@ impl Serialize for AssistantMessageEvent {
         }
     }
 }
+
+/// Tool selection for one model request. Omit to use the provider default.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum ToolChoice {
+    Mode(ToolChoiceMode),
+    Tool {
+        name: String,
+    },
+    AllowedTools(AllowedToolsChoice),
+    /// Native API object. Fields are retained verbatim for the selected protocol.
+    Native(NativeToolChoice),
+}
+
+/// Provider-independent tool-selection modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoiceMode {
+    Auto,
+    None,
+    Required,
+}
+
+/// A nonempty subset of currently active tools. Does not alter active tools.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedToolsChoice {
+    #[serde(rename = "type")]
+    pub kind: AllowedToolsType,
+    pub mode: AllowedToolsMode,
+    pub tools: Vec<ToolName>,
+}
+
+/// Discriminator for a portable group of named tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowedToolsType {
+    AllowedTools,
+}
+
+/// Whether a group permits a direct response or requires a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AllowedToolsMode {
+    Auto,
+    Required,
+}
+
+/// A locally registered tool referenced by its active name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolName {
+    pub name: String,
+}
+
+/// Native selector transport with an object/string-discriminator contract.
+/// Protocol semantics are checked at the provider boundary; the destination
+/// service validates its complete native schema and individual model support.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct NativeToolChoice(pub serde_json::Map<String, serde_json::Value>);
+
+impl<'de> Deserialize<'de> for NativeToolChoice {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let map = value
+            .as_object()
+            .ok_or_else(|| serde::de::Error::custom("native toolChoice must be an object"))?;
+        let native = Self(map.clone());
+        if native.kind().trim().is_empty() {
+            return Err(serde::de::Error::custom(
+                "native toolChoice requires a nonempty string `type`",
+            ));
+        }
+        Ok(native)
+    }
+}
+
+impl NativeToolChoice {
+    pub(crate) fn kind(&self) -> &str {
+        self.0
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    }
+}

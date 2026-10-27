@@ -144,3 +144,80 @@ provider / harness / session / extension 的全部本地构建——这是“客
   - 自包含（假服务端）：握手 + transcript 折叠、事件泵忽略响应帧、**token 认证三态**；
   - 真实服务端（env 门控）：`RPI_REMOTE_E2E_ADDR` + `RPI_REMOTE_E2E_TOKEN`
     驱动真实客户端跑一轮真实模型调用。
+
+## Tool choice
+
+Pass `toolChoice` on the invocation that starts the model request. It applies
+only to that invocation's first successful model response. A retry of a failed
+initial request retains the parameter. Tool execution, requests carrying tool
+results, follow-up processing and later user messages proceed normally without
+inheriting it. No tool-choice setting is stored in the harness or session.
+
+RPC uses the existing `prompt` command:
+
+```json
+{"type":"prompt","id":1,"message":"Read this file","toolChoice":{"name":"read"}}
+{"type":"prompt","id":2,"message":"Use a suitable tool","toolChoice":"required"}
+{"type":"prompt","id":3,"message":"Inspect the project","toolChoice":{"type":"allowed_tools","mode":"auto","tools":[{"name":"read"},{"name":"bash"}]}}
+{"type":"prompt","id":4,"message":"Continue normally"}
+```
+
+Plugins use `RuntimeActionId::SendUserMessage` with
+`{"text":"Read this file","toolChoice":{"name":"read"}}`.
+`RuntimeActionId::SendMessage` also accepts `toolChoice` when starting an idle
+run with `triggerTurn:true`:
+
+```json
+{"text":"Inspect the project","options":{"triggerTurn":true,"toolChoice":"required"}}
+```
+
+The option can be flat or nested in `options`, but must not be supplied in both
+places. A `SendMessage` that only appends or queues input does not start a model
+request and rejects `toolChoice`; it does not store it for a future request.
+
+Portable values are `"auto"`, `"none"`, `"required"`, `{"name":"read"}`, and
+`{"type":"allowed_tools","mode":"auto","tools":[{"name":"read"},{"name":"bash"}]}`.
+Group mode `auto` allows zero or more calls from the group. `required` requires
+one or more calls from the group, not every member. Named local tools must be
+active; groups must be nonempty with unique names. Invalid invocation parameters
+fail before starting a run. Omitting the field or passing `null` supplies no
+override for that invocation. The globally active tool list is unchanged.
+
+### Native objects
+
+For an OpenAI-protocol model, native selector objects are passed verbatim using
+the selected endpoint's shape. Routing uses `model.api`, including third-party
+OpenAI-compatible providers, Azure Responses and Codex Responses.
+
+Responses examples (values of `toolChoice`):
+
+```json
+{"type":"function","name":"read"}
+{"type":"custom","name":"run_grammar"}
+{"type":"function","namespace":"workspace","name":"read"}
+{"type":"mcp","server_label":"docs","name":"search"}
+{"type":"web_search"}
+{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"read"},{"type":"mcp","server_label":"docs"}]}
+```
+
+Chat Completions examples:
+
+```json
+{"type":"function","function":{"name":"read"}}
+{"type":"custom","custom":{"name":"run_grammar"}}
+{"type":"allowed_tools","allowed_tools":{"mode":"auto","tools":[{"type":"function","function":{"name":"read"}}]}}
+```
+
+Tool definitions must already be configured in the outgoing request; selecting
+a server tool does not register a tool or add an execution handler.
+
+Anthropic converts plain function selectors and function-only groups without
+namespaces. Its native `auto`, `none`, `any`, and `tool` objects (including
+`disable_parallel_tool_use`) are supported. OpenAI custom, MCP, built-in and
+namespaced selectors with no equivalent are rejected, without downgrading.
+The target service validates its native schema and individual model restrictions.
+`parallel_tool_calls` is a separate OpenAI request parameter.
+
+Native reference:
+[Responses](https://developers.openai.com/api/reference/python/resources/responses/methods/create),
+[Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).

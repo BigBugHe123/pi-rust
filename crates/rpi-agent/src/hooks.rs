@@ -90,6 +90,32 @@ pub type AfterToolCall = Arc<
         + Sync,
 >;
 
+/// Options for the first successful model response of one invocation.
+/// Clones share consumption only so retries of the same invocation retain the
+/// initial parameters. Create a fresh value for each new invocation.
+#[derive(Debug, Clone, Default)]
+pub struct InitialRequestOptions {
+    tool_choice: Arc<std::sync::Mutex<Option<rpi_ai::types::ToolChoice>>>,
+}
+
+impl InitialRequestOptions {
+    /// Scope a tool selector to the first response, including its failed retries.
+    pub fn new(tool_choice: Option<rpi_ai::types::ToolChoice>) -> Self {
+        Self {
+            tool_choice: Arc::new(std::sync::Mutex::new(tool_choice)),
+        }
+    }
+
+    pub(crate) fn response_received(&self, response: &rpi_ai::types::AssistantMessage) {
+        if response.stop_reason != rpi_ai::types::StopReason::Error {
+            self.tool_choice
+                .lock()
+                .expect("initial request options lock")
+                .take();
+        }
+    }
+}
+
 /// The config bundle handed to `run_agent_loop` / `run_agent_loop_continue`.
 ///
 /// An optional incremental converter for the common case where the context is
@@ -128,6 +154,8 @@ pub struct AgentLoopConfig {
     pub tool_execution: ToolExecutionMode,
 
     // ---- provider-options subset (forwarded into SimpleStreamOptions) ----
+    /// Invocation-local parameters consumed by the loop, independent of observers.
+    pub initial_request: InitialRequestOptions,
     pub thinking_level: ThinkingLevel,
     pub api_key: Option<String>,
     pub timeout: Option<Duration>,
@@ -181,6 +209,12 @@ impl std::fmt::Debug for AgentLoopConfig {
 impl AgentLoopConfig {
     pub fn to_stream_options(&self, api_key: Option<String>) -> SimpleStreamOptions {
         let mut opts = SimpleStreamOptions {
+            tool_choice: self
+                .initial_request
+                .tool_choice
+                .lock()
+                .expect("initial request options lock")
+                .clone(),
             api_key,
             timeout: self.timeout,
             stream_idle_timeout: self.stream_idle_timeout,

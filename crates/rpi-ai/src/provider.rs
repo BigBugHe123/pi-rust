@@ -3,6 +3,8 @@
 //! provider's wire format directly; it calls `stream_simple` and consumes the
 //! returned [`AssistantMessageEventStream`].
 
+mod tool_choice;
+
 use crate::event_stream::AssistantMessageEventStream;
 use crate::model::Model;
 use crate::types::{AssistantMessage, Context, DeferredHandle, ThinkingBudgets, ThinkingLevel};
@@ -32,6 +34,7 @@ pub enum CacheRetention {
 /// equivalent when it drives a real turn (M2).
 #[derive(Debug, Clone)]
 pub struct SimpleStreamOptions {
+    pub tool_choice: Option<crate::types::ToolChoice>,
     /// API key. A provider may fall back to an env var when `None` (M3 anthropic
     /// reads `ANTHROPIC_API_KEY`); faux ignores it.
     pub api_key: Option<String>,
@@ -79,6 +82,7 @@ pub struct SimpleStreamOptions {
 impl Default for SimpleStreamOptions {
     fn default() -> Self {
         Self {
+            tool_choice: None,
             api_key: None,
             timeout: Some(DEFAULT_LLM_API_TIMEOUT),
             stream_idle_timeout: Some(DEFAULT_STREAM_IDLE_TIMEOUT),
@@ -404,6 +408,7 @@ impl ContextPatch {
 /// a rpi-harness cycle.
 #[derive(Debug, Clone, Default)]
 pub struct SimpleStreamOptionsPatch {
+    pub tool_choice: Option<Option<crate::types::ToolChoice>>,
     pub timeout: Option<Option<Duration>>,
     /// Replace the idle timeout, reset its default with inner `None`, or disable with zero.
     pub stream_idle_timeout: Option<Option<Duration>>,
@@ -424,6 +429,9 @@ impl SimpleStreamOptionsPatch {
     /// outer `None` = leave the field; an explicit value replaces it; `None`
     /// inside a map entry deletes that key.
     pub fn apply(&self, opts: &mut SimpleStreamOptions) {
+        if let Some(choice) = &self.tool_choice {
+            opts.tool_choice = choice.clone();
+        }
         if let Some(v) = self.timeout {
             opts.timeout = v;
         }

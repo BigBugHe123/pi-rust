@@ -174,6 +174,7 @@ impl ProviderHooks for ExtensionProviderHooks {
             "metadata": opts.metadata,
             "maxTokens": opts.max_tokens,
             "temperature": opts.temperature,
+            "toolChoice": opts.tool_choice,
             // (B) the model-facing messages, so observers (e.g. rpi-langfuse)
             // can record the real generation input. `ctx` was previously
             // discarded entirely, which is why generation/trace input was

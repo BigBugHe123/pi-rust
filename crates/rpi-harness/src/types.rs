@@ -44,6 +44,15 @@ pub struct SendMessageOptions {
     pub deliver_as: MessageDelivery,
 }
 
+/// Parameters for one invocation. Tool selection applies only to its first
+/// successful model request; subsequent tool-result requests use normal options.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct PromptOptions {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<rpi_ai::types::ToolChoice>,
+}
+
 /// A skill loaded from a `SKILL.md` file or provided by an application. Mirrors
 /// TS `Skill`.
 ///

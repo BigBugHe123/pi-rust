@@ -266,7 +266,9 @@ pub unsafe fn drive_with_context(
         else {
             return 2;
         };
-        let options = super::options(&request.options);
+        let Ok(options) = super::options(&request.options) else {
+            return 2;
+        };
         let control = unsafe { control.as_ref() };
         let scoped = ProviderContext::new();
         let context = unsafe { context.cast::<ProviderContext>().as_ref() };
@@ -366,6 +368,43 @@ macro_rules! export_provider_with_context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_choice_is_forwarded_by_context_provider_driver() {
+        fn factory(
+            _: &ProviderContext,
+            _: &Model,
+            options: &SimpleStreamOptions,
+        ) -> Result<Arc<dyn Provider>, String> {
+            assert_eq!(
+                serde_json::to_value(&options.tool_choice).unwrap(),
+                serde_json::json!({"type":"mcp","server_label":"docs","name":"search"})
+            );
+            Ok(rpi_ai::providers::faux::FauxProvider::new(
+                rpi_ai::providers::faux::FauxScript::new().with_text("ok"),
+            ))
+        }
+        let context = ProviderContext::new();
+        let request = serde_json::json!({"model":Model::new("m","M",rpi_ai::Api::Faux,"fixture","http://localhost"),"context":rpi_ai::Context::new(vec![]),"options":{"toolChoice":{"type":"mcp","server_label":"docs","name":"search"}}}).to_string();
+        let mut out = StbString::empty();
+        let code = unsafe {
+            drive_with_context(
+                factory,
+                (&context as *const ProviderContext).cast_mut().cast(),
+                StbStringRef::from_str(&request),
+                None,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(code, 0);
+        let owned = unsafe {
+            crate::callbacks::OwnedString::from_raw(out, Some(crate::callbacks::free_string))
+        };
+        let message: AssistantMessage = serde_json::from_str(&owned.to_string_lossy()).unwrap();
+        assert_eq!(message.stop_reason, StopReason::Stop);
+    }
 
     #[test]
     fn repeated_requests_share_one_lazy_runtime_and_shutdown_rejects_work() {

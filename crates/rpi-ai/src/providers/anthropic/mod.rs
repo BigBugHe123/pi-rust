@@ -318,6 +318,9 @@ fn prepare_params(
     provider_key: &Option<String>,
     allow_env_api_key: bool,
 ) -> Result<PreparedParams, String> {
+    if let Some(choice) = &opts.tool_choice {
+        choice.validate_for_api(&model.api)?;
+    }
     // ---- resolve auth (assertRequestAuth) ----
     let resolved_key = resolve_api_key(provider_key, opts, allow_env_api_key);
     // TS `assertRequestAuth(model.provider, options?.apiKey, options?.headers)`
@@ -347,7 +350,7 @@ fn prepare_params(
             false,
             opts,
             std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() != Some("1"),
-        ),
+        )?,
         api_key_for_header,
     })
 }

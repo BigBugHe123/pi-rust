@@ -1054,7 +1054,11 @@ pub enum RuntimeActionId {
     /// details) or `text`. Options `triggerTurn` and `deliverAs` can be flat or
     /// nested under `options`. Default: idle append, active steer. Use explicit
     /// `triggerTurn: true` to start an idle run. `nextTurn` always defers.
+    /// A new idle run may include `toolChoice` (flat or in `options`) for its
+    /// first model response. Appending/queueing does not accept toolChoice.
     SendMessage = 0,
+    /// Args: {"text":"...", "toolChoice":...}; toolChoice applies to the first
+    /// model response of this invocation, not subsequent tool-result requests.
     SendUserMessage = 1,
     /// Append without starting a run. `{"customType": ..., "data": ...}` stores
     /// extension data; `{"message": ...}` queues context until the active turn

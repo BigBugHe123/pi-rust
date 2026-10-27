@@ -39,9 +39,10 @@ pub use provider::{
 };
 pub use schema::validate_tool_arguments;
 pub use types::{
-    Api, AssistantMessage, AssistantMessageEvent, Content, Context, DeferredHandle, DoneReason,
-    ErrorReason, ImageContent, InputModality, Message, ModelCost, ModelCostRates, ModelCostTier,
-    ProviderId, Schema, StopReason, TextContent, ThinkingBudgets, ThinkingContent, ThinkingLevel,
-    ThinkingLevelMap, Tool, ToolCall, ToolCallType, ToolResultMessage, Usage, UsageCost,
-    UserContent, UserMessage,
+    AllowedToolsChoice, AllowedToolsMode, AllowedToolsType, Api, AssistantMessage,
+    AssistantMessageEvent, Content, Context, DeferredHandle, DoneReason, ErrorReason, ImageContent,
+    InputModality, Message, ModelCost, ModelCostRates, ModelCostTier, NativeToolChoice, ProviderId,
+    Schema, StopReason, TextContent, ThinkingBudgets, ThinkingContent, ThinkingLevel,
+    ThinkingLevelMap, Tool, ToolCall, ToolCallType, ToolChoice, ToolChoiceMode, ToolName,
+    ToolResultMessage, Usage, UsageCost, UserContent, UserMessage,
 };

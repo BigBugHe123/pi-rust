@@ -408,3 +408,42 @@ async fn message_update_forwards_the_provider_snapshot_without_copying() {
         "expected at least the two text deltas to be checked, got {checked}"
     );
 }
+
+/// Request lifetimes must be controlled by the loop even when all events are ignored.
+#[tokio::test]
+async fn tool_choice_lifetime_does_not_depend_on_event_observers() {
+    struct DiscardEvents;
+    impl rpi_agent::AgentEmitter for DiscardEvents {
+        fn emit(&self, _: AgentEvent) -> futures::future::BoxFuture<'static, ()> {
+            Box::pin(async {})
+        }
+    }
+    let (tool, executed) = EchoTool::new();
+    let script = mock_stream_fn(vec![
+        assistant_tool_calls(
+            vec![("call-1", "echo", serde_json::json!({"value":"hello"}))],
+            StopReason::ToolUse,
+        ),
+        assistant_text("done", StopReason::Stop),
+    ]);
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = Arc::clone(&observed);
+    let stream = rpi_agent::stream_fn(move |model, context, options| {
+        captured.lock().unwrap().push(options.tool_choice.clone());
+        script(model, context, options)
+    });
+    let choice = rpi_ai::types::ToolChoice::Mode(rpi_ai::types::ToolChoiceMode::Required);
+    let mut config = base_config();
+    config.initial_request = rpi_agent::InitialRequestOptions::new(Some(choice.clone()));
+    rpi_agent::run_agent_loop(
+        vec![user_message("echo hello")],
+        context_with_tools(vec![Arc::new(tool)]),
+        config,
+        Arc::new(DiscardEvents),
+        stream,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*observed.lock().unwrap(), vec![Some(choice), None]);
+    assert_eq!(*executed.lock().unwrap(), ["hello"]);
+}
