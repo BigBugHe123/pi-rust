@@ -25,6 +25,15 @@ pub enum Command {
     },
     Abort,
     GetState,
+    /// List extension slash commands (name and description).
+    GetCommands,
+    /// Invoke an extension handler and return its JSON result as response data.
+    /// `command` accepts a registered name with or without a leading slash.
+    ExecuteCommand {
+        command: String,
+        #[serde(default)]
+        args: String,
+    },
     /// Read-only snapshot of the current branch's message entries.
     GetMessages {
         limit: Option<u64>,
@@ -108,6 +117,8 @@ pub enum Command {
 
 pub const SUPPORTED_COMMANDS: &[&str] = &[
     "get_state",
+    "get_commands",
+    "execute_command",
     "get_messages",
     "get_history",
     "get_session_branch",
@@ -193,6 +204,25 @@ pub fn model_descriptor(model: &rpi_ai::Model) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_commands_are_advertised_and_args_default_to_empty() {
+        for name in ["get_commands", "execute_command"] {
+            assert!(SUPPORTED_COMMANDS.contains(&name));
+        }
+        let request: Request = serde_json::from_value(json!({
+            "type": "execute_command", "command": "/example"
+        }))
+        .unwrap();
+        assert!(
+            matches!(request.command, Command::ExecuteCommand { command, args }
+            if command == "/example" && args.is_empty())
+        );
+        assert!(serde_json::from_value::<Request>(json!({
+            "type": "execute_command", "command": "example", "args": 42
+        }))
+        .is_err());
+    }
 
     #[test]
     fn ready_advertises_the_p0_contract() {

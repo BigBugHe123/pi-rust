@@ -319,6 +319,7 @@ where
     R: tokio::io::AsyncBufRead + Unpin,
     W: Write + Send + 'static,
 {
+    let mut command_tasks = Vec::new();
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     // One blocking writer owns stdout. Producers only enqueue bounded messages,
     // so pipe backpressure never blocks a Tokio worker on IO or a std mutex.
@@ -508,6 +509,25 @@ where
                 }
                 continue;
             }
+            "execute_command" => {
+                command_tasks.retain(|task: &tokio::task::JoinHandle<()>| !task.is_finished());
+                let snapshot = oauth_snapshot.clone();
+                let request = msg.clone();
+                let out = stdout.clone();
+                command_tasks.push(tokio::spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        rpc_execute_command(snapshot.as_deref(), &request)
+                    })
+                    .await
+                    .unwrap_or_else(|_| Err("command task failed".into()));
+                    write_line(
+                        &out,
+                        &rpc_protocol::response(Some(id), "execute_command", result.map(Some)),
+                    )
+                    .await;
+                }));
+                continue;
+            }
             "stop" => {
                 cancel_on_exit = true;
                 write_line(
@@ -661,6 +681,7 @@ where
                 .map(|_| serde_json::json!({"aborted": true}))
                 .map_err(|e| e.to_string()),
             "get_state" => Ok(rpc_get_state(&lane, harness).await),
+            "get_commands" => Ok(rpc_get_commands(oauth_snapshot.as_deref())),
             "get_messages" => rpc_get_messages(&lane, harness, &msg).await,
             "get_history" => rpc_get_history(&lane, harness, &msg).await,
             "get_session_branch" => rpc_get_session_branch(harness).await,
@@ -695,6 +716,9 @@ where
     if cancel_on_exit {
         run_cancel.cancel();
     }
+    for task in command_tasks {
+        let _ = task.await;
+    }
     let mut exit_code = 0;
     if let Some(task) = run_task {
         if let Err(error) = task.await {
@@ -717,6 +741,60 @@ where
         }
     }
     exit_code
+}
+
+fn rpc_get_commands(snapshot: Option<&rpi_extensions::RegistrySnapshot>) -> serde_json::Value {
+    let commands: Vec<_> = snapshot
+        .into_iter()
+        .flat_map(|s| s.commands())
+        .map(
+            |command| serde_json::json!({"name": command.name, "description": command.description}),
+        )
+        .collect();
+    serde_json::json!({"commands": commands})
+}
+
+fn rpc_execute_command(
+    snapshot: Option<&rpi_extensions::RegistrySnapshot>,
+    request: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let name = request
+        .get("command")
+        .and_then(|v| v.as_str())
+        .filter(|name| !name.trim_start_matches('/').is_empty())
+        .ok_or("command must be a non-empty string")?;
+    let args = match request.get("args") {
+        None => "",
+        Some(value) => value.as_str().ok_or("args must be a string")?,
+    };
+    let command = snapshot
+        .into_iter()
+        .flat_map(|s| s.commands())
+        .find(|c| c.name.trim_start_matches('/') == name.trim_start_matches('/'))
+        .ok_or_else(|| format!("unknown command: {name}"))?;
+    let input = serde_json::json!({"command": name, "args": args}).to_string();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut out = rpi_plugin_sdk::StbString::empty();
+        let rc = (command.handler)(
+            rpi_plugin_sdk::StbStringRef::from_str(&input),
+            &mut out,
+            command.user_data,
+        );
+        // SAFETY: the callback transfers its output using the host allocator,
+        // matching the TUI command invocation contract.
+        let out = unsafe {
+            rpi_plugin_sdk::callbacks::OwnedString::from_raw(
+                out,
+                Some(rpi_extensions::host_free_string),
+            )
+        };
+        if rc != 0 {
+            return Err(format!("command failed: {name} (code {rc})"));
+        }
+        serde_json::from_str(&out.to_string_lossy())
+            .map_err(|_| format!("command returned invalid JSON: {name}"))
+    }))
+    .unwrap_or_else(|_| Err(format!("command panicked: {name}")))
 }
 
 async fn drain_rpc_events(
@@ -1934,6 +2012,59 @@ mod tests {
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
     use rpi_harness::session::types::OperationError;
+
+    #[tokio::test]
+    async fn rpc_commands_list_and_execute_registered_handler() {
+        extern "C" fn echo(
+            input: rpi_plugin_sdk::StbStringRef,
+            out: *mut rpi_plugin_sdk::StbString,
+            _: *mut std::ffi::c_void,
+        ) -> i32 {
+            // SAFETY: the RPC invoker provides live input and output pointers.
+            unsafe {
+                *out = rpi_plugin_sdk::StbString::from_string(input.as_str().to_owned());
+            }
+            0
+        }
+        let mut registry = rpi_extensions::ExtensionRegistry::new();
+        registry.register_command(
+            "echo".into(),
+            "Echo arguments".into(),
+            echo,
+            std::ptr::null_mut(),
+        );
+        let harness = AgentHarness::create(Default::default()).await.unwrap();
+        let output = RpcOutput::default();
+        let input = concat!(
+            "{\"id\":1,\"type\":\"get_commands\"}\n",
+            "{\"id\":2,\"type\":\"execute_command\",\"command\":\"/echo\",\"args\":\"hello world\"}\n",
+            "{\"id\":3,\"type\":\"execute_command\",\"command\":\"missing\"}\n",
+            "{\"id\":4,\"type\":\"execute_command\",\"command\":\"echo\",\"args\":42}\n"
+        );
+        assert_eq!(
+            rpc_with_io(
+                &harness,
+                None,
+                vec![],
+                rpi_extensions::UiDialogMailbox::new(),
+                Some(Arc::new(registry.snapshot())),
+                tokio::io::BufReader::new(input.as_bytes()),
+                output.clone()
+            )
+            .await,
+            0
+        );
+        let messages = output.messages();
+        let response = |id| messages.iter().find(|m| m["id"] == id).unwrap();
+        assert_eq!(response(1)["data"]["commands"][0]["name"], "echo");
+        assert_eq!(
+            response(2)["data"],
+            serde_json::json!({"command":"/echo", "args":"hello world"})
+        );
+        assert_eq!(response(3)["success"], false);
+        assert_eq!(response(4)["success"], false);
+        assert_eq!(rpc_get_commands(None), serde_json::json!({"commands":[]}));
+    }
 
     #[test]
     fn rpc_auth_status_shares_header_readiness_and_expired_token_state() {
