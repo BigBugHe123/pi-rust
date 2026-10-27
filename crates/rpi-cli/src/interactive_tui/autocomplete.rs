@@ -177,6 +177,24 @@ pub(super) fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>)
     };
     let start = sugg.start.min(text.len());
     let end = sugg.end.min(text.len());
+    if sugg.is_path {
+        // The path provider returns a BASENAME (`report.txt`) but spans the
+        // whole path prefix, so applying its span drops the parent
+        // directories: Tab on `@/abs/nested/repo` produced `@report.txt`, a
+        // reference to a different file. Replace only the basename segment
+        // the caret sits in — the same span the Enter path uses — and keep
+        // the text as typed when the candidate does not complete that whole
+        // segment (no silent drop of what the user typed after the caret).
+        let (segment_start, segment_end) = path_segment_bounds(&text, start, cursor);
+        let completes_whole = state
+            .autocomplete
+            .get_suggestions(&text, segment_end)
+            .is_some_and(|whole| whole.items.iter().any(|item| item.text == top.text));
+        if !completes_whole {
+            return false;
+        }
+        return apply_suggestion(state, editor, segment_start, segment_end, top);
+    }
     apply_suggestion(state, editor, start, end, top)
 }
 

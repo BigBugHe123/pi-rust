@@ -4750,3 +4750,133 @@ fn final_review_pr106_path_segment_covers_the_text_after_the_caret() {
         "nothing may be rewritten when the whole segment does not complete"
     );
 }
+
+#[test]
+fn merge_review_pr106_enter_after_directory_completion_must_not_duplicate_the_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("report.txt"), "review fixture").unwrap();
+    assert!(!nested.join("nested").exists());
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!("@{}", temporary.path().join("nes").display());
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(route_enter_completion(&state, &editor));
+    let first = editor.get_text();
+    assert!(
+        first.ends_with("nested/"),
+        "first directory completion: {first}"
+    );
+    refresh_autocomplete(&state, &editor);
+    // A directory completion leaves its separator at the caret, so the next
+    // Enter should operate inside that directory, not insert its name again.
+    let consumed = route_enter_completion(&state, &editor);
+    let second = editor.get_text();
+    let reference = second.trim().strip_prefix('@').unwrap();
+    assert!(
+        std::path::Path::new(reference).exists(),
+        "Enter after a directory completion must retain a valid reference; first={first:?}, second={second:?}, consumed={consumed}"
+    );
+}
+
+/// Self-review probe: a directory completion leaves its separator at the
+/// caret, so the NEXT Enter completes INSIDE that directory instead of
+/// inserting the directory's own name again (`…/nested/nested/`, a reference
+/// that does not exist). Pins the exact text and the consumed key.
+#[test]
+fn final_review_pr106_enter_after_directory_completion_completes_inside_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let report = nested.join("report.txt");
+    std::fs::write(&report, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!(
+        "@{}{}nes",
+        temporary.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(
+        route_enter_completion(&state, &editor),
+        "the directory completion consumes the Enter"
+    );
+    assert_eq!(
+        editor.get_text(),
+        format!("@{}{}", nested.display(), std::path::MAIN_SEPARATOR),
+        "the first Enter completes the directory and leaves its separator at the caret"
+    );
+    refresh_autocomplete(&state, &editor);
+    assert!(
+        route_enter_completion(&state, &editor),
+        "the completion inside the directory consumes the Enter too"
+    );
+    assert_eq!(
+        editor.get_text(),
+        format!("@{} ", report.display()),
+        "the second Enter completes a child of the selected directory, not the directory itself"
+    );
+    assert!(
+        !nested.join("nested").exists(),
+        "no completion may invent a directory named after its own parent"
+    );
+}
+
+/// Self-review probe: Tab applies the same basename-segment span as Enter.
+/// The path provider returns a basename while spanning the whole path prefix,
+/// so accepting its span dropped the directory: `@/abs/nested/repo` + Tab
+/// became `@report.txt`, a reference to a different file. A segment that does
+/// not complete as a whole is left exactly as typed.
+#[test]
+fn final_review_pr106_tab_path_completion_must_preserve_the_parent_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let report = nested.join("report.txt");
+    std::fs::write(&report, "review fixture").unwrap();
+    assert!(!temporary.path().join("report.txt").exists());
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!("@{}{}repo", nested.display(), std::path::MAIN_SEPARATOR);
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(
+        accept_top_suggestion(&state, &editor),
+        "Tab accepts the candidate"
+    );
+    assert_eq!(
+        editor.get_text(),
+        format!("@{} ", report.display()),
+        "Tab must complete the basename without discarding the directory"
+    );
+
+    // The candidate does not complete the whole segment, so nothing is
+    // rewritten (the typed suffix after the caret survives).
+    let suffix = format!("{prefix}zz.txt");
+    editor.set_text(&suffix);
+    set_editor_cursor_offset(&editor, &suffix, prefix.len());
+    assert!(
+        !accept_top_suggestion(&state, &editor),
+        "an uncompletable segment is not rewritten"
+    );
+    assert_eq!(editor.get_text(), suffix);
+}
