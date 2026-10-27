@@ -23,6 +23,20 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 - Preserve SQLite concurrent writes and restore state after persistence failure.
 - Validate operation starts across batched record/message writes.
 
+## [0.9.6](https://github.com/bigfish1913/pi-rust/compare/v0.9.5...v0.9.6) - 2026-10-27
+
+### Fixed
+
+- *(cli)* preserve the two-argument default system prompt API for existing library callers
+- *(prompt)* list only the active tools and drop guidelines for absent ones ([#119](https://github.com/bigfish1913/pi-rust/pull/119))
+- *(edit)* the display diff shows replaced lines old then new ([#121](https://github.com/bigfish1913/pi-rust/pull/121))
+
+## [0.9.5](https://github.com/bigfish1913/pi-rust/compare/v0.9.4...v0.9.5) - 2026-10-27
+
+### Fixed
+
+- *(tui)* recognize Shift+Enter on Windows via native key state ([#108](https://github.com/bigfish1913/pi-rust/pull/108))
+
 ## [0.9.4](https://github.com/bigfish1913/pi-rust/compare/v0.9.3...v0.9.4) - 2026-10-26
 
 ### Fixed
