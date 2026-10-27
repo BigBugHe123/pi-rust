@@ -1,2 +1,0 @@
-#!/bin/sh
-exec env  /root/rpi-cause-20261024/rpi-controls "$@"
