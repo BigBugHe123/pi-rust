@@ -12,10 +12,7 @@ fn published_two_argument_prompt_api_remains_callable() {
         for tool in BUILTIN_TOOL_NAMES {
             assert!(text.contains(&format!("- {tool}")));
         }
-        assert_eq!(
-            text.contains("Your own reasoning is carried back"),
-            replayed
-        );
+        assert_eq!(text.contains("reasoning is carried back"), replayed);
         assert!(!text.contains("todo tool"));
     }
 }
