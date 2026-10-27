@@ -79,13 +79,13 @@ use rpi_tui::scroll_view::{OverscrollMode, ScrollbarMode};
 use rpi_tui::strip_ansi;
 use rpi_tui::{
     apply_theme_preset, AltScreenSearch, AssistantBlock, AssistantMessageComponent,
-    AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
-    BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
-    EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
-    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
-    ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList, SettingItem,
-    SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
-    StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
+    AssistantMessageOptions, AutocompleteItem, AutocompleteManager, AutocompleteSuggestions,
+    BashExecutionComponent, BashTruncation, CombinedAutocompleteProvider, Component, Container,
+    DynamicBorder, Editor, EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable,
+    FollowMode, FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal,
+    ScrollView, ScrollViewOptions, SearchBar, SearchableSelectList, SelectItem, SelectList,
+    SettingItem, SettingsList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider,
+    Spacer, StackChild, StackEntry, StatusIndicator, Text, ThemeManager, ThemePreset,
     ToolExecutionComponent, ToolStatus, TuiAltScreen, UserMessageComponent, VStack, WorkingState,
     TUI,
 };
@@ -1250,6 +1250,7 @@ pub async fn interactive_tui(
         autocomplete_container: autocomplete_container.clone(),
         autocomplete_max_visible,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
         tui: Some(tui.clone()),
@@ -2796,6 +2797,38 @@ pub async fn interactive_tui(
                     windows_paste_run.flush(&editor_for_key, now);
                 } else {
                     windows_paste_run.flush(&editor_for_key, std::time::Instant::now());
+                }
+            }
+
+            // 5a-ter. A bare Enter in a completion context (`/` or `@`)
+            //     resolves the completion before submitting, mirroring the
+            //     TS editor's `tui.select.confirm` (`editor.ts:757-815`):
+            //     apply the sole/highlighted item, then let a `/` completion
+            //     fall through to submit while an `@`-path one consumes the
+            //     Enter. Unambiguous only — a fresh ambiguous popup submits
+            //     the typed text, and unknown `/skill:name` still reaches
+            //     the model untouched.
+            //
+            //     Placement is load-bearing: this runs AFTER the Windows
+            //     paste classification and flush above, immediately before
+            //     the confirmed submit Enter is forwarded to the editor, so
+            //     an Enter that belongs to a paste never reaches it — the
+            //     paste paths have already `continue`d. At this point the
+            //     editor also holds any buffered typed prefix the Windows
+            //     handler just flushed, so the completion sees the full
+            //     token.
+            if key.modifiers == KeyModifiers::NONE
+                && (key.code == KeyCode::Enter
+                    || key.code == KeyCode::Char('\n')
+                    || key.code == KeyCode::Char('\r'))
+            {
+                // One resolution, one replacement: `route_enter_completion`
+                // applies the same snapshot it decided on and reports whether
+                // this Enter is consumed by an `@`-path completion.
+                if route_enter_completion(&state_for_key, &editor_for_key) {
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
                 }
             }
 

@@ -1,6 +1,7 @@
 use super::*;
 use rpi_tui::Component;
 
+mod enter_completion;
 mod session_regressions;
 
 #[test]
@@ -473,6 +474,7 @@ fn test_tui_state() -> Arc<TuiState> {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -1777,6 +1779,7 @@ fn test_agent_event_mapping_creates_assistant_and_tool() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2844,6 +2847,7 @@ fn test_autocomplete_slash_suggestions_render() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -2936,6 +2940,7 @@ fn test_select_list_swap_restores_editor() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -3031,6 +3036,7 @@ fn test_message_history_browse_restores_draft() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -3129,6 +3135,7 @@ fn test_accept_top_suggestion_replaces_prefix() {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: 5,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -3213,6 +3220,7 @@ fn autocomplete_test_state(max_visible: usize) -> Arc<TuiState> {
         autocomplete_container: Arc::new(Container::new()),
         autocomplete_max_visible: max_visible,
         autocomplete_selection: std::sync::Mutex::new(0),
+        autocomplete_selection_stamped_for: std::sync::Mutex::new(None),
         pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager: Arc::new(ThemeManager::new()),
         tui: None,
@@ -4420,4 +4428,601 @@ fn fullscreen_drag_paints_highlight_and_click_does_not() {
         "a plain click must not paint a highlight: {click_frame:?}"
     );
     assert!(click_text.is_none(), "a plain click must not select text");
+}
+
+// ==== Reviewer probes for PR #106 (carried verbatim; the Windows ones call
+// the real state/paste-run/editor methods in the key loop's NEW order). ====
+
+fn review_pr106_slash_state() -> Arc<TuiState> {
+    let state = test_tui_state();
+    state.autocomplete.set_provider(Arc::new(
+        SlashCommandAutocompleteProvider::with_default_commands(),
+    ));
+    state
+}
+
+#[test]
+fn review_pr106_explicitly_selecting_row_zero_must_accept_it() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    editor.set_text("/c");
+    editor.set_cursor(0, 2);
+    assert!(navigate_autocomplete(&state, &editor, 1));
+    assert!(navigate_autocomplete(&state, &editor, -1));
+    assert_eq!(*state.autocomplete_selection.lock().unwrap(), 0);
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::ApplyAndSubmit),
+        "Down then Up explicitly selected the first row; it is not a fresh ambiguous popup"
+    );
+}
+
+#[test]
+fn review_pr106_windows_queued_prefix_enter_must_submit_the_completed_command() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let submitted_for_callback = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        submitted_for_callback
+            .lock()
+            .unwrap()
+            .push(text.to_string());
+    }));
+    let now = std::time::Instant::now();
+    let mut run = WindowsPasteRun::default();
+    assert!(review_pr91_deliver_batch(
+        &mut run, &editor, "/clea", true, now
+    ));
+    assert_eq!(run.text, "/clea");
+    assert!(editor.get_text().is_empty());
+    // Follow the production key-loop ordering at the NEW head: Windows Enter
+    // classification/flush FIRST, then the completion hook, then the editor.
+    assert!(!windows_enter_in_paste(&run, false, None, now));
+    run.flush(&editor, now);
+    // The production routing entry point: one resolution, the same snapshot
+    // applied, `true` only for an `@`-path completion.
+    assert!(
+        !route_enter_completion(&state, &editor),
+        "a slash command must not consume Enter as a path completion"
+    );
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        *submitted.lock().unwrap(),
+        vec!["/clear".to_string()],
+        "the completion hook must see the buffered prefix before the submitting Enter"
+    );
+}
+
+#[test]
+fn review_pr106_windows_pasted_interior_enter_must_not_rewrite_the_draft() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let now = std::time::Instant::now();
+    let mut run = WindowsPasteRun::default();
+    review_pr91_deliver_batch(&mut run, &editor, "/clea", false, now);
+    assert_eq!(editor.get_text(), "/clea");
+    // Production ordering at the NEW head: an interior pasted Enter is
+    // classified BEFORE the completion hook can look at the draft.
+    assert!(windows_enter_in_paste(&run, true, None, now));
+    run.feed('\n', now);
+    run.feed('X', now);
+    run.flush(&editor, now);
+    assert_eq!(
+        editor.get_text(),
+        "/clea\nX",
+        "an interior pasted Enter must be classified before completion can rewrite clipboard text"
+    );
+}
+
+#[test]
+fn rereview_pr106_enter_in_middle_of_complete_command_must_preserve_the_command() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    editor.set_text("/clear");
+    // Move the caret back two columns, without changing any text.
+    editor.set_cursor(0, 4); // /cle|ar
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
+    editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        *submitted.lock().unwrap(),
+        vec!["/clear".to_string()],
+        "Enter with the caret inside an already complete command must not duplicate its suffix"
+    );
+}
+
+/// Self-review probe: the whole-token resolution must not silently DROP the
+/// text the user typed after the caret. With `/clearXYZ` and the caret at
+/// column 4 the prefix `/cle` still completes to `/clear`, but the token as a
+/// whole does not — so Enter must submit the text exactly as typed instead
+/// of rewriting it to `/clear` (which would lose `XYZ`).
+#[test]
+fn rereview_pr106_enter_inside_an_unknown_token_keeps_the_typed_text() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    editor.set_text("/clearXYZ");
+    editor.set_cursor(0, 4); // /cle|arXYZ
+    assert_eq!(
+        enter_completion_action(&state, &editor),
+        Some(EnterCompletionAction::Submit),
+        "a token that does not complete as a whole must be submitted as typed"
+    );
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert!(
+        !completion.apply(&state, &editor),
+        "nothing may be applied when the whole token does not complete"
+    );
+    assert_eq!(editor.get_text(), "/clearXYZ");
+}
+
+/// Self-review probe: the same whole-token rule applies when the caret is
+/// inside a token that ends the input. `/clea` + `r` is the token `/clear`,
+/// so Enter must complete it to `/clear` — the same result as typing
+/// `/clear` and pressing Enter.
+#[test]
+fn rereview_pr106_enter_inside_a_token_completes_the_whole_token() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    editor.set_text("/clear");
+    editor.set_cursor(0, 4); // /cle|ar
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        "/clear",
+        "the whole token is completed, not just the prefix before the caret"
+    );
+}
+
+/// Self-review probe: a command with a space after it is two tokens. With
+/// the caret inside the first token (`/cle|ar now`) only the command token
+/// is completed — the trailing word must survive untouched.
+#[test]
+fn rereview_pr106_enter_inside_a_command_token_keeps_the_following_word() {
+    let state = review_pr106_slash_state();
+    let editor = state.editor.clone();
+    editor.set_text("/clear now");
+    editor.set_cursor(0, 4); // /cle|ar now
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyAndSubmit);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        "/clear now",
+        "only the command token is replaced; the next word is untouched"
+    );
+}
+
+// ==== Reviewer probes for PR #106, round 3 (the two-lookup flow they model
+// is gone: the decision and the replacement are one snapshot, applied by
+// `route_enter_completion` — so the probes take the snapshot and apply it,
+// which is exactly what the key loop does). ====
+
+/// `@<root>/nested/repo` + Enter must complete the basename and KEEP the
+/// directory: the path provider spans the whole path prefix but returns a
+/// basename, so replacing its span would point the reference at a different
+/// file (`@report.txt`).
+#[test]
+fn final_review_pr106_enter_path_completion_must_preserve_the_parent_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let completed = nested.join("report.txt");
+    std::fs::write(&completed, "review fixture").unwrap();
+    assert!(!temporary.path().join("report.txt").exists());
+    let prefix = format!("@{}", nested.join("repo").display());
+    let expected = format!("@{} ", completed.display());
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    assert!(completion.apply(&state, &editor));
+    assert_eq!(
+        editor.get_text(),
+        expected,
+        "Enter must complete the basename without discarding the directory from the file reference"
+    );
+}
+
+/// A path candidate that disappears between the decision and the apply must
+/// not turn the decided `ApplyOnly` into a submit of the unfinished prompt:
+/// the snapshot is applied as decided, and an `@`-path decision consumes the
+/// Enter independently of the apply result.
+#[test]
+fn final_review_pr106_disappearing_file_candidate_must_not_turn_enter_into_submit() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("notes.txt");
+    std::fs::write(&path, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    editor.set_text("@not");
+    editor.set_cursor(0, 4);
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    // The decision is taken ONCE; the key loop keeps this snapshot.
+    let completion = resolve_enter_completion(&state, &editor).expect("a decision");
+    assert_eq!(completion.action, EnterCompletionAction::ApplyOnly);
+    // Model a real directory change after the decision, before the apply. No
+    // provider stub is used.
+    std::fs::remove_file(&path).unwrap();
+    // The production routing applies the SAME snapshot and consumes the Enter
+    // for an `@`-path completion; the key never reaches the editor.
+    let consumed = {
+        completion.apply(&state, &editor);
+        completion.consumes_enter()
+    };
+    if !consumed {
+        editor.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "a disappearing path candidate must not cause ApplyOnly to submit the unfinished prompt"
+    );
+    assert_eq!(
+        editor.get_text(),
+        "@notes.txt ",
+        "the decided candidate is applied from the snapshot, not re-resolved"
+    );
+}
+
+/// Self-review probe: the key loop's actual entry point (`route_enter_completion`)
+/// resolves once, completes the basename, and consumes the Enter so the prompt
+/// is not submitted.
+#[test]
+fn final_review_pr106_path_completion_route_consumes_the_enter() {
+    let temporary = tempfile::tempdir().unwrap();
+    std::fs::write(temporary.path().join("notes.txt"), "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    editor.set_text("@not");
+    editor.set_cursor(0, 4);
+    let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+    let capture = submitted.clone();
+    editor.on_submit(Arc::new(move |text| {
+        capture.lock().unwrap().push(text.to_string());
+    }));
+    assert!(
+        route_enter_completion(&state, &editor),
+        "an @-path completion consumes the Enter"
+    );
+    assert_eq!(editor.get_text(), "@notes.txt ");
+    assert!(
+        submitted.lock().unwrap().is_empty(),
+        "a path completion must never submit the prompt"
+    );
+}
+
+/// Self-review probe: the path segment rule matches the command-token rule —
+/// the whole segment around the caret is replaced (no duplicated suffix), and
+/// a segment that does not complete keeps the typed text instead of dropping
+/// it.
+#[test]
+fn final_review_pr106_path_segment_covers_the_text_after_the_caret() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let completed = nested.join("report.txt");
+    std::fs::write(&completed, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    // Caret inside the basename: `.../nested/repo|rt.txt`.
+    let prefix = format!("@{}", nested.join("repo").display());
+    let text = format!("{prefix}rt.txt");
+    editor.set_text(&text);
+    set_editor_cursor_offset(&editor, &text, prefix.len());
+    assert!(
+        route_enter_completion(&state, &editor),
+        "a path completion consumes the Enter"
+    );
+    assert_eq!(
+        editor.get_text(),
+        format!("@{} ", completed.display()),
+        "the whole basename segment is completed, not just the part before the caret"
+    );
+
+    // A segment that does not complete as a whole keeps the typed text: the
+    // completion must not silently drop `zz` after the caret.
+    let unknown = format!("{prefix}zz.txt");
+    editor.set_text(&unknown);
+    set_editor_cursor_offset(&editor, &unknown, prefix.len());
+    assert!(
+        !route_enter_completion(&state, &editor),
+        "a segment that does not complete falls through to the normal submit"
+    );
+    assert_eq!(
+        editor.get_text(),
+        unknown,
+        "nothing may be rewritten when the whole segment does not complete"
+    );
+}
+
+#[test]
+fn merge_review_pr106_enter_after_directory_completion_must_not_duplicate_the_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    std::fs::write(nested.join("report.txt"), "review fixture").unwrap();
+    assert!(!nested.join("nested").exists());
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!("@{}", temporary.path().join("nes").display());
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(route_enter_completion(&state, &editor));
+    let first = editor.get_text();
+    assert!(
+        first.ends_with("nested/"),
+        "first directory completion: {first}"
+    );
+    refresh_autocomplete(&state, &editor);
+    // A directory completion leaves its separator at the caret, so the next
+    // Enter should operate inside that directory, not insert its name again.
+    let consumed = route_enter_completion(&state, &editor);
+    let second = editor.get_text();
+    let reference = second.trim().strip_prefix('@').unwrap();
+    assert!(
+        std::path::Path::new(reference).exists(),
+        "Enter after a directory completion must retain a valid reference; first={first:?}, second={second:?}, consumed={consumed}"
+    );
+}
+
+/// Self-review probe: a directory completion leaves its separator at the
+/// caret, so the NEXT Enter completes INSIDE that directory instead of
+/// inserting the directory's own name again (`…/nested/nested/`, a reference
+/// that does not exist). Pins the exact text and the consumed key.
+///
+/// The path provider marks a directory with `/` on EVERY platform (the
+/// upstream TS convention — `toDisplayPath` normalizes `\` to `/`; the
+/// upstream-derived provider probe pins `vec!["nested/"]`), while the part
+/// of the path the user typed keeps the platform separator. The completed
+/// text therefore mixes the two glyphs, and the raw string differs per
+/// platform even though it names the same file. The assertion normalizes
+/// the separators, so it pins the reference itself and not the glyph.
+#[test]
+fn final_review_pr106_enter_after_directory_completion_completes_inside_it() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let report = nested.join("report.txt");
+    std::fs::write(&report, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!(
+        "@{}{}nes",
+        temporary.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(
+        route_enter_completion(&state, &editor),
+        "the directory completion consumes the Enter"
+    );
+    let first = editor.get_text();
+    assert_eq!(
+        normalize_path_separators(&first),
+        normalize_path_separators(&format!("@{}/", nested.display())),
+        "the first Enter completes the directory and leaves its separator at the caret"
+    );
+    // The provider marks a directory with `/` on EVERY platform (upstream TS
+    // normalizes `\` to `/`), so the completed reference ends in a forward
+    // slash even where the typed path used the platform separator. The
+    // convention is the same on Linux and Windows — pinned here so a change
+    // to it cannot pass on one platform and fail on the other.
+    assert!(
+        first.ends_with("nested/"),
+        "the directory marker is `/` on every platform: {first:?}"
+    );
+    refresh_autocomplete(&state, &editor);
+    assert!(
+        route_enter_completion(&state, &editor),
+        "the completion inside the directory consumes the Enter too"
+    );
+    let second = editor.get_text();
+    assert_eq!(
+        normalize_path_separators(&second),
+        normalize_path_separators(&format!("@{} ", report.display())),
+        "the second Enter completes a child of the selected directory, not the directory itself"
+    );
+    // The reference must name the file that exists — the invariant behind
+    // the text comparison, independent of any separator glyph.
+    let reference = second.trim().strip_prefix('@').expect("an @-reference");
+    assert!(
+        std::path::Path::new(reference).exists(),
+        "the completed reference must name the real file: {second:?}"
+    );
+    assert!(
+        !nested.join("nested").exists(),
+        "no completion may invent a directory named after its own parent"
+    );
+}
+
+/// Normalize the path separators of a reference so an assertion compares the
+/// path a completion names, not the separator glyph it was typed with.
+///
+/// The path provider marks a directory with `/` on every platform, so a
+/// completed reference mixes the provider's separator with the platform one
+/// the user typed. The normalized form is the same string on every platform.
+fn normalize_path_separators(reference: &str) -> String {
+    reference.replace('\\', "/")
+}
+
+/// Self-review probe: the recorded Windows reproduction, kept in the tree so
+/// the platform-dependent comparison cannot come back unnoticed.
+///
+/// On the Windows checkout the completed reference ended in the provider's
+/// `/` while the typed path used the platform `\`:
+/// `@D:\Temp\...\nested/` (actual) vs `@D:\Temp\...\nested\` (expected) —
+/// the same file, two glyphs. The provider's `/` marker is the upstream
+/// convention and is pre-existing (it is in `rpi-tui` before this PR), so
+/// the comparison is the thing that has to be separator-agnostic.
+#[test]
+fn final_review_pr106_path_reference_comparison_is_separator_agnostic() {
+    // The exact shapes the Windows checkout produced.
+    let actual = "@D:\\Temp\\pr106\\nested/";
+    let expected = "@D:\\Temp\\pr106\\nested\\";
+    assert_ne!(
+        actual, expected,
+        "the raw texts differ: that is the platform difference the comparison must absorb"
+    );
+    assert_eq!(
+        normalize_path_separators(actual),
+        normalize_path_separators(expected),
+        "the normalized references are the same reference"
+    );
+    // The same holds for the file the reference ends at.
+    let actual_file = "@D:\\Temp\\pr106\\nested/report.txt ";
+    let expected_file = "@D:\\Temp\\pr106\\nested\\report.txt ";
+    assert_eq!(
+        normalize_path_separators(actual_file),
+        normalize_path_separators(expected_file),
+        "the normalized file references are the same reference"
+    );
+}
+
+/// Self-review probe: the completed reference must NAME THE FILE, on every
+/// platform — the invariant the text comparison cannot express.
+///
+/// The provider marks a directory with `/` on every platform, so on Windows
+/// the completed reference mixes the typed `\` with the provider's `/`. The
+/// reference is resolved as a path (the OS accepts both separators on
+/// Windows), so the file it names is the same on every platform. A probe
+/// that only compared the raw text could pass on Linux and fail on Windows
+/// while the feature worked; this one compares the resolved path.
+#[test]
+fn final_review_pr106_completed_path_reference_resolves_to_the_same_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let report = nested.join("report.txt");
+    std::fs::write(&report, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!(
+        "@{}{}nes",
+        temporary.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(route_enter_completion(&state, &editor));
+    refresh_autocomplete(&state, &editor);
+    assert!(route_enter_completion(&state, &editor));
+    let text = editor.get_text();
+    let reference = text.trim().strip_prefix('@').expect("an @-reference");
+    // The reference resolves to the file that exists — the invariant behind
+    // the text comparison, independent of any separator glyph.
+    let resolved = std::path::Path::new(reference);
+    assert!(
+        resolved.exists(),
+        "the completed reference must name the real file: {text:?}"
+    );
+    assert_eq!(
+        resolved.file_name().and_then(|name| name.to_str()),
+        Some("report.txt"),
+        "the completed reference must name the child file: {text:?}"
+    );
+    assert_eq!(
+        resolved.parent().and_then(|parent| parent.file_name()),
+        Some(std::ffi::OsStr::new("nested")),
+        "the completed reference must stay inside the selected directory: {text:?}"
+    );
+}
+
+/// Self-review probe: Tab applies the same basename-segment span as Enter.
+/// The path provider returns a basename while spanning the whole path prefix,
+/// so accepting its span dropped the directory: `@/abs/nested/repo` + Tab
+/// became `@report.txt`, a reference to a different file. A segment that does
+/// not complete as a whole is left exactly as typed.
+#[test]
+fn final_review_pr106_tab_path_completion_must_preserve_the_parent_directory() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let report = nested.join("report.txt");
+    std::fs::write(&report, "review fixture").unwrap();
+    assert!(!temporary.path().join("report.txt").exists());
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!("@{}{}repo", nested.display(), std::path::MAIN_SEPARATOR);
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(
+        accept_top_suggestion(&state, &editor),
+        "Tab accepts the candidate"
+    );
+    assert_eq!(
+        editor.get_text(),
+        format!("@{} ", report.display()),
+        "Tab must complete the basename without discarding the directory"
+    );
+
+    // The candidate does not complete the whole segment, so nothing is
+    // rewritten (the typed suffix after the caret survives).
+    let suffix = format!("{prefix}zz.txt");
+    editor.set_text(&suffix);
+    set_editor_cursor_offset(&editor, &suffix, prefix.len());
+    assert!(
+        !accept_top_suggestion(&state, &editor),
+        "an uncompletable segment is not rewritten"
+    );
+    assert_eq!(editor.get_text(), suffix);
 }

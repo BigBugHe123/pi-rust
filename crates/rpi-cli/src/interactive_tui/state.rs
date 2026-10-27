@@ -263,6 +263,17 @@ pub(super) struct TuiState {
     pub(super) autocomplete_max_visible: usize,
     /// Currently highlighted autocomplete row (0-based), moved by ↑/↓.
     pub(super) autocomplete_selection: std::sync::Mutex<usize>,
+    /// The completion prefix (the editor text span the popup is completing)
+    /// that was current when the user LAST navigated the popup with ↑/↓.
+    ///
+    /// The row index alone cannot express "the user explicitly selected row
+    /// 0" — ↓ then ↑ lands back on 0, indistinguishable from a fresh popup.
+    /// The stamp holds the prefix the popup was completing at that moment;
+    /// an Enter accepts the highlighted row only while the popup still
+    /// completes that same prefix. Any change to the completed span (typing,
+    /// backspace, a different token) retires the stamp, so a fresh popup for
+    /// the new prefix starts un-navigated.
+    pub(super) autocomplete_selection_stamped_for: std::sync::Mutex<Option<String>>,
     /// Images queued from clipboard paste and attached to the next prompt.
     pub(super) pending_images: std::sync::Mutex<Vec<rpi_ai::types::ImageContent>>,
     /// The owned theme manager — `/theme` applies presets here. The global
