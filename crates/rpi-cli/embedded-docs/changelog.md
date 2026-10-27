@@ -11,6 +11,28 @@ from; the matching [GitHub Release](../../releases) carries the same notes.
 
 ## [Unreleased]
 
+## [0.10.1](https://github.com/bigfish1913/pi-rust/compare/v0.10.0...v0.10.1) - 2026-10-27
+
+### Added
+
+- *(tui)* expose skill activation and slash invocation
+
+### Fixed
+
+- *(cli)* browse into a directory when a path prefix ends at a separator
+- *(cli)* keep the path directory and apply one Enter snapshot
+- *(cli)* complete the whole command token on Enter
+- *(cli)* classify Windows paste before Enter completion and stamp explicit selection
+- *(cli)* resolve slash completion on Enter before submitting the prefix
+- *(session)* --fork takes a session file outside the session directory
+
+### Other
+
+- Merge branch 'main' into fix/enter-accept-completion
+- Merge branch 'main' into feat/tui-skill-invocation
+- *(cli)* compare the completed path reference by normalized separator
+- Merge branch 'main' into fix/fork-session-file
+
 ## [0.10.0](https://github.com/bigfish1913/pi-rust/compare/v0.9.6...v0.10.0) - 2026-10-27
 
 ### Added
