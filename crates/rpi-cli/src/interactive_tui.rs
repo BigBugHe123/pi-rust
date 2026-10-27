@@ -527,6 +527,21 @@ fn dispatch_slash(text: &str, ctx: &CommandContext, registry: &CommandRegistry) 
     }
 }
 
+/// Normalize a decoded event before it enters the key loop.
+///
+/// [`rpi_tui::terminal::normalize_key_event`] samples platform state (Apple
+/// Terminal, Windows console) that describes the keyboard *now*, so it runs
+/// here — right after `crossterm::event::read`, before paste probing, routing
+/// and rendering. Sampling later would let a Shift press meant for the next
+/// keystroke be attributed to an Enter that is already queued. The protocol
+/// pass in the loop deliberately does not sample again.
+fn normalize_decoded_event(event: Event) -> Event {
+    match event {
+        Event::Key(key) => Event::Key(rpi_tui::terminal::normalize_key_event(key)),
+        other => other,
+    }
+}
+
 /// Current wall-clock time in milliseconds since the Unix epoch. Used for
 /// `bashExecution` message timestamps (agent-loop messages carry real times, so
 /// the transcript record must too).
@@ -1744,7 +1759,7 @@ pub async fn interactive_tui(
                     let _ = tx_for_key.send(TuiMessage::Exit);
                     break;
                 };
-                ev
+                normalize_decoded_event(ev)
             };
             // `Event::Resize` is delivered as its own event (not a Key). With
             // `start_readerless` there is no competing terminal-reader thread to
@@ -2716,7 +2731,7 @@ pub async fn interactive_tui(
                                 if crossterm::event::poll(std::time::Duration::ZERO)
                                     .unwrap_or(false)
                                 {
-                                    crossterm::event::read().ok()
+                                    crossterm::event::read().ok().map(normalize_decoded_event)
                                 } else {
                                     None
                                 }
@@ -2745,7 +2760,7 @@ pub async fn interactive_tui(
                 {
                     let (more_queued, stashed) = probe_paste_input(pending_event.take(), || {
                         if crossterm::event::poll(PASTE_PROBE).unwrap_or(false) {
-                            crossterm::event::read().ok()
+                            crossterm::event::read().ok().map(normalize_decoded_event)
                         } else {
                             None
                         }
