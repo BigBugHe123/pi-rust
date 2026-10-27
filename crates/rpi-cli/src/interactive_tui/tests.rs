@@ -4790,6 +4790,14 @@ fn merge_review_pr106_enter_after_directory_completion_must_not_duplicate_the_di
 /// caret, so the NEXT Enter completes INSIDE that directory instead of
 /// inserting the directory's own name again (`…/nested/nested/`, a reference
 /// that does not exist). Pins the exact text and the consumed key.
+///
+/// The path provider marks a directory with `/` on EVERY platform (the
+/// upstream TS convention — `toDisplayPath` normalizes `\` to `/`; the
+/// upstream-derived provider probe pins `vec!["nested/"]`), while the part
+/// of the path the user typed keeps the platform separator. The completed
+/// text therefore mixes the two glyphs, and the raw string differs per
+/// platform even though it names the same file. The assertion normalizes
+/// the separators, so it pins the reference itself and not the glyph.
 #[test]
 fn final_review_pr106_enter_after_directory_completion_completes_inside_it() {
     let temporary = tempfile::tempdir().unwrap();
@@ -4815,24 +4823,139 @@ fn final_review_pr106_enter_after_directory_completion_completes_inside_it() {
         route_enter_completion(&state, &editor),
         "the directory completion consumes the Enter"
     );
+    let first = editor.get_text();
     assert_eq!(
-        editor.get_text(),
-        format!("@{}{}", nested.display(), std::path::MAIN_SEPARATOR),
+        normalize_path_separators(&first),
+        normalize_path_separators(&format!("@{}/", nested.display())),
         "the first Enter completes the directory and leaves its separator at the caret"
+    );
+    // The provider marks a directory with `/` on EVERY platform (upstream TS
+    // normalizes `\` to `/`), so the completed reference ends in a forward
+    // slash even where the typed path used the platform separator. The
+    // convention is the same on Linux and Windows — pinned here so a change
+    // to it cannot pass on one platform and fail on the other.
+    assert!(
+        first.ends_with("nested/"),
+        "the directory marker is `/` on every platform: {first:?}"
     );
     refresh_autocomplete(&state, &editor);
     assert!(
         route_enter_completion(&state, &editor),
         "the completion inside the directory consumes the Enter too"
     );
+    let second = editor.get_text();
     assert_eq!(
-        editor.get_text(),
-        format!("@{} ", report.display()),
+        normalize_path_separators(&second),
+        normalize_path_separators(&format!("@{} ", report.display())),
         "the second Enter completes a child of the selected directory, not the directory itself"
+    );
+    // The reference must name the file that exists — the invariant behind
+    // the text comparison, independent of any separator glyph.
+    let reference = second.trim().strip_prefix('@').expect("an @-reference");
+    assert!(
+        std::path::Path::new(reference).exists(),
+        "the completed reference must name the real file: {second:?}"
     );
     assert!(
         !nested.join("nested").exists(),
         "no completion may invent a directory named after its own parent"
+    );
+}
+
+/// Normalize the path separators of a reference so an assertion compares the
+/// path a completion names, not the separator glyph it was typed with.
+///
+/// The path provider marks a directory with `/` on every platform, so a
+/// completed reference mixes the provider's separator with the platform one
+/// the user typed. The normalized form is the same string on every platform.
+fn normalize_path_separators(reference: &str) -> String {
+    reference.replace('\\', "/")
+}
+
+/// Self-review probe: the recorded Windows reproduction, kept in the tree so
+/// the platform-dependent comparison cannot come back unnoticed.
+///
+/// On the Windows checkout the completed reference ended in the provider's
+/// `/` while the typed path used the platform `\`:
+/// `@D:\Temp\...\nested/` (actual) vs `@D:\Temp\...\nested\` (expected) —
+/// the same file, two glyphs. The provider's `/` marker is the upstream
+/// convention and is pre-existing (it is in `rpi-tui` before this PR), so
+/// the comparison is the thing that has to be separator-agnostic.
+#[test]
+fn final_review_pr106_path_reference_comparison_is_separator_agnostic() {
+    // The exact shapes the Windows checkout produced.
+    let actual = "@D:\\Temp\\pr106\\nested/";
+    let expected = "@D:\\Temp\\pr106\\nested\\";
+    assert_ne!(
+        actual, expected,
+        "the raw texts differ: that is the platform difference the comparison must absorb"
+    );
+    assert_eq!(
+        normalize_path_separators(actual),
+        normalize_path_separators(expected),
+        "the normalized references are the same reference"
+    );
+    // The same holds for the file the reference ends at.
+    let actual_file = "@D:\\Temp\\pr106\\nested/report.txt ";
+    let expected_file = "@D:\\Temp\\pr106\\nested\\report.txt ";
+    assert_eq!(
+        normalize_path_separators(actual_file),
+        normalize_path_separators(expected_file),
+        "the normalized file references are the same reference"
+    );
+}
+
+/// Self-review probe: the completed reference must NAME THE FILE, on every
+/// platform — the invariant the text comparison cannot express.
+///
+/// The provider marks a directory with `/` on every platform, so on Windows
+/// the completed reference mixes the typed `\` with the provider's `/`. The
+/// reference is resolved as a path (the OS accepts both separators on
+/// Windows), so the file it names is the same on every platform. A probe
+/// that only compared the raw text could pass on Linux and fail on Windows
+/// while the feature worked; this one compares the resolved path.
+#[test]
+fn final_review_pr106_completed_path_reference_resolves_to_the_same_file() {
+    let temporary = tempfile::tempdir().unwrap();
+    let nested = temporary.path().join("nested");
+    std::fs::create_dir(&nested).unwrap();
+    let report = nested.join("report.txt");
+    std::fs::write(&report, "review fixture").unwrap();
+    let state = test_tui_state();
+    state
+        .autocomplete
+        .set_provider(Arc::new(FilePathAutocompleteProvider::with_root(
+            temporary.path().to_path_buf(),
+        )));
+    let editor = state.editor.clone();
+    let prefix = format!(
+        "@{}{}nes",
+        temporary.path().display(),
+        std::path::MAIN_SEPARATOR
+    );
+    editor.set_text(&prefix);
+    set_editor_cursor_offset(&editor, &prefix, prefix.len());
+    assert!(route_enter_completion(&state, &editor));
+    refresh_autocomplete(&state, &editor);
+    assert!(route_enter_completion(&state, &editor));
+    let text = editor.get_text();
+    let reference = text.trim().strip_prefix('@').expect("an @-reference");
+    // The reference resolves to the file that exists — the invariant behind
+    // the text comparison, independent of any separator glyph.
+    let resolved = std::path::Path::new(reference);
+    assert!(
+        resolved.exists(),
+        "the completed reference must name the real file: {text:?}"
+    );
+    assert_eq!(
+        resolved.file_name().and_then(|name| name.to_str()),
+        Some("report.txt"),
+        "the completed reference must name the child file: {text:?}"
+    );
+    assert_eq!(
+        resolved.parent().and_then(|parent| parent.file_name()),
+        Some(std::ffi::OsStr::new("nested")),
+        "the completed reference must stay inside the selected directory: {text:?}"
     );
 }
 
