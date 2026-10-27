@@ -2,6 +2,12 @@ name: Release automation
 
 on:
   workflow_call:
+    inputs:
+      prepare:
+        description: 'Allow this run to prepare or update the stable Release PR'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -33,7 +39,7 @@ jobs:
   prepare:
     name: Prepare the next Release PR
     needs: detect
-    if: needs.detect.outputs.release == 'false'
+    if: needs.detect.outputs.release == 'false' && inputs.prepare == true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:

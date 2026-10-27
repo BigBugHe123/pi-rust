@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, preview]
   workflow_dispatch:
+    inputs:
+      prepare_release:
+        description: 'Prepare or update the stable Release PR after CI passes'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -165,6 +171,8 @@ jobs:
       contents: write
       pull-requests: read
     uses: ./.github/workflows/release.yml
+    with:
+      prepare: ${{ github.event_name == 'workflow_dispatch' && inputs.prepare_release == true }}
     secrets: inherit
 
   preview-version:
